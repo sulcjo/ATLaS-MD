@@ -65,7 +65,10 @@ def parity_report(run_dir) -> dict[str, Any]:
             "n_nonfinite_offline": int((~fin_off).sum()), "n_finite_mismatch": n_mismatch,
             "k_max_kcal": float(k_max),
             "max_abs_dz": float(np.max(np.abs(z_run[both] - z_off[both]))) if n_cmp else 0.0,
-            "max_reduced": max_red, "tolerance": tol, "ok": bool(ok)}
+            "max_reduced": max_red, "tolerance": tol, "ok": bool(ok),
+            # F07: the stored z's evaluator (the aux force; "unrecorded" in pre-F07 payloads) and the reference.
+            "runtime_z_source": (runtimes.get(seg) or {}).get("aux_z_source") or "unrecorded",
+            "reference_z_source": "positions"}
         if vacuous:
             row["bound_vacuous"] = True
         if n == 0:

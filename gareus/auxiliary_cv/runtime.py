@@ -17,7 +17,7 @@ import numpy as np
 from ..correctness._io import IntegrityError
 from .evaluate import z_from_positions
 from .features import active_feature_mask, openmm_dihedrals, unique_torsions
-from .force import AuxForceInfo, build_aux_force, set_aux_parameters
+from .force import AUX_FORCE_NAME, AuxForceInfo, aux_energy_function, build_aux_force, set_aux_parameters
 from .state_table import AuxStateTable
 
 RESERVED_PHYSICAL_GROUPS = frozenset({0, 1, 2})
@@ -144,20 +144,84 @@ if __name__ == "__main__":  # python -m gareus.auxiliary_cv.runtime topology-sha
     print(canonical_topology_sha256_from_pdb(sys.argv[2], AuxModel.load(sys.argv[3])))
 
 
+def _where(replica) -> str:
+    return "" if replica is None else f" on replica {replica}"
+
+
+def check_aux_force(force, runtime: AuxRuntime, *, replica=None) -> None:
+    """The force-side z evaluator of one replica must be this runtime's auxiliary force (F07).
+
+    Its name, sub-CV names and energy expression (whose literals carry the model's offset and scale) must
+    equal what ``build_aux_force`` writes for the runtime's model, so ``aux_z_from_force``'s projection is
+    exactly the force's own z. A missing force is refused: the position evaluator is never substituted.
+    """
+    where = _where(replica)
+    if force is None:
+        raise AuxObservationError(f"force-side aux z evaluator unavailable{where}: no auxiliary force to read "
+                                  "(the position evaluator is never substituted for it, F07)")
+    try:
+        name = force.getName()
+        names = tuple(force.getCollectiveVariableName(i) for i in range(force.getNumCollectiveVariables()))
+        expr = force.getEnergyFunction()
+    except Exception as exc:  # noqa: BLE001 -- anything that is not a CustomCVForce is unavailable
+        raise AuxObservationError(f"force-side aux z evaluator unavailable{where}: {type(exc).__name__}: {exc}") \
+            from exc
+    if name != AUX_FORCE_NAME:
+        raise AuxObservationError(f"force-side aux z evaluator{where} is {name!r}, not {AUX_FORCE_NAME!r}")
+    if names != tuple(runtime.info.sub_cv_names):
+        raise AuxObservationError(f"auxiliary force{where} has sub-CVs {list(names)}, the runtime expects "
+                                  f"{list(runtime.info.sub_cv_names)}")
+    want = aux_energy_function(runtime.table.model, runtime.info.sub_cv_names)
+    if expr != want:
+        raise AuxObservationError(f"auxiliary force{where} energy expression {expr!r} is not the runtime model's "
+                                  f"{want!r} (offset/scale differ)")
+
+
+def resolve_aux_force(system, runtime: AuxRuntime, *, replica=None):
+    """The auxiliary force of one replica's own System (never the setup force object), checked."""
+    n = int(system.getNumForces())
+    if not 0 <= runtime.force_index < n:
+        raise AuxObservationError(f"replica System{_where(replica)} has {n} forces; no auxiliary force at index "
+                                  f"{runtime.force_index}")
+    force = system.getForce(runtime.force_index)
+    check_aux_force(force, runtime, replica=replica)
+    return force
+
+
+def aux_z_from_force(context, force, runtime: AuxRuntime, *, replica=None) -> float:
+    """z as the aux force on ``context`` computes it: (offset + sum of its sub-CV values) / scale.
+
+    The caller has checked ``force`` (``check_aux_force``). A failed read raises; it never becomes NaN.
+    """
+    where = _where(replica)
+    if force is None:
+        raise AuxObservationError(f"force-side aux z evaluator unavailable{where}: no auxiliary force to read")
+    try:
+        values = np.asarray(force.getCollectiveVariableValues(context), dtype=np.float64)
+    except Exception as exc:  # noqa: BLE001 -- recorded as a failure, never substituted
+        raise AuxObservationError(f"force-side aux z read failed{where}: {type(exc).__name__}: {exc}") from exc
+    if values.shape != (len(runtime.info.sub_cv_names),):
+        raise AuxObservationError(f"auxiliary force{where} returned {values.size} sub-CV values for "
+                                  f"{len(runtime.info.sub_cv_names)} sub-CVs")
+    model = runtime.table.model
+    return float((model.offset + values.sum()) / model.scale)
+
+
 def observe_aux_z(context, runtime: AuxRuntime, *, force=None, positions_nm=None) -> float:
     """z of one carrier under the phase's auxiliary model, whatever state it occupies.
 
+    ``force=``: the aux force's own value on ``context`` (checked first). ``positions_nm=``: the independent
+    NumPy evaluator (used for parity and for the pull end-state check, never as the runtime z).
     Never raises on a non-finite value: the observation is recorded as is, and
     ``aux_bias_matrix_kcal`` refuses it when an active state needs it (sham arms may record NaN).
-    The fast path cannot see a degenerate torsion (OpenMM returns a finite theta there).
+    The force cannot see a degenerate torsion (OpenMM returns a finite theta there).
     """
     if (force is None) == (positions_nm is None):
-        raise ValueError("observe_aux_z needs exactly one of force= (fast path) or positions_nm= (slow path)")
-    model = runtime.table.model
+        raise ValueError("observe_aux_z needs exactly one of force= (force side) or positions_nm= (positions)")
     if force is not None:
-        values = np.asarray(force.getCollectiveVariableValues(context), dtype=np.float64)
-        return float((model.offset + values.sum()) / model.scale)
-    return float(z_from_positions(positions_nm, model)[0])
+        check_aux_force(force, runtime)
+        return aux_z_from_force(context, force, runtime)
+    return float(z_from_positions(positions_nm, runtime.table.model)[0])
 
 
 def check_aux_geometry(positions_nm, runtime: AuxRuntime, *, replica=None) -> None:
@@ -180,23 +244,29 @@ def check_aux_geometry(positions_nm, runtime: AuxRuntime, *, replica=None) -> No
                                   "active; failing the segment (spec 3.3)")
 
 
-def make_aux_z_observer(runtime: AuxRuntime, *, use_fast_path: bool, fast_forces, unit):
+def checked_aux_forces(runtime: AuxRuntime, aux_forces) -> list:
+    """Every replica's aux force, checked at observer construction (F07)."""
+    forces = list(aux_forces)
+    for r, force in enumerate(forces):
+        check_aux_force(force, runtime, replica=r)
+    return forces
+
+
+def make_aux_z_observer(runtime: AuxRuntime, *, aux_forces, unit):
     """The single per-carrier z observer for both the sample and the exchange path.
 
-    With any active state: one positions read, a geometry check, then the fast-path z (the force's
-    own value) or the slow-path z. With no active state: positions only on the slow path; never raises.
+    z is always the aux force's own value on the replica's Context (F07), whichever CV1/CV2 path the run
+    observes its umbrella CVs on. With any active state one positions read feeds the geometry check
+    (the force sees a finite theta at degenerate geometry); with none, no positions are read.
     """
     any_active = any(float(k) > 0.0 for k in runtime.table.k_kcal)
+    forces = checked_aux_forces(runtime, aux_forces)
 
     def observe(r, sim) -> float:
-        pos = None
-        if any_active or not use_fast_path:
-            pos = sim.context.getState(getPositions=True).getPositions(asNumpy=True).value_in_unit(unit.nanometer)
         if any_active:
+            pos = sim.context.getState(getPositions=True).getPositions(asNumpy=True).value_in_unit(unit.nanometer)
             check_aux_geometry(pos, runtime, replica=r)
-        if use_fast_path:
-            return observe_aux_z(sim.context, runtime, force=fast_forces[r])
-        return observe_aux_z(sim.context, runtime, positions_nm=pos)
+        return aux_z_from_force(sim.context, forces[r], runtime, replica=r)
 
     return observe
 

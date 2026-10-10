@@ -276,7 +276,9 @@ def aux_io_runtime(runtime, *, state_definition, topology, args, platform, conte
     if fallback_reason is not None:
         print(f"WARNING: auxiliary runtime precision fell back to {precision!r} ({fallback_reason}); parity uses "
               "that tolerance and the samples' runtime block records precision_fallback", flush=True)
-    info = runtime_info(platform.getName(), precision, fallback_reason)
+    from .runtime_io import AUX_Z_REFERENCE, AUX_Z_SOURCE
+    info = runtime_info(platform.getName(), precision, fallback_reason, z_source=AUX_Z_SOURCE,
+                        z_reference=AUX_Z_REFERENCE)
     return AuxIORuntime(state_definition, {model.model_sha256: model}, runtime.info, schema, info,
                         exchange_energy_version_for_args(args), str(args.aux_phase_kind),
                         bool(args.aux_equilibrium_eligible), topology_identity_sha256(topology))

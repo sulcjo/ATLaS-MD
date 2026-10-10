@@ -51,9 +51,7 @@ def build_aux_force(openmm, model: AuxModel, *, force_group: int):
             tf.addTorsion(*[int(a) for a in quad], [weight])
         cv.addCollectiveVariable(name, tf)
         names.append(name)
-    z_expr = f"(({model.offset:.17g})" + "".join(f" + {n}" for n in names) + f")/({model.scale:.17g})"
-    cv.setEnergyFunction(
-        f"select({AUX_GLOBAL_K}, 0.5*{AUX_GLOBAL_K}*(auxz-{AUX_GLOBAL_C})^2, 0); auxz = {z_expr}")
+    cv.setEnergyFunction(aux_energy_function(model, names))
     cv.addGlobalParameter(AUX_GLOBAL_K, 0.0)
     cv.addGlobalParameter(AUX_GLOBAL_C, 0.0)
     cv.setForceGroup(int(force_group))
@@ -61,6 +59,13 @@ def build_aux_force(openmm, model: AuxModel, *, force_group: int):
     info = AuxForceInfo(AUX_FORCE_NAME, int(force_group), model.model_sha256,
                         AUX_GLOBAL_K, AUX_GLOBAL_C, tuple(names))
     return cv, info
+
+
+def aux_energy_function(model: AuxModel, sub_cv_names) -> str:
+    """The aux force's energy expression: z's offset and scale are literals in it (exact ``.17g``), so a
+    force whose expression equals this one for ``model`` computes z = (offset + sum of sub-CVs) / scale."""
+    z_expr = f"(({model.offset:.17g})" + "".join(f" + {n}" for n in sub_cv_names) + f")/({model.scale:.17g})"
+    return f"select({AUX_GLOBAL_K}, 0.5*{AUX_GLOBAL_K}*(auxz-{AUX_GLOBAL_C})^2, 0); auxz = {z_expr}"
 
 
 def aux_parameter_values(*, center, k_kcal) -> tuple[float, float]:

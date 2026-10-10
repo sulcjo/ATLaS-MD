@@ -71,3 +71,17 @@ def test_missing_precision_raises(tmp_path, monkeypatch):
                         lambda d: {k: {"platform": "CUDA"} for k in real(d)})
     with pytest.raises(IntegrityError, match="precision"):
         parity_report(tmp_path)
+
+
+def test_rows_record_the_runtime_z_source(tmp_path, monkeypatch):
+    """F07: each row names the stored z's evaluator (from the samples' runtime block) and the reference."""
+    import gareus.auxiliary_cv.offline as off
+    _run(tmp_path, historical=False)
+    (legacy,) = parity_report(tmp_path)["segments"].values()
+    assert legacy["runtime_z_source"] == "unrecorded" and legacy["reference_z_source"] == "positions"
+    real = off.segment_aux_runtime
+    monkeypatch.setattr(off, "segment_aux_runtime",
+                        lambda d: {k: {**v, "aux_z_source": "force", "aux_z_reference": "positions"}
+                                   for k, v in real(d).items()})
+    (row,) = parity_report(tmp_path)["segments"].values()
+    assert row["runtime_z_source"] == "force" and row["reference_z_source"] == "positions" and row["ok"] is True

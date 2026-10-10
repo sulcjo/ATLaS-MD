@@ -130,7 +130,9 @@ def test_aux_io_runtime_fields_and_precision_fallback(capsys):
                                  aux_equilibrium_eligible=True, aux_cv_model="m.json")
     io = aux_io_runtime(runtime, state_definition={"x": 1}, topology=d["topology"], args=args,
                         platform=_Platform("Reference"), context=ctx)
-    assert io.runtime == {"platform": "Reference", "precision": "double"}
+    # F07: an aux run's runtime block names the stored z's evaluator (aux force) and its parity reference.
+    assert io.runtime == {"platform": "Reference", "precision": "double", "aux_z_source": "force",
+                          "aux_z_reference": "positions"}
     assert io.phase_kind == "production" and io.equilibrium_eligible is True
     assert io.state_definition == {"x": 1} and list(io.models) == [runtime.table.model.model_sha256]
     assert "WARNING" not in capsys.readouterr().out

@@ -71,37 +71,36 @@ def _degenerate(ctx, rt, d):
     return bad
 
 
-@pytest.mark.parametrize("fast", [True, False])
-def test_live_degenerate_geometry_with_an_active_state_raises_on_both_paths(fast):
+def test_live_degenerate_geometry_with_an_active_state_raises_on_both_paths():
     """Board condition 1 / spec 3.3: the fast path alone sees a finite theta, so the observer checks geometry."""
     from openmm import unit
     from gareus.auxiliary_cv.runtime import AuxObservationError, make_aux_z_observer
     ctx, rt, force, d = _setup()
     _degenerate(ctx, rt, d)
     active = _with_table(rt, 2.0)
-    observe = make_aux_z_observer(active, use_fast_path=fast, fast_forces=[force], unit=unit)
+    observe = make_aux_z_observer(active, aux_forces=[force], unit=unit)
     with pytest.raises(AuxObservationError, match="degenerate"):
         observe(0, types.SimpleNamespace(context=ctx))
 
 
-@pytest.mark.parametrize("fast", [True, False])
-def test_sham_only_population_never_raises_on_degenerate_geometry(fast):
+def test_sham_only_population_never_raises_on_degenerate_geometry():
     from openmm import unit
     from gareus.auxiliary_cv.runtime import make_aux_z_observer
     ctx, rt, force, d = _setup()
     _degenerate(ctx, rt, d)
     sham = _with_table(rt, 0.0)
-    z = make_aux_z_observer(sham, use_fast_path=fast, fast_forces=[force], unit=unit)(0, types.SimpleNamespace(context=ctx))
-    assert (math.isfinite(z) if fast else math.isnan(z))      # recorded, never raised
+    z = make_aux_z_observer(sham, aux_forces=[force], unit=unit)(0, types.SimpleNamespace(context=ctx))
+    # F07: z is the force's own value on every CV1 path, and the force sees a finite theta at degenerate
+    # geometry; the slow path used to record the NumPy evaluator's NaN here. Recorded, never raised.
+    assert math.isfinite(z)
 
 
-@pytest.mark.parametrize("fast", [True, False])
-def test_regular_geometry_with_an_active_state_returns_the_path_z(fast):
+def test_regular_geometry_with_an_active_state_returns_the_path_z():
     from openmm import unit
     from gareus.auxiliary_cv.runtime import make_aux_z_observer
     ctx, rt, force, d = _setup()
     active = _with_table(rt, 2.0)
-    z = make_aux_z_observer(active, use_fast_path=fast, fast_forces=[force], unit=unit)(0, types.SimpleNamespace(context=ctx))
+    z = make_aux_z_observer(active, aux_forces=[force], unit=unit)(0, types.SimpleNamespace(context=ctx))
     assert z == pytest.approx(z_from_positions(d["positions_nm"], rt.table.model)[0], abs=1e-9)
 
 

@@ -8000,7 +8000,7 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
               "fast-path scalar; observing it from positions instead")
     # ── Auxiliary-CV states (spec 3.3/4.2): one z per carrier, whatever state it occupies ──
     _aux_rt = getattr(args, "_aux_runtime", None)
-    _fast_aux_forces = [None] * nrep
+    _aux_forces = [None] * nrep
     if _aux_rt is not None:
         # Task-6 alignment: one aux state per replica slot, in the window order the table was loaded in.
         if _aux_rt.table.n != nrep or len(centers_a) != nrep:
@@ -8010,15 +8010,13 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                                  nrep) != _aux_window_key:
             raise RuntimeError("window order changed after the auxiliary state table was loaded; "
                                "each auxiliary term would pair with another window's restraints")
-        from .auxiliary_cv.force import AUX_FORCE_NAME as _AUX_CV_FORCE_NAME
-        from .auxiliary_cv.runtime import aux_bias_matrix_kcal, make_aux_z_observer
-        _fast_aux_forces = [sim.system.getForce(_aux_rt.force_index) for sim in sims]
-        if any(f.getName() != _AUX_CV_FORCE_NAME for f in _fast_aux_forces):
-            raise RuntimeError("replica systems do not carry the auxiliary-CV force at the base system's index")
+        from .auxiliary_cv.runtime import aux_bias_matrix_kcal, make_aux_z_observer, resolve_aux_force
+        # F07: each replica's own aux force (resolved from its own System and checked against the model),
+        # read on its own Context whatever CV1/CV2 path the run uses -- never the NumPy evaluator.
+        _aux_forces = [resolve_aux_force(sim.system, _aux_rt, replica=r) for r, sim in enumerate(sims)]
         # The single z observation both the sample writer and the exchange kernel use; with any
         # active state it also fails the segment on a degenerate torsion (spec 3.3, Task 5).
-        _aux_z_for_replica = make_aux_z_observer(_aux_rt, use_fast_path=_use_fast_cv_path,
-                                                 fast_forces=_fast_aux_forces, unit=unit)
+        _aux_z_for_replica = make_aux_z_observer(_aux_rt, aux_forces=_aux_forces, unit=unit)
     else:
         def _aux_z_for_replica(r, sim) -> float:
             return float("nan")
@@ -8335,7 +8333,7 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
             raise RuntimeError("auxiliary topology identity is not the solvated start PDB's "
                                f"({_aux_io.topology_sha256} vs {_aux_whole_topology_sha})")
         _aux_record_for_replica = make_aux_record_observer(
-            args._aux_runtime, use_fast_path=_use_fast_cv_path, fast_forces=_fast_aux_forces, unit=unit,
+            args._aux_runtime, aux_forces=_aux_forces, unit=unit,
             schema=_aux_io.sample_schema, models=_aux_io.models)
     if _aux_io is not None:
         # Final fix wave M2: every auxiliary refusal runs before the segment is registered -- the boundary

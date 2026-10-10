@@ -116,3 +116,20 @@ def test_runtime_precision_of_reference_and_cpu_contexts():
         assert runtime_precision(plat.getName(), plat, ctx) == expected
     assert runtime_precision("SomethingElse") == "single"
     assert PARITY_TOLERANCE == {"double": 1e-6, "mixed": 1e-4, "single": 1e-4}
+
+
+def test_runtime_block_carries_the_z_source_through_the_payload():
+    """F07: the force/positions sources survive payload_with_runtime -> runtime_from_payload; without them the
+    block is byte-identical to before (pinned dicts elsewhere), and a lone or unknown source is refused."""
+    from gareus.auxiliary_cv.sample_schema import runtime_from_payload
+    d = dipeptide()
+    s = build_sample_schema(d["topology"], _peptide_atoms(d), [_model(d, 0)])
+    info = runtime_info("CUDA", "mixed", z_source="force", z_reference="positions")
+    assert info == {"platform": "CUDA", "precision": "mixed", "aux_z_source": "force", "aux_z_reference": "positions"}
+    assert runtime_info("CUDA", "mixed") == {"platform": "CUDA", "precision": "mixed"}
+    assert runtime_from_payload(payload_with_runtime(s, info)) == info
+    assert runtime_from_payload({"runtime": info}) == info
+    for bad in ({"z_source": "force"}, {"z_source": "positions", "z_reference": "positions"},
+                {"z_source": "force", "z_reference": "force"}):
+        with pytest.raises(IntegrityError, match="source"):
+            runtime_info("CUDA", "mixed", **bad)

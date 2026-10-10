@@ -106,8 +106,8 @@ def check_runtime_parity(runtime_z, positions_z, *, beta: float, k_max_kcal: flo
     du = parity_violation(runtime_z[both], positions_z[both], beta=beta, k_max_kcal=k_max_kcal, centers=centers)
     worst = float(np.max(du))
     if not np.isfinite(worst) or worst > float(tolerance):
-        raise AuxObservationError(f"runtime/positions aux z parity: reduced disagreement {worst:.3g} > "
-                                  f"{tolerance:g}")
+        raise AuxObservationError(f"runtime/positions aux z parity ({AUX_Z_SOURCE} vs {AUX_Z_REFERENCE}): reduced "
+                                  f"disagreement {worst:.3g} > {tolerance:g}")
 
 
 def context_box_nm(context, unit) -> list:
@@ -125,26 +125,29 @@ def check_fixed_box(boxes, fixed_box, *, label: str) -> None:
                                  f"{want.tolist()}; an NVT auxiliary state definition needs one fixed box")
 
 
-def make_aux_record_observer(runtime, *, use_fast_path: bool, fast_forces, unit, schema, models):
+#: Where the stored runtime z (``aux_z_00``) and its parity reference come from (F07).
+AUX_Z_SOURCE = "force"
+AUX_Z_REFERENCE = "positions"
+
+
+def make_aux_record_observer(runtime, *, aux_forces, unit, schema, models):
     """Per-sample observation of an auxiliary run.
 
-    ONE positions read per carrier gives the geometry check (only with an active state), the stored
-    torsion basis and the positions z used for runtime parity. The runtime exchange z is computed as
-    Stage B's ``make_aux_z_observer`` does: on the fast path the force's own value, on the slow path
-    these positions (ruling M4: no second positions read).
+    The runtime z is always the aux force's own value on the replica's Context (F07; ``AUX_Z_SOURCE``),
+    whichever CV1/CV2 path the run uses. ONE positions read per carrier gives the geometry check (only
+    with an active state), the stored torsion basis and the independent positions z (``AUX_Z_REFERENCE``)
+    that runtime parity compares it with.
     """
-    from .runtime import check_aux_geometry, observe_aux_z
+    from .runtime import aux_z_from_force, check_aux_geometry, checked_aux_forces
     from .sample_schema import observe_carrier
     any_active = any(float(k) > 0.0 for k in runtime.table.k_kcal)
+    forces = checked_aux_forces(runtime, aux_forces)
 
     def observe(r, sim):
         pos = sim.context.getState(getPositions=True).getPositions(asNumpy=True).value_in_unit(unit.nanometer)
         if any_active:
             check_aux_geometry(pos, runtime, replica=r)
-        if use_fast_path:
-            z_runtime = observe_aux_z(sim.context, runtime, force=fast_forces[r])
-        else:
-            z_runtime = observe_aux_z(sim.context, runtime, positions_nm=pos)
+        z_runtime = aux_z_from_force(sim.context, forces[r], runtime, replica=r)
         obs = observe_carrier(pos, schema, models)
         return float(z_runtime), obs.torsions, float(obs.z[0])
 

@@ -139,7 +139,14 @@ def runtime_precision(platform_name: str, platform=None, context=None) -> str:
     return runtime_precision_info(platform_name, platform, context)[0]
 
 
-def runtime_info(platform_name: str, precision: str, fallback_reason: Optional[str] = None) -> dict[str, Any]:
+#: Runtime-z evaluation sources a samples payload may record (F07): the aux force on each replica's Context.
+AUX_Z_SOURCES = ("force",)
+#: The independent value runtime parity compares the stored z with.
+AUX_Z_REFERENCES = ("positions",)
+
+
+def runtime_info(platform_name: str, precision: str, fallback_reason: Optional[str] = None, *,
+                 z_source: Optional[str] = None, z_reference: Optional[str] = None) -> dict[str, Any]:
     if precision not in PRECISIONS:
         raise IntegrityError(f"runtime precision must be one of {PRECISIONS}, got {precision!r}")
     info: dict[str, Any] = {"platform": str(platform_name), "precision": str(precision)}
@@ -147,7 +154,20 @@ def runtime_info(platform_name: str, precision: str, fallback_reason: Optional[s
         # Only on a fallback: the normal block (and its payload bytes) is unchanged.
         info["precision_fallback"] = True
         info["precision_fallback_reason"] = str(fallback_reason)
+    if (z_source is None) != (z_reference is None):
+        raise IntegrityError("runtime aux z source and reference are recorded together or not at all")
+    if z_source is not None:
+        # F07: written by every run since the force-side observer; absent in older payloads ("unrecorded").
+        if z_source not in AUX_Z_SOURCES or z_reference not in AUX_Z_REFERENCES:
+            raise IntegrityError(f"runtime aux z source/reference must be one of {AUX_Z_SOURCES}/"
+                                 f"{AUX_Z_REFERENCES}, got {z_source!r}/{z_reference!r}")
+        info["aux_z_source"] = str(z_source)
+        info["aux_z_reference"] = str(z_reference)
     return info
+
+
+def _z_sources(block: Mapping[str, Any]) -> dict[str, Optional[str]]:
+    return {"z_source": block.get("aux_z_source"), "z_reference": block.get("aux_z_reference")}
 
 
 def _fallback_reason(block: Mapping[str, Any]) -> Optional[str]:
@@ -156,7 +176,7 @@ def _fallback_reason(block: Mapping[str, Any]) -> Optional[str]:
 
 def payload_with_runtime(schema: AuxSampleSchema, info: Mapping[str, str]) -> dict[str, Any]:
     payload = schema.to_payload()
-    payload["runtime"] = runtime_info(info["platform"], info["precision"], _fallback_reason(info))
+    payload["runtime"] = runtime_info(info["platform"], info["precision"], _fallback_reason(info), **_z_sources(info))
     return payload
 
 
@@ -164,4 +184,5 @@ def runtime_from_payload(payload: Mapping[str, Any]) -> Optional[dict[str, str]]
     block = payload.get("runtime")
     if block is None:
         return None
-    return runtime_info(block.get("platform", ""), block.get("precision", ""), _fallback_reason(block))
+    return runtime_info(block.get("platform", ""), block.get("precision", ""), _fallback_reason(block),
+                        **_z_sources(block))

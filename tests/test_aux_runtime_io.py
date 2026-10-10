@@ -109,13 +109,12 @@ def _record_setup(k_kcal):
     return ctx, runtime, force, d, schema, {rt.table.model.model_sha256: rt.table.model}
 
 
-@pytest.mark.parametrize("fast", [True, False])
-def test_record_observer_one_read_gives_runtime_z_torsions_and_positions_z(fast):
+def test_record_observer_one_read_gives_runtime_z_torsions_and_positions_z():
     from openmm import unit
     from gareus.auxiliary_cv.runtime_io import make_aux_record_observer
     from gareus.auxiliary_cv.sample_schema import observe_carrier
     ctx, runtime, force, d, schema, models = _record_setup(2.0)
-    observe = make_aux_record_observer(runtime, use_fast_path=fast, fast_forces=[force], unit=unit,
+    observe = make_aux_record_observer(runtime, aux_forces=[force], unit=unit,
                                        schema=schema, models=models)
     z_rt, tors, z_pos = observe(0, types.SimpleNamespace(context=ctx))
     ref = observe_carrier(d["positions_nm"], schema, models)
@@ -123,8 +122,7 @@ def test_record_observer_one_read_gives_runtime_z_torsions_and_positions_z(fast)
     assert z_pos == pytest.approx(float(ref.z[0]), abs=1e-12) and z_rt == pytest.approx(z_pos, abs=1e-9)
 
 
-@pytest.mark.parametrize("fast", [True, False])
-def test_record_observer_checks_geometry_only_with_an_active_state(fast):
+def test_record_observer_checks_geometry_only_with_an_active_state():
     from openmm import unit
     from test_aux_cv_observation import _degenerate
     from gareus.auxiliary_cv.runtime import AuxObservationError
@@ -132,7 +130,7 @@ def test_record_observer_checks_geometry_only_with_an_active_state(fast):
     for k, raises in ((2.0, True), (0.0, False)):
         ctx, runtime, force, d, schema, models = _record_setup(k)
         _degenerate(ctx, runtime, d)
-        observe = make_aux_record_observer(runtime, use_fast_path=fast, fast_forces=[force], unit=unit,
+        observe = make_aux_record_observer(runtime, aux_forces=[force], unit=unit,
                                            schema=schema, models=models)
         if raises:
             with pytest.raises(AuxObservationError, match="degenerate"):
@@ -141,8 +139,7 @@ def test_record_observer_checks_geometry_only_with_an_active_state(fast):
             observe(0, types.SimpleNamespace(context=ctx))
 
 
-@pytest.mark.parametrize("fast", [True, False])
-def test_record_observer_reads_positions_once_per_carrier(fast):
+def test_record_observer_reads_positions_once_per_carrier():
     """Carry-over 10: ONE getState(getPositions=True) per carrier per sample."""
     from openmm import unit
     from gareus.auxiliary_cv.runtime_io import make_aux_record_observer
@@ -154,11 +151,17 @@ def test_record_observer_reads_positions_once_per_carrier(fast):
             calls.append(kw)
             return ctx.getState(**kw)
 
-    class _Force:      # the fast path reads the force's own value through the real Context
-        def getCollectiveVariableValues(self, _c):
-            return force.getCollectiveVariableValues(ctx)
+    class _Force:      # the force's own value, read through the real Context
+        def __init__(self, inner):
+            self._inner = inner
 
-    observe = make_aux_record_observer(runtime, use_fast_path=fast, fast_forces=[_Force()], unit=unit,
+        def __getattr__(self, name):
+            return getattr(self._inner, name)
+
+        def getCollectiveVariableValues(self, _c):
+            return self._inner.getCollectiveVariableValues(ctx)
+
+    observe = make_aux_record_observer(runtime, aux_forces=[_Force(force)], unit=unit,
                                        schema=schema, models=models)
     z_rt, _tors, _zpos = observe(0, types.SimpleNamespace(context=_Ctx()))
     assert sum(1 for kw in calls if kw.get("getPositions")) == 1
@@ -463,3 +466,173 @@ def test_final_report_skips_the_legacy_npz_validators_on_an_aux_run(tmp_path, mo
     production._final_report_validations(tmp_path, legacy_args, 0.3, 0.3)
     assert called == ["validate_analysis_metadata_readiness", "validate_us_mbar_inputs",
                       "compute_gamd_reweighting_diagnostics"]
+
+
+# ── F07: runtime z always comes from each replica's own aux force ──────────────
+
+def _cv1_force(mm, system, cv1):
+    """A CV1 force of the given kind, so the System looks like a slow-path (distance) or fast-path
+    (contact CustomCVForce) production System; the aux observer must not care which."""
+    bond = mm.CustomBondForce("r")
+    bond.addBond(0, 5, [])
+    if cv1 == "distance":
+        bond.setForceGroup(31)
+        system.addForce(bond)
+        return
+    cv = mm.CustomCVForce("0*contacts")
+    cv.addCollectiveVariable("contacts", bond)
+    cv.setForceGroup(31)
+    system.addForce(cv)
+
+
+def _perturbed_setup(k_kcal, *, cv1, d_offset=0.0, d_coeff=0.0, positions=None):
+    """Context whose aux force is built from a model that differs from the runtime's true model by
+    ``d_offset`` / ``d_coeff`` (on the first coefficient); positions are unchanged."""
+    import dataclasses
+    import openmm as mm
+    from aux_cv_fixture import dipeptide, model_payload
+    from pep_gamd_fixture import _fresh_system
+    from gareus.auxiliary_cv.model import AuxModel
+    from gareus.auxiliary_cv.runtime import add_aux_cv_force
+    from gareus.auxiliary_cv.sample_schema import build_sample_schema
+    from gareus.auxiliary_cv.state_table import AuxStateTable
+    d = dipeptide()
+    blocks = [lab.split("-")[0] for lab in d["labels"]]
+    coeffs = np.random.default_rng(5).normal(size=2 * len(d["quads"]))
+    true = AuxModel.from_mapping(model_payload(d["quads"], coeffs, offset=-0.3, blocks=blocks, scale=1.7))
+    bumped = coeffs.copy()
+    bumped[0] += d_coeff
+    forced = AuxModel.from_mapping(model_payload(d["quads"], bumped, offset=-0.3 + d_offset, blocks=blocks,
+                                                 scale=1.7))
+    system = _fresh_system()
+    _cv1_force(mm, system, cv1)
+    rt = add_aux_cv_force(mm, system, AuxStateTable(forced, (0.0,), (0.0,), (None,)),
+                          SimpleNamespace(umbrella_force_group=31, secondary_cv_force_group=29))
+    runtime = dataclasses.replace(rt, table=AuxStateTable(true, (0.5,), (float(k_kcal),), (None,)))
+    ctx = mm.Context(system, mm.VerletIntegrator(0.001), mm.Platform.getPlatformByName("Reference"))
+    ctx.setPositions(d["positions_nm"] if positions is None else positions)
+    atoms = sorted({a for q in d["quads"] for a in q})
+    schema = build_sample_schema(d["topology"], atoms, [true])
+    return ctx, runtime, system, d, schema, {true.model_sha256: true}
+
+
+def _observe_and_check(runtime, ctx, force, schema, models):
+    from openmm import unit
+    from gareus.auxiliary_cv.runtime_io import make_aux_record_observer
+    from gareus.auxiliary_cv.sample_schema import PARITY_TOLERANCE
+    observe = make_aux_record_observer(runtime, aux_forces=[force], unit=unit, schema=schema, models=models)
+    z_rt, _tors, z_pos = observe(0, SimpleNamespace(context=ctx))
+    check_runtime_parity(np.array([z_rt]), np.array([z_pos]), beta=0.4, k_max_kcal=float(max(runtime.table.k_kcal)),
+                         centers=list(runtime.table.centers), tolerance=PARITY_TOLERANCE["double"])
+    return z_rt, z_pos
+
+
+@pytest.mark.parametrize("cv1", ["distance", "contacts"])     # slow-path / fast-path production Systems
+def test_force_side_weight_perturbation_is_detected_on_both_cv1_paths(cv1):
+    """F07: positions unchanged, only the aux force's torsion weight differs -> parity fails (the slow path
+    used to compare the NumPy evaluator with itself and pass)."""
+    from gareus.auxiliary_cv.runtime import AuxObservationError
+    ctx, runtime, system, _d, schema, models = _perturbed_setup(2.0, cv1=cv1, d_coeff=1e-3)
+    with pytest.raises(AuxObservationError, match="parity"):
+        _observe_and_check(runtime, ctx, system.getForce(runtime.force_index), schema, models)
+
+
+@pytest.mark.parametrize("cv1", ["distance", "contacts"])
+def test_force_side_offset_perturbation_is_refused_on_both_cv1_paths(cv1):
+    """The offset/scale are literals in the force's expression, invisible to getCollectiveVariableValues: a
+    force whose offset differs from the runtime model's is refused before any z is read."""
+    from gareus.auxiliary_cv.runtime import AuxObservationError
+    ctx, runtime, system, _d, schema, models = _perturbed_setup(2.0, cv1=cv1, d_offset=1e-3)
+    with pytest.raises(AuxObservationError, match="offset/scale differ"):
+        _observe_and_check(runtime, ctx, system.getForce(runtime.force_index), schema, models)
+
+
+@pytest.mark.parametrize("cv1", ["distance", "contacts"])
+def test_unperturbed_force_passes_parity_on_both_cv1_paths(cv1):
+    ctx, runtime, system, _d, schema, models = _perturbed_setup(2.0, cv1=cv1)
+    z_rt, z_pos = _observe_and_check(runtime, ctx, system.getForce(runtime.force_index), schema, models)
+    assert z_rt == pytest.approx(z_pos, abs=1e-9)
+
+
+def test_inactive_state_still_records_the_force_side_z():
+    """k = 0: the stored runtime z is the force's value, not the positions' z (and parity is vacuous)."""
+    from openmm import unit
+    from gareus.auxiliary_cv.runtime_io import make_aux_record_observer
+    from gareus.auxiliary_cv.features import openmm_dihedrals
+    ctx, runtime, system, d, schema, models = _perturbed_setup(0.0, cv1="distance", d_coeff=0.25)
+    observe = make_aux_record_observer(runtime, aux_forces=[system.getForce(runtime.force_index)], unit=unit,
+                                       schema=schema, models=models)
+    z_rt, _tors, z_pos = observe(0, SimpleNamespace(context=ctx))
+    f0 = runtime.table.model.feature_schema.features[0]
+    theta = openmm_dihedrals(d["positions_nm"], [tuple(f0.atom_indices)])[0][0]
+    sign = -1.0 if f0.dihedral_sign_convention == "negated" else 1.0
+    expected = 0.25 * getattr(np, f0.trig)(sign * theta) / runtime.table.model.scale
+    assert z_rt - z_pos == pytest.approx(expected, abs=1e-9) and abs(expected) > 1e-3
+
+
+def test_cloned_contexts_each_read_their_own_force():
+    """Two replica Systems (serialised clones), different positions: each observer slot reads its own
+    Context's force; a force of another System cannot be read on a Context."""
+    import openmm as mm
+    from openmm import unit
+    from gareus.auxiliary_cv.runtime import AuxObservationError, resolve_aux_force
+    from gareus.auxiliary_cv.runtime_io import make_aux_record_observer
+    ctx_a, runtime, system_a, d, schema, models = _perturbed_setup(2.0, cv1="distance")
+    system_b = mm.XmlSerializer.deserialize(mm.XmlSerializer.serialize(system_a))
+    pos_b = d["positions_nm"].copy()
+    q = runtime.table.model.feature_schema.features[0].atom_indices
+    pos_b[q[0]] = pos_b[q[0]] + np.array([0.03, -0.02, 0.01])
+    ctx_b = mm.Context(system_b, mm.VerletIntegrator(0.001), mm.Platform.getPlatformByName("Reference"))
+    ctx_b.setPositions(pos_b)
+    forces = [resolve_aux_force(s, runtime, replica=r) for r, s in enumerate((system_a, system_b))]
+    observe = make_aux_record_observer(runtime, aux_forces=forces, unit=unit, schema=schema, models=models)
+    z_a, _ta, zp_a = observe(0, SimpleNamespace(context=ctx_a))
+    z_b, _tb, zp_b = observe(1, SimpleNamespace(context=ctx_b))
+    assert z_a == pytest.approx(zp_a, abs=1e-9) and z_b == pytest.approx(zp_b, abs=1e-9)
+    assert abs(z_a - z_b) > 1e-4
+    crossed = make_aux_record_observer(runtime, aux_forces=forces[::-1], unit=unit, schema=schema, models=models)
+    with pytest.raises(AuxObservationError, match="read failed"):
+        crossed(0, SimpleNamespace(context=ctx_a))
+
+
+def test_missing_or_foreign_force_is_unavailable_never_the_positions_evaluator():
+    import openmm as mm
+    from openmm import unit
+    from gareus.auxiliary_cv.runtime import AuxObservationError, make_aux_z_observer, resolve_aux_force
+    from gareus.auxiliary_cv.runtime_io import make_aux_record_observer
+    _ctx, runtime, system, _d, schema, models = _perturbed_setup(0.0, cv1="distance")
+    for bad in (None, mm.CustomCVForce("0")):
+        with pytest.raises(AuxObservationError, match="unavailable|not 'ATLaSAuxCVUmbrella'"):
+            make_aux_record_observer(runtime, aux_forces=[bad], unit=unit, schema=schema, models=models)
+        with pytest.raises(AuxObservationError, match="unavailable|not 'ATLaSAuxCVUmbrella'"):
+            make_aux_z_observer(runtime, aux_forces=[bad], unit=unit)
+    with pytest.raises(AuxObservationError, match="no auxiliary force at index"):
+        resolve_aux_force(mm.System(), runtime)
+
+
+def test_pure_offset_projection_reads_no_sub_cv():
+    """z = (offset + sum of sub-CVs) / scale with no sub-CV is offset / scale (the projection's offset term)."""
+    from gareus.auxiliary_cv.runtime import aux_z_from_force
+    rt = SimpleNamespace(table=SimpleNamespace(model=SimpleNamespace(offset=-0.75, scale=2.5)),
+                         info=SimpleNamespace(sub_cv_names=()))
+    force = SimpleNamespace(getCollectiveVariableValues=lambda _c: [])
+    assert aux_z_from_force(None, force, rt) == pytest.approx(-0.3, abs=0.0)
+    two = SimpleNamespace(getCollectiveVariableValues=lambda _c: [0.5, -0.25])
+    rt2 = SimpleNamespace(table=rt.table, info=SimpleNamespace(sub_cv_names=("a", "b")))
+    assert aux_z_from_force(None, two, rt2) == pytest.approx((-0.75 + 0.25) / 2.5, abs=1e-15)
+    from gareus.auxiliary_cv.runtime import AuxObservationError
+    with pytest.raises(AuxObservationError, match="sub-CV values"):
+        aux_z_from_force(None, force, rt2)
+
+
+def test_production_observers_never_select_the_z_evaluator_by_cv_path():
+    """F07 wiring: run_gareus builds both aux observers without the CV fast-path flag, from per-replica
+    forces resolved on each replica's own System."""
+    src = inspect.getsource(__import__("gareus.production", fromlist=["x"]))
+    tree = ast.parse(src)
+    calls = _named_calls(tree, "make_aux_z_observer") + _named_calls(tree, "make_aux_record_observer")
+    assert len(calls) == 2
+    for call in calls:
+        kws = {k.arg for k in call.keywords}
+        assert "aux_forces" in kws and "use_fast_path" not in kws and "fast_forces" not in kws
+    assert _named_calls(tree, "resolve_aux_force")
