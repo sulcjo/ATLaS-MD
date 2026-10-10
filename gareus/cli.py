@@ -720,6 +720,9 @@ def _add_window_args(p: argparse.ArgumentParser) -> None:
                         "every worker and the worker burn-in discards their samples. Off by default.")
     p.add_argument("--ap-aux-reserve-slots", type=int, default=4,
                    help="Replica slots of the P1 reserve kept for auxiliary workers (R1/R3 never use them).")
+    p.add_argument("--ap-aux-validation", choices=("required", "off"), default="required",
+                   help="Gate on aux worker admission: required (default) = adaptive_production/aux_validation.json "
+                        "must be valid; off = skip it (k3 cap from aux_settings k3_max_unvalidated). Frozen per campaign.")
     p.add_argument("--ap-aux-settings-override", action="store_true", default=False,
                    help="Replace the campaign's recorded aux_settings.json with this job's values.")
     p.add_argument("--ap-cv2-respring", action=argparse.BooleanOptionalAction, default=False,
@@ -1984,6 +1987,7 @@ def _shim_adaptive_production(args: argparse.Namespace) -> None:
     args.adaptive_production_cv2_respring = args.ap_cv2_respring
     args.adaptive_production_aux_discovery = bool(getattr(args, "ap_aux_discovery", False))
     args.adaptive_production_aux_reserve_slots = int(getattr(args, "ap_aux_reserve_slots", 4))
+    args.adaptive_production_aux_validation = str(getattr(args, "ap_aux_validation", "required"))
     args.adaptive_production_aux_settings_override = bool(getattr(args, "ap_aux_settings_override", False))
     args.adaptive_production_cv2_bridge_sets = args.ap_cv2_bridge_sets
     args.adaptive_production_respring_min_neff = args.ap_respring_min_neff

@@ -2314,7 +2314,10 @@ numbered epoch (status in epoch_NNN/aux_discovery_report.json: last_epoch, no_sl
 physical_system_unsupported, insufficient_evidence, keep, broaden, null_uninformative_trapped_lineages, no_worker,
 no_eligible_worker, validation_missing, alignment, ok, refused_by_applier, error).
 Model, partition, settings and admission are frozen in adaptive_production/ (aux_*.json);
---ap-aux-settings-override replaces the settings. Workers are invisible to respring, R1-R3,
+--ap-aux-settings-override replaces the settings.
+--ap-aux-validation off (default required; frozen per campaign in aux_campaign_options.json) skips the
+aux_validation.json gate at the driver start and at admission, takes the k3 cap from aux_settings
+k3_max_unvalidated and records validation: off in the admission record and discovery report. Workers are invisible to respring, R1-R3,
 retirement and respace; the union MBAR pools them only after admission, using recorded z
 (post-admission) or XTC-backfilled z (before). Needs --ap-continue-states (frozen per campaign in
 adaptive_production/aux_campaign_options.json; a job without it is refused at parse and at driver

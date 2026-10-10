@@ -62,6 +62,7 @@ class AuxDiscoverySettings:
     heldout_min_frames: int = 50
     heldout_o_min: float = 0.15
     max_workers: int = 4
+    k3_max_unvalidated: float = 10.0     # k3 cap when --ap-aux-validation off (no aux_validation.json k3_max_validated)
     placement_seed: int = 20261007
     # data
     frame_stride_steps: int = 0          # 0 = one exchange interval
@@ -146,6 +147,14 @@ def resolve_aux_settings(adaptive_dir: Path, settings: AuxDiscoverySettings, *,
     return settings, rec
 
 
+def aux_validation_mode(args) -> str:
+    """``--ap-aux-validation`` of this job: ``required`` (default) or ``off``."""
+    mode = str(getattr(args, "ap_aux_validation", None) or "required")
+    if mode not in ("required", "off"):
+        raise ValueError(f"--ap-aux-validation must be required or off, got {mode!r}")
+    return mode
+
+
 def resolve_aux_campaign_options(adaptive_dir: Path, args) -> Dict[str, Any]:
     """Freeze the job options aux discovery depends on (today ``--ap-continue-states``) in the aux-specific record
     ``aux_campaign_options.json`` at the campaign's first aux job; every later job must match it. A mismatch or an
@@ -153,6 +162,9 @@ def resolve_aux_campaign_options(adaptive_dir: Path, args) -> Dict[str, Any]:
     ``DECISION_SETTINGS_FIELDS`` so a non-aux campaign's decision_settings.json is unchanged."""
     path = Path(adaptive_dir) / AUX_CAMPAIGN_OPTIONS_FILENAME
     current = {"continue_states": bool(getattr(args, "ap_continue_states", False))}
+    mode = aux_validation_mode(args)
+    if mode != "required":                   # key written only when off: a required campaign's record is unchanged
+        current["aux_validation"] = mode
     if not path.exists():
         rec = {"schema": AUX_CAMPAIGN_OPTIONS_SCHEMA, "options": current, "written_unix": time.time()}
         _atomic_write_json(path, rec)
@@ -164,6 +176,11 @@ def resolve_aux_campaign_options(adaptive_dir: Path, args) -> Dict[str, Any]:
             raise ValueError(f"schema {rec.get('schema')!r} / options {recorded!r}")
     except Exception as exc:
         raise RuntimeError(f"{path} is not a valid {AUX_CAMPAIGN_OPTIONS_SCHEMA} record ({exc})") from exc
+    # Records written before the switch carry no key: they were validated, i.e. "required".
+    rec_validation = recorded.get("aux_validation", "required")
+    if rec_validation != current.get("aux_validation", "required"):
+        raise RuntimeError(f"{path}: this aux campaign records aux_validation={rec_validation}, this job has "
+                           f"aux_validation={current.get('aux_validation', 'required')}; --ap-aux-validation is frozen per campaign")
     if not recorded["continue_states"] or recorded["continue_states"] != current["continue_states"]:
         raise RuntimeError(f"{path}: this aux campaign records continue_states={recorded['continue_states']}, this "
                            f"job has continue_states={current['continue_states']}; aux discovery runs only with "

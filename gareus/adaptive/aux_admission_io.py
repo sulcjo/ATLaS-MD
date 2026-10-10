@@ -13,8 +13,9 @@ from typing import List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
-from gareus.adaptive.aux_discovery.settings import AuxDiscoverySettings, resolve_aux_settings
-from gareus.adaptive.aux_discovery.validation import check_validation_record
+from gareus.adaptive.aux_discovery.settings import (AuxDiscoverySettings, aux_validation_mode,
+                                                    resolve_aux_settings)
+from gareus.adaptive.aux_discovery.validation import ValidationStatus, check_validation_record
 
 REPORT_SCHEMA = "aux_discovery_report_v1"
 REPORT_NAME = "aux_discovery_report.json"
@@ -249,8 +250,14 @@ def run_epoch_aux_discovery(*, adaptive_dir, epoch_dir, epoch, registry, diagnos
         settings, srec = resolve_aux_settings(adaptive_dir, AuxDiscoverySettings(),
                                               override=bool(getattr(args, "adaptive_production_aux_settings_override", False)))
         report["settings"] = srec.get("settings")
-        val = check_validation_record(adaptive_dir / VALIDATION_FILENAME, timestep_fs=float(args.timestep_fs))
-        report["validation"] = {"ok": val.ok, "reason": val.reason, "k3_max": val.k3_max}
+        if aux_validation_mode(args) == "off":
+            # --ap-aux-validation off: no aux_validation.json is read; the k3 cap is the frozen settings' own.
+            val = ValidationStatus(True, "off", float(settings.k3_max_unvalidated))
+            report["validation"] = {"validation": "off", "ok": True, "reason": "off", "k3_max": val.k3_max,
+                                    "k3_max_source": "aux_settings.k3_max_unvalidated"}
+        else:
+            val = check_validation_record(adaptive_dir / VALIDATION_FILENAME, timestep_fs=float(args.timestep_fs))
+            report["validation"] = {"ok": val.ok, "reason": val.reason, "k3_max": val.k3_max}
         calib = _calib_steps_for_phase(args, adaptive_dir)
         ok, why = phase_alignment_ok(args, calib_steps=calib)
         report["alignment"] = {"ok": ok, "detail": why, "calib_steps": int(calib)}
@@ -391,7 +398,8 @@ def _freeze(adaptive_dir: Path, epoch, res, new_actions, settings, srec, val) ->
     _write_json(adaptive_dir / ADMISSION_FILENAME, {
         "schema": ADMISSION_SCHEMA, "epoch": int(epoch), "model_sha256": res.model.model_sha256,
         "eval_partition_sha256": part_sha, "settings_sha256": settings_sha,
-        "validation": {"k3_max": val.k3_max, "reason": val.reason}, "backfill": backfill,
+        "validation": ({"validation": "off", "k3_max": val.k3_max, "reason": val.reason}
+                       if val.reason == "off" else {"k3_max": val.k3_max, "reason": val.reason}), "backfill": backfill,
         "workers": [{"parent_state_id": a[1], "aux_center": a[2]["aux_center"],
                      "aux_k_kcal_mol": a[2]["aux_k_kcal_mol"], "placement_rank": a[4]["aux"]["placement_rank"],
                      "burnin_phase_epoch": a[4]["aux"]["burnin_phase_epoch"]} for a in new_actions]})
