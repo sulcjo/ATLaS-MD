@@ -1,0 +1,35 @@
+{
+  "/home/sulcjo/cvaux_parity_runs/OUT_RT": {
+    "ok": true,
+    "segments": {
+      "seg_001": {
+        "k_max_kcal": 1.2,
+        "max_abs_dz": 0.0,
+        "max_reduced": 0.0,
+        "n_compared": 336,
+        "n_finite_mismatch": 0,
+        "n_nonfinite_offline": 0,
+        "n_nonfinite_stored": 0,
+        "ok": true,
+        "platform": "CUDA",
+        "precision": "mixed",
+        "rows": 336,
+        "tolerance": 0.0001
+      },
+      "seg_002": {
+        "k_max_kcal": 1.2,
+        "max_abs_dz": 0.0,
+        "max_reduced": 0.0,
+        "n_compared": 384,
+        "n_finite_mismatch": 0,
+        "n_nonfinite_offline": 0,
+        "n_nonfinite_stored": 0,
+        "ok": true,
+        "platform": "CUDA",
+        "precision": "mixed",
+        "rows": 384,
+        "tolerance": 0.0001
+      }
+    }
+  }
+}

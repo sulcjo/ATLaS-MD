@@ -1,0 +1,75 @@
+{
+  "enabled": true,
+  "npt": {
+    "controllers": 0
+  },
+  "phases": {
+    "checkpoint_flush": {
+      "calls": 3,
+      "fraction_of_wall": 0.0023114170592198847,
+      "mean_s": 0.1080372417345643,
+      "seconds": 0.3241117252036929,
+      "seconds_per_2000_steps": 0.1080372417345643
+    },
+    "checkpoint_save": {
+      "calls": 3,
+      "fraction_of_wall": 0.002430355841486756,
+      "mean_s": 0.11359652318060398,
+      "seconds": 0.34078956954181194,
+      "seconds_per_2000_steps": 0.11359652318060398
+    },
+    "exchange": {
+      "calls": 12,
+      "fraction_of_wall": 0.001645800429653904,
+      "mean_s": 0.0192314643257608,
+      "seconds": 0.23077757190912962,
+      "seconds_per_2000_steps": 0.0769258573030432
+    },
+    "exchange.swap_apply": {
+      "calls": 248,
+      "fraction_of_wall": 0.0010901939872075802,
+      "mean_s": 0.0006164083738000163,
+      "seconds": 0.15286927670240402,
+      "seconds_per_2000_steps": 0.050956425567468
+    },
+    "log": {
+      "calls": 24,
+      "fraction_of_wall": 0.00013542191031282646,
+      "mean_s": 0.0007912142900750041,
+      "seconds": 0.0189891429618001,
+      "seconds_per_2000_steps": 0.006329714320600033
+    },
+    "md": {
+      "calls": 24,
+      "fraction_of_wall": 0.9868589399953033,
+      "mean_s": 5.765809194456476,
+      "seconds": 138.3794206669554,
+      "seconds_per_2000_steps": 46.1264735556518
+    },
+    "progress": {
+      "calls": 24,
+      "fraction_of_wall": 2.9579777988436067e-06,
+      "mean_s": 1.728224257628123e-05,
+      "seconds": 0.0004147738218307495,
+      "seconds_per_2000_steps": 0.00013825794061024982
+    },
+    "sample": {
+      "calls": 24,
+      "fraction_of_wall": 0.006584459417088637,
+      "mean_s": 0.038470276864245534,
+      "seconds": 0.9232866447418928,
+      "seconds_per_2000_steps": 0.30776221491396427
+    },
+    "sample.fetch": {
+      "calls": 24,
+      "fraction_of_wall": 0.006417147515980321,
+      "mean_s": 0.03749274252913892,
+      "seconds": 0.8998258206993341,
+      "seconds_per_2000_steps": 0.2999419402331114
+    }
+  },
+  "steps": 6000,
+  "top_level_sum_s": 140.21779009513557,
+  "unattributed_s": 0.0042974380776286125,
+  "wall_s": 140.2220875332132
+}
