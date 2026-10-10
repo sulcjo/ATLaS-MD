@@ -25,8 +25,9 @@ PARTITION_FILENAME = "aux_eval_partition.pkl"
 VALIDATION_FILENAME = "aux_validation.json"
 HISTORY_FILENAME = "aux_discovery_history.json"
 HISTORY_SCHEMA = "aux_discovery_history_v1"
-HISTORY_NOTE = ("One entry per discovery attempt. The same epochs' frames are reused as holdout across attempts, so "
-                "per-attempt gates give NO campaign-wide false-discovery control.")
+HISTORY_NOTE = ("One entry per discovery attempt. Each attempt's holdout is its boundary epoch, which becomes training "
+                "data at the next attempt, and every attempt re-tests the campaign's own frames, so per-attempt gates "
+                "give NO campaign-wide false-discovery control.")
 ACTION = "admit_aux"
 _FROZEN_NAMES = (MODEL_FILENAME, PARTITION_FILENAME, PARTITION_FILENAME + ".sha256", ADMISSION_FILENAME)
 
@@ -38,21 +39,41 @@ def _write_json(path: Path, payload: dict) -> None:
     tmp.replace(path)
 
 
-def append_discovery_history(adaptive_dir: Path, report: dict, epoch: int) -> None:
-    """Append this attempt (boundary epoch, outcome, holdout boundary) to adaptive_production's history file."""
+def append_discovery_history(adaptive_dir: Path, report: dict, epoch: int) -> bool:
+    """Record this attempt (boundary epoch, outcome, holdout boundary) in adaptive_production's history file.
+
+    A kill-replay of the same boundary epoch REPLACES that epoch's entry (keeping its attempt_index), so each
+    boundary is listed once. A missing file starts the history; an unreadable one (bad JSON, wrong schema,
+    ``attempts`` not a list) is left byte-for-byte untouched with a WARNING, never reset. Returns whether the
+    file was written."""
     path = Path(adaptive_dir) / HISTORY_FILENAME
-    try:
-        rec = json.loads(path.read_text())
-        entries = list(rec.get("attempts") or [])
-    except Exception:
-        entries = []
+    entries: list = []
+    if path.exists():
+        try:
+            rec = json.loads(path.read_text())
+            if not isinstance(rec, dict) or rec.get("schema") != HISTORY_SCHEMA or not isinstance(
+                    rec.get("attempts"), list):
+                raise ValueError(f"not an {HISTORY_SCHEMA} record with an attempts list")
+            entries = list(rec["attempts"])
+        except Exception as exc:
+            print(f"WARNING: {path} is unreadable ({type(exc).__name__}: {exc}); left untouched, epoch {int(epoch)}'s "
+                  "attempt is recorded only in its aux_discovery_report.json -- repair or move the file aside")
+            return False
     n_hold = (report.get("discovery") or {}).get("n_holdout") if isinstance(report.get("discovery"), dict) else None
-    entries.append({"boundary_epoch": int(epoch), "status": report.get("status"),
-                    "holdout_epochs": [int(epoch)], "train_epochs": list(range(int(epoch))), "n_holdout_frames": report.get("n_holdout", n_hold),
-                    "attempt_index": len(entries) + 1,
-                    "z3_chosen": (report.get("z3_search") or {}).get("chosen") is not None,
-                    "null_gate_passed": ((report.get("z3_search") or {}).get("null_gate") or {}).get("passed")})
+    same = [i for i, e in enumerate(entries) if isinstance(e, dict) and e.get("boundary_epoch") == int(epoch)]
+    index = int(entries[same[0]].get("attempt_index") or same[0] + 1) if same else len(entries) + 1
+    entry = {"boundary_epoch": int(epoch), "status": report.get("status"),
+             "holdout_epochs": [int(epoch)], "train_epochs": list(range(int(epoch))),
+             "n_holdout_frames": report.get("n_holdout", n_hold), "attempt_index": index,
+             "z3_chosen": (report.get("z3_search") or {}).get("chosen") is not None,
+             "null_gate_passed": ((report.get("z3_search") or {}).get("null_gate") or {}).get("passed")}
+    if same:
+        entries = [e for i, e in enumerate(entries) if i not in same[1:]]
+        entries[same[0]] = entry
+    else:
+        entries.append(entry)
     _write_json(path, {"schema": HISTORY_SCHEMA, "note": HISTORY_NOTE, "attempts": entries})
+    return True
 
 
 def _resolved_distance_interval(args) -> int:

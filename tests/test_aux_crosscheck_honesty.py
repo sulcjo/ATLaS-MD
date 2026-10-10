@@ -66,3 +66,32 @@ def test_history_appends_across_boundaries(tmp_path):
     assert [a["boundary_epoch"] for a in rec["attempts"]] == [1, 2]
     assert [a["status"] for a in rec["attempts"]] == ["broaden", "ok"]
     assert "NO campaign-wide false-discovery control" in rec["note"]
+
+
+def test_history_kill_replay_replaces_the_same_boundary_entry(tmp_path):
+    from gareus.adaptive.aux_admission_io import HISTORY_FILENAME, append_discovery_history
+    append_discovery_history(tmp_path, {"status": "broaden", "n_holdout": 10}, 1)
+    append_discovery_history(tmp_path, {"status": "error", "n_holdout": 12}, 2)
+    append_discovery_history(tmp_path, {"status": "ok", "n_holdout": 12}, 2)       # epoch 2 replayed after a kill
+    rec = json.loads((tmp_path / HISTORY_FILENAME).read_text())
+    assert [a["boundary_epoch"] for a in rec["attempts"]] == [1, 2]
+    assert [a["status"] for a in rec["attempts"]] == ["broaden", "ok"]
+    assert [a["attempt_index"] for a in rec["attempts"]] == [1, 2]
+
+
+@pytest.mark.parametrize("payload", ["{not json", json.dumps({"schema": "other", "attempts": []}),
+                                     json.dumps({"schema": "aux_discovery_history_v1", "attempts": {"a": 1}})])
+def test_unreadable_history_is_never_overwritten(tmp_path, capsys, payload):
+    from gareus.adaptive.aux_admission_io import HISTORY_FILENAME, append_discovery_history
+    path = tmp_path / HISTORY_FILENAME
+    path.write_text(payload)
+    append_discovery_history(tmp_path, {"status": "ok", "n_holdout": 12}, 2)       # never raises
+    assert path.read_text() == payload
+    err = capsys.readouterr().out
+    assert "WARNING" in err and HISTORY_FILENAME in err
+
+
+def test_history_note_says_holdout_becomes_training():
+    from gareus.adaptive.aux_admission_io import HISTORY_NOTE
+    assert "boundary epoch" in HISTORY_NOTE and "training" in HISTORY_NOTE
+    assert "NO campaign-wide false-discovery control" in HISTORY_NOTE
