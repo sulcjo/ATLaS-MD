@@ -12,6 +12,7 @@ from typing import Any, Mapping, Sequence
 import numpy as np
 
 from ..correctness._io import IntegrityError
+from .sample_schema import AUX_Z_REFERENCE, AUX_Z_SOURCE  # noqa: F401 -- re-exported
 
 
 def check_exchange_boundary_alignment(*, exchange_interval: int, distance_interval: int, traj_interval: int,
@@ -125,9 +126,6 @@ def check_fixed_box(boxes, fixed_box, *, label: str) -> None:
                                  f"{want.tolist()}; an NVT auxiliary state definition needs one fixed box")
 
 
-#: Where the stored runtime z (``aux_z_00``) and its parity reference come from (F07).
-AUX_Z_SOURCE = "force"
-AUX_Z_REFERENCE = "positions"
 
 
 def make_aux_record_observer(runtime, *, aux_forces, unit, schema, models):

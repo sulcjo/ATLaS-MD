@@ -34,20 +34,13 @@ class AuxForceInfo:
 def build_aux_force(openmm, model: AuxModel, *, force_group: int):
     if isinstance(force_group, bool) or not isinstance(force_group, int) or not 0 <= force_group <= 31:
         raise IntegrityError(f"aux force group must be an integer in 0..31, got {force_group!r}")
-    groups: dict[tuple[str, int], list[tuple[tuple[int, ...], float]]] = defaultdict(list)
-    for feature, coeff in zip(model.feature_schema.features, model.coefficients):
-        if coeff == 0.0:
-            continue
-        sign = -1 if feature.dihedral_sign_convention == "negated" else 1
-        groups[(feature.trig, sign)].append((tuple(feature.atom_indices), float(coeff)))
     cv = openmm.CustomCVForce("0")
     names = []
-    for (trig, sign) in sorted(groups):
-        name = f"aux_{trig}_{'neg' if sign < 0 else 'dir'}"
-        tf = openmm.CustomTorsionForce(f"w*{trig}({'-' if sign < 0 else ''}theta)")
+    for name, expr, torsions in aux_sub_cv_spec(model):
+        tf = openmm.CustomTorsionForce(expr)
         tf.addPerTorsionParameter("w")
         tf.setUsesPeriodicBoundaryConditions(False)
-        for quad, weight in groups[(trig, sign)]:
+        for quad, weight in torsions:
             tf.addTorsion(*[int(a) for a in quad], [weight])
         cv.addCollectiveVariable(name, tf)
         names.append(name)
@@ -59,6 +52,19 @@ def build_aux_force(openmm, model: AuxModel, *, force_group: int):
     info = AuxForceInfo(AUX_FORCE_NAME, int(force_group), model.model_sha256,
                         AUX_GLOBAL_K, AUX_GLOBAL_C, tuple(names))
     return cv, info
+
+
+def aux_sub_cv_spec(model: AuxModel) -> list[tuple[str, str, list[tuple[tuple[int, ...], float]]]]:
+    """(name, CustomTorsionForce expression, [(atom quad, weight)]) of every sub-CV ``build_aux_force``
+    writes for ``model``, in force order: zero coefficients dropped, grouped by (trig, sign convention)."""
+    groups: dict[tuple[str, int], list[tuple[tuple[int, ...], float]]] = defaultdict(list)
+    for feature, coeff in zip(model.feature_schema.features, model.coefficients):
+        if coeff == 0.0:
+            continue
+        sign = -1 if feature.dihedral_sign_convention == "negated" else 1
+        groups[(feature.trig, sign)].append((tuple(int(a) for a in feature.atom_indices), float(coeff)))
+    return [(f"aux_{trig}_{'neg' if sign < 0 else 'dir'}", f"w*{trig}({'-' if sign < 0 else ''}theta)",
+             groups[(trig, sign)]) for (trig, sign) in sorted(groups)]
 
 
 def aux_energy_function(model: AuxModel, sub_cv_names) -> str:

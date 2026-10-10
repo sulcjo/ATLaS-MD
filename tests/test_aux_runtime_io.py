@@ -527,14 +527,62 @@ def _observe_and_check(runtime, ctx, force, schema, models):
     return z_rt, z_pos
 
 
+class _ShiftedForce:
+    """The real aux force with its getCollectiveVariableValues result shifted (force-side value only)."""
+
+    def __init__(self, inner, shift):
+        self._inner, self._shift = inner, float(shift)
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+    def getCollectiveVariableValues(self, context):
+        values = list(self._inner.getCollectiveVariableValues(context))
+        values[0] += self._shift
+        return values
+
+
 @pytest.mark.parametrize("cv1", ["distance", "contacts"])     # slow-path / fast-path production Systems
-def test_force_side_weight_perturbation_is_detected_on_both_cv1_paths(cv1):
-    """F07: positions unchanged, only the aux force's torsion weight differs -> parity fails (the slow path
-    used to compare the NumPy evaluator with itself and pass)."""
+def test_force_side_value_perturbation_is_detected_on_both_cv1_paths(cv1):
+    """F07: positions unchanged, only the force's value differs -> parity fails (the slow path used to compare
+    the NumPy evaluator with itself and pass)."""
     from gareus.auxiliary_cv.runtime import AuxObservationError
-    ctx, runtime, system, _d, schema, models = _perturbed_setup(2.0, cv1=cv1, d_coeff=1e-3)
+    ctx, runtime, system, _d, schema, models = _perturbed_setup(2.0, cv1=cv1)
     with pytest.raises(AuxObservationError, match="parity"):
-        _observe_and_check(runtime, ctx, system.getForce(runtime.force_index), schema, models)
+        _observe_and_check(runtime, ctx, _ShiftedForce(system.getForce(runtime.force_index), 1e-3), schema, models)
+
+
+@pytest.mark.parametrize("k_kcal", [2.0, 0.0])
+@pytest.mark.parametrize("cv1", ["distance", "contacts"])
+def test_force_with_a_wrong_weight_is_refused_at_observer_build(cv1, k_kcal):
+    """A force built with one torsion weight off by 1e-3 never reaches a read, even with every state inactive
+    (where no parity check runs)."""
+    from openmm import unit
+    from gareus.auxiliary_cv.runtime import AuxObservationError, make_aux_z_observer
+    from gareus.auxiliary_cv.runtime_io import make_aux_record_observer
+    _ctx, runtime, system, _d, schema, models = _perturbed_setup(k_kcal, cv1=cv1, d_coeff=1e-3)
+    force = system.getForce(runtime.force_index)
+    with pytest.raises(AuxObservationError, match=r"torsion \d+ \(atoms/weight\) differs"):
+        make_aux_record_observer(runtime, aux_forces=[force], unit=unit, schema=schema, models=models)
+    with pytest.raises(AuxObservationError, match=r"torsion \d+ \(atoms/weight\) differs"):
+        make_aux_z_observer(runtime, aux_forces=[force], unit=unit)
+
+
+def test_force_with_a_wrong_atom_is_refused_at_observer_build():
+    import openmm as mm
+    from openmm import unit
+    from gareus.auxiliary_cv.force import build_aux_force
+    from gareus.auxiliary_cv.runtime import AuxObservationError, make_aux_z_observer
+    _ctx, runtime, _system, _d, _schema, _models = _perturbed_setup(0.0, cv1="distance")
+    force, _info = build_aux_force(mm, runtime.table.model, force_group=runtime.info.force_group)
+    tf = force.getCollectiveVariable(0)
+    *atoms, params = tf.getTorsionParameters(0)
+    atoms[0] = atoms[0] + 1 if atoms[0] + 1 not in atoms else atoms[0] + 2
+    tf.setTorsionParameters(0, *atoms, params)
+    with pytest.raises(AuxObservationError, match=r"torsion 0 \(atoms/weight\) differs"):
+        make_aux_z_observer(runtime, aux_forces=[force], unit=unit)
+    good, _ = build_aux_force(mm, runtime.table.model, force_group=runtime.info.force_group)
+    make_aux_z_observer(runtime, aux_forces=[good], unit=unit)       # the model's own force passes
 
 
 @pytest.mark.parametrize("cv1", ["distance", "contacts"])
@@ -558,16 +606,11 @@ def test_inactive_state_still_records_the_force_side_z():
     """k = 0: the stored runtime z is the force's value, not the positions' z (and parity is vacuous)."""
     from openmm import unit
     from gareus.auxiliary_cv.runtime_io import make_aux_record_observer
-    from gareus.auxiliary_cv.features import openmm_dihedrals
-    ctx, runtime, system, d, schema, models = _perturbed_setup(0.0, cv1="distance", d_coeff=0.25)
-    observe = make_aux_record_observer(runtime, aux_forces=[system.getForce(runtime.force_index)], unit=unit,
-                                       schema=schema, models=models)
+    ctx, runtime, system, _d, schema, models = _perturbed_setup(0.0, cv1="distance")
+    observe = make_aux_record_observer(runtime, aux_forces=[_ShiftedForce(system.getForce(runtime.force_index), 0.25)],
+                                       unit=unit, schema=schema, models=models)
     z_rt, _tors, z_pos = observe(0, SimpleNamespace(context=ctx))
-    f0 = runtime.table.model.feature_schema.features[0]
-    theta = openmm_dihedrals(d["positions_nm"], [tuple(f0.atom_indices)])[0][0]
-    sign = -1.0 if f0.dihedral_sign_convention == "negated" else 1.0
-    expected = 0.25 * getattr(np, f0.trig)(sign * theta) / runtime.table.model.scale
-    assert z_rt - z_pos == pytest.approx(expected, abs=1e-9) and abs(expected) > 1e-3
+    assert z_rt - z_pos == pytest.approx(0.25 / runtime.table.model.scale, abs=1e-9)
 
 
 def test_cloned_contexts_each_read_their_own_force():

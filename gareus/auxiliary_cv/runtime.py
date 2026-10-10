@@ -17,7 +17,8 @@ import numpy as np
 from ..correctness._io import IntegrityError
 from .evaluate import z_from_positions
 from .features import active_feature_mask, openmm_dihedrals, unique_torsions
-from .force import AUX_FORCE_NAME, AuxForceInfo, aux_energy_function, build_aux_force, set_aux_parameters
+from .force import (AUX_FORCE_NAME, AuxForceInfo, aux_energy_function, aux_sub_cv_spec, build_aux_force,
+                    set_aux_parameters)
 from .state_table import AuxStateTable
 
 RESERVED_PHYSICAL_GROUPS = frozenset({0, 1, 2})
@@ -175,6 +176,34 @@ def check_aux_force(force, runtime: AuxRuntime, *, replica=None) -> None:
     if expr != want:
         raise AuxObservationError(f"auxiliary force{where} energy expression {expr!r} is not the runtime model's "
                                   f"{want!r} (offset/scale differ)")
+    _check_aux_sub_cvs(force, runtime, where)
+
+
+def _check_aux_sub_cvs(force, runtime: AuxRuntime, where: str) -> None:
+    """Every sub-CV's torsions (atom quads and weights, in order) and expression equal the model's, so a
+    force with a wrong weight or atom is refused even when every state is inactive (no parity runs)."""
+    spec = aux_sub_cv_spec(runtime.table.model)
+    if len(spec) != force.getNumCollectiveVariables():
+        raise AuxObservationError(f"auxiliary force{where} has {force.getNumCollectiveVariables()} sub-CVs, the "
+                                  f"model {len(spec)}")
+    for i, (name, expr, torsions) in enumerate(spec):
+        try:
+            tf = force.getCollectiveVariable(i)
+            got_expr = tf.getEnergyFunction()
+            got = [tf.getTorsionParameters(j) for j in range(tf.getNumTorsions())]
+            periodic = bool(tf.usesPeriodicBoundaryConditions())
+        except Exception as exc:  # noqa: BLE001 -- an unreadable sub-CV is unavailable, never trusted
+            raise AuxObservationError(f"auxiliary force{where} sub-CV {name!r} unreadable: "
+                                      f"{type(exc).__name__}: {exc}") from exc
+        if got_expr != expr or periodic:
+            raise AuxObservationError(f"auxiliary force{where} sub-CV {name!r} expression {got_expr!r} "
+                                      f"(periodic {periodic}) is not the model's {expr!r} (non-periodic)")
+        got_t = [(tuple(int(a) for a in t[:4]), [float(w) for w in t[4]]) for t in got]
+        want_t = [(quad, [weight]) for quad, weight in torsions]
+        if got_t != want_t:
+            bad = next((j for j, (g, w) in enumerate(zip(got_t, want_t)) if g != w), min(len(got_t), len(want_t)))
+            raise AuxObservationError(f"auxiliary force{where} sub-CV {name!r} torsion {bad} (atoms/weight) differs "
+                                      f"from the model's ({len(got_t)} vs {len(want_t)} torsions)")
 
 
 def resolve_aux_force(system, runtime: AuxRuntime, *, replica=None):

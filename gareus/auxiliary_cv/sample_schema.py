@@ -139,10 +139,13 @@ def runtime_precision(platform_name: str, platform=None, context=None) -> str:
     return runtime_precision_info(platform_name, platform, context)[0]
 
 
-#: Runtime-z evaluation sources a samples payload may record (F07): the aux force on each replica's Context.
-AUX_Z_SOURCES = ("force",)
+#: Where the stored runtime z (``aux_z_00``) comes from (F07): the aux force on each replica's Context.
+AUX_Z_SOURCE = "force"
 #: The independent value runtime parity compares the stored z with.
-AUX_Z_REFERENCES = ("positions",)
+AUX_Z_REFERENCE = "positions"
+#: Values a samples payload may record for them.
+AUX_Z_SOURCES = (AUX_Z_SOURCE,)
+AUX_Z_REFERENCES = (AUX_Z_REFERENCE,)
 
 
 def runtime_info(platform_name: str, precision: str, fallback_reason: Optional[str] = None, *,

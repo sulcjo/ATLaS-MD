@@ -15,7 +15,7 @@ def parity_report(run_dir) -> dict[str, Any]:
     from .offline import (_float_column, parity_context, parity_violation, registry_model,
                           segment_aux_runtime, segment_aux_schemas)
     from .evaluate import z_from_dihedrals
-    from .sample_schema import PARITY_TOLERANCE
+    from .sample_schema import AUX_Z_REFERENCE, AUX_Z_SOURCE, PARITY_TOLERANCE
     run_dir = Path(run_dir)
     schemas, runtimes = segment_aux_schemas(run_dir), segment_aux_runtime(run_dir)
     out: dict[str, Any] = {"segments": {}}
@@ -58,7 +58,11 @@ def parity_report(run_dir) -> dict[str, Any]:
         n_cmp = int(both.sum())
         max_red = float(du.max()) if du.size else 0.0
         vacuous = k_max == 0.0
+        # Fail closed: a finite/non-finite mismatch is not ok even when the bound is vacuous (sham-only), e.g. a
+        # degenerate frame where the force's z is finite and the offline torsion evaluator's is NaN.
         ok = n_cmp > 0 and n_mismatch == 0 and (vacuous or max_red <= tol)
+        z_source = (runtimes.get(seg) or {}).get("aux_z_source") or "unrecorded"
+        force_parity = z_source == AUX_Z_SOURCE
         row = {
             "platform": (runtimes.get(seg) or {}).get("platform"), "precision": prec, "rows": int(n),
             "n_compared": n_cmp, "n_nonfinite_stored": int((~fin_run).sum()),
@@ -67,13 +71,21 @@ def parity_report(run_dir) -> dict[str, Any]:
             "max_abs_dz": float(np.max(np.abs(z_run[both] - z_off[both]))) if n_cmp else 0.0,
             "max_reduced": max_red, "tolerance": tol, "ok": bool(ok),
             # F07: the stored z's evaluator (the aux force; "unrecorded" in pre-F07 payloads) and the reference.
-            "runtime_z_source": (runtimes.get(seg) or {}).get("aux_z_source") or "unrecorded",
-            "reference_z_source": "positions"}
+            "runtime_z_source": z_source, "reference_z_source": AUX_Z_REFERENCE,
+            "parity_kind": "force_vs_positions" if force_parity else "stored_vs_offline_data_consistency"}
+        if not force_parity:
+            # A pre-F07 slow-path segment stored the NumPy z: this row checks data consistency, not the force.
+            row["force_parity"] = False
         if vacuous:
             row["bound_vacuous"] = True
         if n == 0:
             row["reason"] = "no rows"
         out["segments"][seg] = row
+    # Summary of what the rows checked; never changes ``ok``.
+    n_without = sum(1 for r in out["segments"].values() if r["parity_kind"] != "force_vs_positions")
+    out["n_segments_without_force_parity"] = n_without
+    out["force_parity"] = ("none" if not out["segments"] or n_without == len(out["segments"])
+                           else "all" if n_without == 0 else "partial")
     if not out["segments"]:
         out["ok"], out["reason"] = False, "no aux segments"
         return out
