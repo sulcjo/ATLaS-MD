@@ -5973,7 +5973,37 @@ def main(argv=None):
         memory_reporter.close()
 
 
+def _write_aux_refusal_summary(args, exc) -> Path:
+    """Final fix wave M3: an aux pooling refusal (AuxPoolingRefused, raised only when aux evidence exists) still
+    leaves a gradeable pmf_summary.json where the summary normally goes: status refused, the reason as
+    ``aux_integrity_failure`` (gareus_report grades it FAIL ahead of everything) and an ``unavailable``
+    crosscheck. The caller re-raises, so the analysis still exits non-zero."""
+    from gareus_report import build_health_verdict
+    out = Path(args.out) if args.out else prod_dir_of(Path(args.input)) / 'pmf_analysis'
+    reason = str(exc)
+    s = {'status': 'refused', 'reason': reason, 'aux_integrity_failure': reason,
+         'aux_crosscheck': {'status': 'unavailable', 'reason': f'aux pooling refused: {reason}'},
+         'production_dir': str(prod_dir_of(Path(args.input))), 'output_dir': str(out)}
+    s['health'] = build_health_verdict(s, float(getattr(args, 'min_neighbor_overlap', 0.30)))
+    out.mkdir(parents=True, exist_ok=True)
+    wjson(out / 'pmf_summary.json', s)
+    return out / 'pmf_summary.json'
+
+
 def _main(args, memory_reporter):
+    from gareus.kernel_identity import AuxPoolingRefused
+    try:
+        return _main_inner(args, memory_reporter)
+    except AuxPoolingRefused as exc:
+        try:
+            path = _write_aux_refusal_summary(args, exc)
+            print(f'  [aux] pooling refused; FAIL summary written to {path}')
+        except Exception as write_exc:
+            print(f'  WARNING [aux] pooling refused and the refusal summary could not be written ({write_exc})')
+        raise
+
+
+def _main_inner(args, memory_reporter):
     args._memory_reporter = memory_reporter
     memory_reporter.record('startup')
     progress=Progress()

@@ -65,3 +65,30 @@ def test_admitted_aux_analysis_is_never_pass(tmp_path):
     excl = s["aux_burnin_exclusions"]                             # F01: the exclusion record reaches the summary
     assert excl["rule"] == "aux_burnin_carrier_v1"
     assert [(r["phase"], r["state_id"], r["reason"]) for r in excl["records"]] == [("epoch_001", 2, "aux_burnin_carrier")]
+
+
+def test_analyzer_pooling_refusal_writes_a_fail_summary_and_still_raises(tmp_path):
+    """Final fix wave M3: the report's aux_integrity_failure precedence branch has a producer."""
+    import analyze_gareus_mbar as agm
+    from gareus_report import build_health_verdict
+    prod = _campaign(tmp_path, admission=False)          # an aux run without admission: load_data refuses
+    out = tmp_path / "out"
+    with pytest.raises(AuxPoolingRefused, match="auxiliary-CV run"):
+        agm.main([str(prod.parent), "--out", str(out)])
+    s = json.loads((out / "pmf_summary.json").read_text())
+    assert s["status"] == "refused" and "auxiliary-CV run" in s["reason"]
+    assert s["aux_integrity_failure"] == s["reason"]
+    assert s["aux_crosscheck"]["status"] == "unavailable"
+    assert s["health"]["overall"] == "FAIL"
+    assert build_health_verdict(s)["overall"] == "FAIL"
+    row = [c for c in s["health"]["checks"] if c["name"] == "Aux ordinary-only crosscheck"]
+    assert row and row[0]["status"] == "fail" and "integrity failure" in row[0]["detail"]
+
+
+def test_analyzer_non_aux_failure_writes_no_refusal_summary(tmp_path):
+    import analyze_gareus_mbar as agm
+    out = tmp_path / "out"
+    with pytest.raises(Exception) as exc:
+        agm.main([str(tmp_path / "missing_run"), "--out", str(out)])
+    assert not isinstance(exc.value, AuxPoolingRefused)
+    assert not (out / "pmf_summary.json").exists()
