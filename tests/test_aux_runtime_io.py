@@ -590,6 +590,14 @@ def test_cloned_contexts_each_read_their_own_force():
     z_b, _tb, zp_b = observe(1, SimpleNamespace(context=ctx_b))
     assert z_a == pytest.approx(zp_a, abs=1e-9) and z_b == pytest.approx(zp_b, abs=1e-9)
     assert abs(z_a - z_b) > 1e-4
+    # One shared System (one force object) for two Contexts: each read still sees its own Context.
+    ctx_a2 = mm.Context(system_a, mm.VerletIntegrator(0.001), mm.Platform.getPlatformByName("Reference"))
+    ctx_a2.setPositions(pos_b)
+    shared = make_aux_record_observer(runtime, aux_forces=[forces[0], forces[0]], unit=unit, schema=schema,
+                                      models=models)
+    s_a, _t, sp_a = shared(0, SimpleNamespace(context=ctx_a))
+    s_b, _t, sp_b = shared(1, SimpleNamespace(context=ctx_a2))
+    assert s_a == pytest.approx(sp_a, abs=1e-9) and s_b == pytest.approx(sp_b, abs=1e-9) and abs(s_a - s_b) > 1e-4
     crossed = make_aux_record_observer(runtime, aux_forces=forces[::-1], unit=unit, schema=schema, models=models)
     with pytest.raises(AuxObservationError, match="read failed"):
         crossed(0, SimpleNamespace(context=ctx_a))

@@ -185,7 +185,9 @@ def test_aux_runtime_construction_in_run_gareus_is_gated_by_an_aux_condition():
                  "refuse_duplicate_event_keys", "data_boundary", "embed_cv_definition",
                  # Task 14 fix round 1 (F4)
                  "prepare_aux_resume", "refuse_aux_resume_without_checkpoint", "discard_refused_segment",
-                 "reseal_chain_for_resume"):
+                 "reseal_chain_for_resume",
+                 # F07 (repair Task 9): force-side aux z observers
+                 "resolve_aux_force", "make_aux_z_observer"):
         for call in _calls(tree, name):
             node, gated = call, False
             while node in parents:
