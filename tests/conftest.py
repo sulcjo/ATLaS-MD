@@ -281,7 +281,9 @@ def small_adaptive_campaign():
             mp.setattr(H, "_discover", _fixed_discovery(calls))
             assert validation_main(["write", "--out", str(out / "adaptive_production" / "aux_validation.json"),
                                     "--commit", "e2e", "--timestep-fs", "1.0", "--k3-max", "10.0",
-                                    "--finite-timestep", "pass", "--npt", "pass", "--cost", "pass"]) == 0
+                                    "--finite-timestep", "pass", "--finite-timestep-evidence", "e2e fixture",
+                                    "--npt", "pass", "--npt-evidence", "e2e fixture",
+                                    "--cost", "pass", "--cost-evidence", "e2e fixture"]) == 0
         run = SmallCampaign(out, argv, calls)
         if kill_after:
             armed = {"on": True}

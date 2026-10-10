@@ -8823,6 +8823,18 @@ def continuation_parent_dirs(adaptive_dir, epoch_dir, segment_name: str, *, enab
     return [str(p) for p in prior_phase_parent_dirs(adaptive_dir, Path(epoch_dir) / "x")]
 
 
+def _require_valid_aux_validation(adaptive_dir: Path, args) -> None:
+    """F03: driver-start check of ``aux_validation.json`` with the admission hook's typed validator, so a
+    malformed record fails before MD. A missing record is allowed (admission then reports validation_missing)."""
+    from .adaptive.aux_discovery.validation import check_validation_record  # noqa: PLC0415
+    path = Path(adaptive_dir) / "aux_validation.json"
+    if not path.exists():
+        return
+    val = check_validation_record(path, timestep_fs=float(args.timestep_fs))
+    if not val.ok:
+        raise RuntimeError(f"{path} is not a valid aux validation record: {val.reason}")
+
+
 def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, forcefield, topology, equil_state, progress=None) -> Dict[str, Any]:
     """Run adaptive production by calling the existing GAREUS worker per epoch.
 
@@ -8862,6 +8874,7 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
             raise RuntimeError("this campaign's frozen decision settings enable aux-CV discovery "
                                f"({adaptive_dir / 'decision_settings.json'}), but this job's options are "
                                "incompatible with it: " + "; ".join(_aux_bad))
+        _require_valid_aux_validation(adaptive_dir, args)
     max_epochs = max(1, _arg_int(args, "adaptive_production_epochs", 3))
     # Epoch 0 also bootstraps the tICA model and (when enabled) the shared GaMD
     # envelope recalibration -- both need only a short look at real sampling, not

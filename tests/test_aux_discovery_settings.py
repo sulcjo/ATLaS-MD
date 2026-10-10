@@ -97,3 +97,20 @@ def test_c11_yaml_parses():
         raise
     assert args.adaptive_production_aux_discovery is True
     assert args.adaptive_production_aux_reserve_slots == 4
+
+
+@pytest.mark.parametrize("key,bad", [
+    ("k_max", True), ("k_max", 0), ("k_max", -3), ("k_max", 2.5), ("k_max", "8"),
+    ("ari_min", float("nan")), ("ari_min", float("inf")), ("ari_min", True), ("ari_min", 1.5),
+    ("temperature_k", 0), ("temperature_k", -300.0), ("temperature_k", False),
+    ("max_workers", 0), ("l1_c_grid", []), ("l1_c_grid", [0.1, float("nan")]), ("l1_c_grid", [0.1, True]),
+    ("quantiles", [0.05, 1.5]), ("l1_c_grid", "0.1"),
+])
+def test_from_mapping_refuses_bad_values(key, bad):
+    with pytest.raises(ValueError):
+        AuxDiscoverySettings.from_mapping({key: bad})
+
+
+def test_from_mapping_roundtrips_defaults():
+    s = AuxDiscoverySettings()
+    assert AuxDiscoverySettings.from_mapping(s.to_mapping()) == s

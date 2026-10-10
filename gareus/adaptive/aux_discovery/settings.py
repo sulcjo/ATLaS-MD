@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import math
 import os
 import tempfile
 import time
@@ -75,8 +76,46 @@ class AuxDiscoverySettings:
             raise ValueError(f"unknown aux settings key(s): {unknown}")
         kw = {}
         for k, v in raw.items():
-            kw[k] = tuple(float(x) for x in v) if isinstance(v, list) else v
+            kw[k] = _typed_setting(k, v)
         return cls(**kw)
+
+
+_NONNEG_ZERO_OK = {"frame_stride_steps", "partition_seed", "placement_seed"}
+_FRACTIONS = {"ari_min", "group_min_share", "pca_var", "hidden_min", "cooc_share", "cooc_bin_min",
+              "lineage_info_min", "gate_o_q05", "heldout_o_min", "gate_top3_share"}
+
+
+def _real(name: str, x: Any) -> float:
+    if isinstance(x, bool) or not isinstance(x, (int, float)) or not math.isfinite(x):
+        raise ValueError(f"aux setting {name!r}: expected a finite number, got {x!r}")
+    return float(x)
+
+
+def _typed_setting(name: str, v: Any) -> Any:
+    """Type and range check of one frozen aux setting (F03): finite, no booleans, positive counts/sizes."""
+    default = _DEFAULTS[name]
+    if isinstance(default, tuple):
+        if not isinstance(v, (list, tuple)) or not v:
+            raise ValueError(f"aux setting {name!r}: expected a non-empty list, got {v!r}")
+        out = tuple(_real(name, x) for x in v)
+        if any(x <= 0 for x in out):
+            raise ValueError(f"aux setting {name!r}: entries must be > 0, got {v!r}")
+        if name in ("quantiles", "width_fractions") and any(x >= 1 for x in out):
+            raise ValueError(f"aux setting {name!r}: entries must be < 1, got {v!r}")
+        return out
+    if isinstance(default, int):
+        if isinstance(v, bool) or not isinstance(v, int):
+            if isinstance(v, float) and math.isfinite(v) and v == int(v):
+                v = int(v)
+            else:
+                raise ValueError(f"aux setting {name!r}: expected an integer, got {v!r}")
+        if v < 0 or (v == 0 and name not in _NONNEG_ZERO_OK):
+            raise ValueError(f"aux setting {name!r}: must be > 0, got {v!r}")
+        return v
+    x = _real(name, v)
+    if x < 0 or x == 0 or (name in _FRACTIONS and x > 1):
+        raise ValueError(f"aux setting {name!r}: out of range, got {v!r}")
+    return x
 
 
 def _atomic_write_json(path: Path, payload: Dict[str, Any]) -> None:
@@ -134,3 +173,6 @@ def aux_discovery_incompatibilities(args, *, topups: bool = False) -> List[str]:
     if int(slots) < 1:
         bad.append("--ap-aux-discovery needs --ap-aux-reserve-slots >= 1")
     return bad
+
+
+_DEFAULTS = {f.name: getattr(AuxDiscoverySettings(), f.name) for f in dataclasses.fields(AuxDiscoverySettings)}
