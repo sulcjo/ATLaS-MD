@@ -67,7 +67,7 @@ def test_report_rows_grade_fail_and_caution():
     v2 = build_health_verdict({"aux_crosscheck": {"status": "skipped", "reason": "x"},
                                "aux_workers": {"workers": []}})
     assert _row(v2, "Aux ordinary-only crosscheck")["status"] == "na"
-    assert _row(v2, "Aux workers")["status"] == "pass"
+    assert _row(v2, "Aux workers")["status"] == "caution"  # empty evidence never grades PASS (F06)
 
 
 def test_report_row_error_is_caution():

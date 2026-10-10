@@ -239,6 +239,9 @@ def _check_aux_workers(s: dict) -> Optional[dict]:
     if not isinstance(aw, dict):
         return None
     rows = aw.get("workers") or []
+    if not rows:
+        return {"name": name, "status": CAUTION,
+                "detail": "no worker evidence: the worker table is empty (nothing to grade)"}
     parts = []
     for r in rows:
         ov = _num(r.get("best_partner_overlap"))
@@ -246,7 +249,10 @@ def _check_aux_workers(s: dict) -> Optional[dict]:
                      + (f"{ov:.2f}" if ov is not None else "n/a"))
     detail = "; ".join(parts) + ("; " if parts else "") + "descriptive; no shams, no attribution"
     bad = [r for r in rows if r.get("overlap_floor_ok") is False]
-    return {"name": name, "status": CAUTION if bad else PASS, "detail": detail}
+    unmeasured = [r for r in rows if _num(r.get("best_partner_overlap")) is None]
+    if unmeasured:
+        detail += f"; {len(unmeasured)} worker(s) with no measurable partner overlap"
+    return {"name": name, "status": CAUTION if (bad or unmeasured) else PASS, "detail": detail}
 
 
 def _headline(s: dict) -> list[dict]:

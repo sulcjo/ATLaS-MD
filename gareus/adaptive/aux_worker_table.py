@@ -48,12 +48,26 @@ def _majority(labels: np.ndarray) -> Optional[int]:
     return int(np.bincount(labels).argmax())
 
 
+def _conditioning_matrix(frames, partition) -> np.ndarray:
+    """Frame coordinates in the partition's declared conditioning order (CV1-only partitions get one column).
+    A partition frozen before the contract (``conditioning`` None) is the legacy 2-D (cv1, cv2)."""
+    spec = getattr(partition, "conditioning", None)
+    names = list(spec.declared_names) if spec is not None else ["cv1", "cv2"]
+    cols = []
+    for nm in names:
+        col = getattr(frames, nm, None)
+        if col is None:
+            raise ValueError(f"partition declares conditioning coordinate {nm!r} but the frames have none")
+        cols.append(np.asarray(col, dtype=float))
+    return np.column_stack(cols)
+
+
 def return_label_change_fraction(frames, eval_partition, worker_state: int,
                                  n_frames: int = LABEL_WINDOW_FRAMES) -> dict:
     """Fraction of worker episodes after which the (frozen evaluation partition) majority label of the
     frames around the episode differs, before entry vs after exit, within one (phase, replica) lineage."""
     labels = np.asarray(eval_partition.predict(np.hstack([frames.hc, frames.hb]),
-                                               np.c_[frames.cv1, frames.cv2]))
+                                               _conditioning_matrix(frames, eval_partition)))
     lineage = frames.lineage
     n_ep = n_change = 0
     for lin in np.unique(lineage):
@@ -75,6 +89,38 @@ def return_label_change_fraction(frames, eval_partition, worker_state: int,
                 n_change += int(pre != post)
             j = k
     return {"fraction": (n_change / n_ep) if n_ep else None, "n_episodes": n_ep}
+
+
+def _phase_array(phase, n: int) -> np.ndarray:
+    if phase is None:
+        return np.zeros(n, dtype=np.int64)      # no phase record: a single phase
+    phase = np.asarray(phase)
+    if phase.size != n:
+        raise ValueError("meta['_epoch_source'] is not aligned with the samples")
+    return phase
+
+
+def _phase_local_trajectories(replica, step, phase) -> List[np.ndarray]:
+    """Sample-index arrays, one per (phase, replica) trajectory in that phase's own step order.
+
+    A trajectory is split wherever consecutive steps are further apart than 1.5x the phase's median step
+    spacing (missing samples are gaps, never bridged), so no entry/exit is created across a phase boundary
+    or across a gap."""
+    ph = _phase_array(phase, replica.size)
+    out: List[np.ndarray] = []
+    for p in np.unique(ph):
+        in_p = np.where(ph == p)[0]
+        runs = []
+        for r in np.unique(replica[in_p]):
+            idx = in_p[replica[in_p] == r]
+            runs.append(idx[np.argsort(step[idx], kind="stable")])
+        diffs = np.concatenate([np.diff(step[i].astype(float)) for i in runs if i.size > 1] or [np.empty(0)])
+        diffs = diffs[diffs > 0]
+        limit = 1.5 * float(np.median(diffs)) if diffs.size else np.inf
+        for idx in runs:
+            cut = np.where(np.diff(step[idx].astype(float)) > limit)[0] + 1
+            out.extend(np.split(idx, cut))
+    return out
 
 
 def worker_table(d: Any, f_k, *, aux_states, ordinary_states, eval_partition=None, frames=None,
@@ -101,10 +147,8 @@ def worker_table(d: Any, f_k, *, aux_states, ordinary_states, eval_partition=Non
     if state_lambdas is not None:
         lam = np.asarray(state_lambdas, float)
         ordinary = [o for o in ordinary if o < lam.size and lam[o] == 0.0]
-    by_replica = []
-    for r in np.unique(replica):
-        idx = np.where(replica == r)[0]
-        by_replica.append(idx[np.argsort(step[idx], kind="stable")])
+    trajectories = _phase_local_trajectories(replica, step, meta.get("_epoch_source"))
+    phase_of = _phase_array(meta.get("_epoch_source"), replica.size)
     rows: List[dict] = []
     for w in sorted(aux_set):
         mine = window == w
@@ -116,7 +160,7 @@ def worker_table(d: Any, f_k, *, aux_states, ordinary_states, eval_partition=Non
             if best_o is None or ov > best_o:
                 best, best_o = o, ov
         entries = exits = 0
-        for idx in by_replica:
+        for idx in trajectories:
             ep = positive_residence_episodes(window[idx], np.ones(idx.size), {w})
             entries += ep["entries"]; exits += ep["exits"]
         zw = z[mine] if z is not None else np.array([])
@@ -131,7 +175,10 @@ def worker_table(d: Any, f_k, *, aux_states, ordinary_states, eval_partition=Non
             "occupancy_fraction": float(mine.sum() / max(1, window.size)),
             "entries": int(entries),
             "exits": int(exits),
-            "carrier_diversity": int(np.unique(replica[mine]).size),
+            # (phase, replica) trajectories and physical replica ids: neither is an independent lineage
+            "carrier_instances": int(np.unique(np.char.add(np.char.add(phase_of[mine].astype(str), ":"),
+                                                           replica[mine].astype(str))).size),
+            "physical_replicas": int(np.unique(replica[mine]).size),
             "z_mean": float(zw.mean()) if zw.size else None,
             "z_sd": float(zw.std()) if zw.size else None,
             "forecast_O": forecasts.get(int(w), forecasts.get(str(w))),
@@ -143,6 +190,8 @@ def worker_table(d: Any, f_k, *, aux_states, ordinary_states, eval_partition=Non
             row["return_label_episodes"] = rc["n_episodes"]
         else:
             row["return_label_change_fraction"] = None
-            row["return_label_status"] = "frames_unavailable"
+            row["return_label_status"] = "unavailable"
+            row["return_label_reason"] = ("frames and an evaluation partition were not supplied; the analyzer "
+                                          "does not load per-frame descriptors")
         rows.append(row)
     return rows
