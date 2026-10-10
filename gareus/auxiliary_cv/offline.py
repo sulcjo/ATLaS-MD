@@ -190,24 +190,17 @@ def classify_pool_segments(run_dir, segment_ids) -> dict[str, list[str]]:
 
 
 def refuse_duplicate_sample_keys(samples: Mapping[str, Any]) -> None:
-    """Refuse an auxiliary sample pool holding one observation key (step, replica) twice.
+    """Refuse an auxiliary sample pool whose observation keys are missing, malformed or duplicated.
 
-    Task 13 carry-over 3: an interrupted auxiliary parent that never checkpointed stays pooled up to its
-    crash step while its restarted child re-runs the same steps; the two would count one carrier's
-    observation twice.
+    Task 13 carry-over 3 / F10: key = (phase/source id, replica, step); ``segment_id`` is provenance. An
+    interrupted auxiliary parent that never checkpointed stays pooled up to its crash step while its restarted
+    child re-runs the same steps; the two would count one carrier's observation twice. The phase id is the
+    ``phase_id`` (else ``source_id``) column when the pool carries one, else the pool is one phase.
     """
-    from .ledger import _first_duplicate, _segments_of
-    if not samples or "step" not in samples or "replica" not in samples:
-        return
-    step = np.asarray(np.ma.getdata(samples["step"])).astype(np.int64)
-    replica = np.asarray(np.ma.getdata(samples["replica"])).astype(np.int64)
-    dup = _first_duplicate(np.stack([step, replica], axis=1))
-    if dup is not None:
-        a, b = dup
-        raise IntegrityError(f"duplicate (step, replica) observation in the auxiliary sample pool: step {int(step[a])}, "
-                             f"replica {int(replica[a])} in segment(s) {_segments_of(samples, (a, b))}; a crashed "
-                             "parent without a checkpoint and its restarted child overlap -- repair the segment "
-                             "registry (seal the parent abandoned) before pooling")
+    from ..correctness.observation_keys import validate_observation_keys
+    phase = next((samples[k] for k in ("phase_id", "source_id") if k in samples), None)
+    validate_observation_keys(phase, samples.get("replica"), samples.get("step"),
+                              segment_ids=samples.get("segment_id"), where="auxiliary sample pool")
 
 
 _TEMPERATURE_RTOL = 1e-9

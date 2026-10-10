@@ -17,6 +17,7 @@ import numpy as np
 
 from ._io import IntegrityError, digest, fsync_directory, json_bytes, json_loads
 from .bias import finite_number, numeric_vector, reconstruct_bias_matrix
+from .observation_keys import lambda_equals_frozen, validate_observation_keys
 from .state_identity import state_definition_hash, validate_fixed_state_segments
 
 EXPORT_SCHEMA = "atlas-fixed-state-npz-v1"
@@ -111,9 +112,10 @@ def build_export_arrays(
     observed_lambdas = None
     if "gamd_lambda" in samples:
         observed_lambdas = numeric_vector(samples["gamd_lambda"], "gamd_lambda", n)
-        assigned_lambdas = np.asarray([table.windows[i]["gamd_lambda"] for i in origins])
+        assigned_lambdas = np.asarray([table.windows[i]["gamd_lambda"] for i in origins], dtype=np.float64)
+        # Stored float32 lambdas hold float32(frozen): compare at the stored precision, keep the frozen value.
         if (not np.isfinite(observed_lambdas).all()
-                or not np.array_equal(observed_lambdas, assigned_lambdas)):
+                or not lambda_equals_frozen(samples["gamd_lambda"], assigned_lambdas).all()):
             raise IntegrityError("Sample gamd_lambda values disagree with their frozen origin states")
     cv2 = None if "cv2" not in samples else numeric_vector(samples["cv2"], "cv2", n)
     pep = None if "v_pep_kj_mol" not in samples else numeric_vector(samples["v_pep_kj_mol"], "v_pep", n)
@@ -127,6 +129,10 @@ def build_export_arrays(
     active_aux = sorted({w["aux_model_sha256"] for w in table.windows if w.get("aux_k", 0.0) > 0})
     aux_z = None
     if active_aux:
+        # Auxiliary pooling counts every observation once: strict (phase, replica, step) identity (F10).
+        phase = next((samples[k] for k in ("phase_id", "source_id") if k in samples), None)
+        validate_observation_keys(phase, samples.get("replica"), samples.get("step"), segment_ids=segments,
+                                  where="strict export")
         from ..auxiliary_cv.offline import aux_z_from_samples, parity_context, registry_model
         from ..auxiliary_cv.sample_schema import PARITY_TOLERANCE
         if aux_sample_schema is None:

@@ -144,3 +144,73 @@ def test_legacy_v1_export_signature_pinned():
     assert man["input_signature"] == "4bb8e35b09a426d57c9723fc06ef70d9864b2553d4af28a49942a5e3be707b91"
     assert sorted(a) == ["N_k", "column_window_ids", "cv_A", "export_manifest_json", "original_window_id",
                          "segment_id", "umbrella_reduced_bias_nk", "window"]
+
+
+# F10: observation identity and stored-dtype lambda comparison ---------------------------------------------
+
+def test_aux_export_refuses_duplicate_conflicting_missing_keys():
+    s = _samples()
+    _export(s)
+    dup = {k: np.asarray(v).copy() for k, v in s.items()}
+    dup["step"][1] = dup["step"][3] = 100; dup["replica"][3] = dup["replica"][1]
+    with pytest.raises(IntegrityError, match="duplicate"):
+        _export(dup)
+    conflict = dict(dup); conflict["cv1"] = np.asarray(dup["cv1"]).copy(); conflict["cv1"][3] += 1.0
+    with pytest.raises(IntegrityError, match="duplicate"):
+        _export(conflict)
+    for key in ("step", "replica"):
+        missing = {k: v for k, v in s.items() if k != key}
+        with pytest.raises(IntegrityError, match=key):
+            _export(missing)
+
+
+def test_aux_export_nk_not_silently_changed_by_added_duplicate():
+    s = _samples()
+    base = _export(s)["N_k"].tolist()
+    grown = {k: np.concatenate([np.asarray(v), np.asarray(v)[:1]]) for k, v in s.items()}
+    with pytest.raises(IntegrityError, match="duplicate"):
+        _export(grown)
+    assert base == [4, 4]
+
+
+def test_aux_export_equal_steps_in_different_phases_are_not_duplicates():
+    s = _samples()
+    s["step"] = np.zeros(8, dtype=np.int64); s["replica"] = np.zeros(8, dtype=np.int64)
+    s["phase_id"] = np.array([f"p{i}" for i in range(8)])
+    assert int(_export(s)["N_k"].sum()) == 8
+    s["phase_id"] = np.array(["p0"] * 8)
+    with pytest.raises(IntegrityError, match="duplicate"):
+        _export(s)
+
+
+def _lam_export(stored_lambda, frozen_lambda, dtype):
+    from aux_c_fixture import definition, rows
+    r = rows([(0.2, 10.0, 0.0, 0.0, "ordinary")], MODEL.model_sha256)
+    r = [dict(x, gamd_lambda=frozen_lambda) for x in r]
+    from aux_c_fixture import BOX, CV1
+    d = make_state_definition(r, physical_system_sha256="a" * 64, ensemble="NVT", temperature_k=300.0,
+                              fixed_box_vectors_nm=BOX, cv1=CV1, cv2=None, boost={"kind": "pep-gamd", "envelope": {"vmax": 1.0}},
+                              aux_models={MODEL.model_sha256: MODEL.to_mapping()})
+    n = 4
+    s = {"cv1": np.linspace(0.1, 0.3, n), "window_id": np.zeros(n, dtype=np.int64),
+         "segment_id": np.array(["seg_001"] * n), "step": np.arange(n), "replica": np.zeros(n, dtype=np.int64),
+         "gamd_lambda": np.full(n, stored_lambda, dtype=dtype)}
+    snap = {"seg_001": freeze_snapshot("seg_001", d, equilibrium_analysis_eligible=True, phase_kind="production")}
+    env = (lambda boost: None)
+    return build_export_arrays(s, snap, BETA, sample_view=VIEW, envelope_factory=env, reconstruct=lambda cv1, cv2, w, b, **k: np.zeros((len(cv1), len(w))))
+
+
+@pytest.mark.parametrize("lam", [0.0, 1.0, 0.1])
+def test_float32_stored_lambda_round_trips(lam):
+    assert _lam_export(lam, lam, np.float32)["N_k"].tolist() == [4]
+
+
+def test_wrong_and_adjacent_float32_lambda_refused_float64_exact():
+    nxt = float(np.nextafter(np.float32(0.1), np.float32(1.0)))
+    with pytest.raises(IntegrityError, match="gamd_lambda"):
+        _lam_export(nxt, 0.1, np.float32)
+    with pytest.raises(IntegrityError, match="gamd_lambda"):
+        _lam_export(0.2, 0.1, np.float32)
+    assert _lam_export(0.1, 0.1, np.float64)["N_k"].tolist() == [4]
+    with pytest.raises(IntegrityError, match="gamd_lambda"):
+        _lam_export(float(np.float32(0.1)), 0.1, np.float64)

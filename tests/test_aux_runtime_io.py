@@ -335,7 +335,7 @@ def test_duplicate_sample_keys_are_refused():
     from gareus.auxiliary_cv.offline import refuse_duplicate_sample_keys
     refuse_duplicate_sample_keys({"step": np.array([10, 10, 20]), "replica": np.array([0, 1, 0]),
                                   "segment_id": np.array(["a", "a", "b"], dtype=object)})
-    with pytest.raises(IntegrityError, match=r"duplicate \(step, replica\).*step 10, replica 1"):
+    with pytest.raises(IntegrityError, match=r"duplicate \(phase, replica, step\).*step 10, replica 1"):
         refuse_duplicate_sample_keys({"step": np.array([10, 10, 10]), "replica": np.array([0, 1, 1]),
                                       "segment_id": np.array(["a", "a", "b"], dtype=object)})
 
@@ -352,7 +352,7 @@ def test_aux_pool_refuses_duplicate_step_replica_rows(tmp_path):
     reg.close_segment(s2, 600)
     WindowSnapshot(tmp_path).snapshot(s2, [], "contacts", None, kernel_identity=tl.KI, state_definition=tl._defn(),
                                       equilibrium_analysis_eligible=True, phase_kind="production")
-    with pytest.raises(IntegrityError, match=r"duplicate \(step, replica\)"):
+    with pytest.raises(IntegrityError, match=r"duplicate \(phase, replica, step\)"):
         load_parquet(tmp_path)
 
 
