@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 from types import SimpleNamespace
 
 from gareus.adaptive.aux_worker_table import positive_residence_episodes, worker_table
@@ -156,7 +157,8 @@ def test_return_label_uses_declared_conditioning_columns_cv1_only():
 
 def test_report_cautions_when_return_label_unavailable():
     from gareus_report import _check_aux_workers, PASS, CAUTION
-    good = {"state_id": 2, "best_partner": 0, "best_partner_overlap": 0.4, "overlap_floor_ok": True}
+    good = {"state_id": 2, "best_partner": 0, "best_partner_overlap": 0.4, "overlap_floor_ok": True,
+            "return_label_change_fraction": 0.25}
     assert _check_aux_workers({"aux_workers": {"workers": [good]}})["status"] == PASS
     w = dict(good, return_label_status="unavailable", return_label_reason="frames not supplied")
     chk = _check_aux_workers({"aux_workers": {"workers": [w]}})
@@ -170,3 +172,20 @@ def test_legacy_partition_gets_two_conditioning_columns():
     legacy = SimpleNamespace()   # no conditioning record
     m = _conditioning_matrix(frames, legacy)
     assert m.shape == (4, 2) and np.allclose(m[:, 1], frames.cv2)
+
+
+@pytest.mark.parametrize("extra", [{}, {"return_label_change_fraction": None},
+                                   {"return_label_change_fraction": float("nan")},
+                                   {"return_label_change_fraction": "0.2"},
+                                   {"return_label_change_fraction": True},
+                                   {"return_label_status": "frames_unavailable"}])
+def test_report_passes_only_with_a_finite_return_label_fraction(extra):
+    """Final fix wave M4: missing, None, non-finite, non-numeric or legacy frames_unavailable -> CAUTION."""
+    from gareus_report import _check_aux_workers, CAUTION, PASS
+    good = {"state_id": 2, "best_partner": 0, "best_partner_overlap": 0.4, "overlap_floor_ok": True,
+            "return_label_change_fraction": 0.0}
+    assert _check_aux_workers({"aux_workers": {"workers": [good]}})["status"] == PASS
+    w = {k: v for k, v in good.items() if k != "return_label_change_fraction"}
+    w.update(extra)
+    chk = _check_aux_workers({"aux_workers": {"workers": [good, w]}})
+    assert chk["status"] == CAUTION and "return-label" in chk["detail"]
