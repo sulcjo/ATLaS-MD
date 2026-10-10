@@ -50,6 +50,7 @@ EXCHANGE_ENERGY_VERSION_AUX = "state_bias_matrix_v3_aux"
 #: Payload schema a Stage C samples manifest records when every row stores the auxiliary z and the
 #: full torsion basis (gareus.auxiliary_cv.sample_schema.AUX_SAMPLES_SCHEMA; kept here import-light).
 AUX_SAMPLES_PAYLOAD_SCHEMA = "atlas-aux-samples-v1"
+AUX_SAMPLES_PAYLOAD_SCHEMAS = (AUX_SAMPLES_PAYLOAD_SCHEMA, "atlas-aux-samples-v2")
 
 
 def raw_sample_payload_schema(run_dir, segment_id) -> "dict | None":
@@ -130,7 +131,7 @@ def run_has_aux(prod) -> bool:
     samples = prod / "samples"
     if samples.is_dir():
         for seg_dir in sorted(p for p in samples.iterdir() if p.is_dir()):
-            if (raw_sample_payload_schema(prod, seg_dir.name) or {}).get("schema") == AUX_SAMPLES_PAYLOAD_SCHEMA:
+            if (raw_sample_payload_schema(prod, seg_dir.name) or {}).get("schema") in AUX_SAMPLES_PAYLOAD_SCHEMAS:
                 return True
     return False
 
@@ -222,14 +223,14 @@ def classify_segment_kernel(window_snapshot: dict, *, sample_payload_schema: "di
         sha = identity.get("aux_model_sha256")
         payload = dict(sample_payload_schema or {})
         state = snap.get("state_definition") or {}
-        if payload.get("schema") != AUX_SAMPLES_PAYLOAD_SCHEMA:
-            return ELIGIBLE_AUX_UNPERSISTED, ("auxiliary-CV segment whose samples carry no atlas-aux-samples-v1 "
+        if payload.get("schema") not in AUX_SAMPLES_PAYLOAD_SCHEMAS:
+            return ELIGIBLE_AUX_UNPERSISTED, ("auxiliary-CV segment whose samples carry no supported "
                                               "payload (Stage B engineering run): its bias cannot be reconstructed")
         if not sha or sha not in (state.get("aux_models") or {}) or sha not in (payload.get("model_shas") or []):
             return ELIGIBLE_AUX_UNPERSISTED, ("auxiliary model of the kernel identity is not bound by the frozen "
                                               "snapshot and the sample schema")
         if cv2 != RESIDUAL_MODE:
-            return ELIGIBLE_VERIFIED, "auxiliary features recorded (atlas-aux-samples-v1) with a frozen state table"
+            return ELIGIBLE_VERIFIED, "auxiliary features recorded with a frozen state table"
     elif cv2 != RESIDUAL_MODE:
         return ELIGIBLE_NOT_APPLICABLE, "secondary CV is not residual-torsion-pc"
     if not identity:

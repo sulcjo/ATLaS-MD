@@ -211,7 +211,7 @@ def segment_eligibility(run_dir) -> dict:
                        if _ki.is_aux_kernel_record(snap.get("kernel_identity")) else None)
             status, reason = _ki.classify_segment_kernel(snap, sample_payload_schema=payload)
         elif _run_is_aux() or ((_ki.raw_sample_payload_schema(run_dir, seg_id) or {}).get("schema")
-                               == _ki.AUX_SAMPLES_PAYLOAD_SCHEMA):
+                               in _ki.AUX_SAMPLES_PAYLOAD_SCHEMAS):
             status, reason = (_ki.ELIGIBLE_AUX_UNPERSISTED,
                               "auxiliary run segment without a window snapshot: its state table is unknown (repair the run)")
         elif latest_residual:

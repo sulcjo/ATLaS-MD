@@ -70,6 +70,22 @@ def pick_best(candidates):
     return max(passing, key=lambda c: (c.info_gain, -c.n_nonzero)) if passing else None
 
 
+def rank_local_candidates(candidates):
+    """Canonical joint-search ranking: score, sparsity, then frozen candidate identity."""
+    return sorted(candidates, key=lambda c: (-c.score, np.count_nonzero(c.weights), c.identity))
+
+
+def local_candidate_summary(candidate):
+    support = np.flatnonzero(np.abs(candidate.weights) > 1e-8)
+    return {"partition_id": candidate.partition_id, "region": int(candidate.region),
+            "pair": list(candidate.pair), "family": candidate.family, "C": float(candidate.c),
+            "local_gain": float(candidate.local_gain), "prevalence": float(candidate.prevalence),
+            "score": float(candidate.score), "n_nonzero": int(np.count_nonzero(candidate.weights)),
+            "feature_width": int(candidate.weights.size),
+            "support": [[int(i), float(candidate.coefficients[i])] for i in support],
+            "offset": float(candidate.offset), "scale": float(candidate.scale)}
+
+
 def _bern_ll(m, X, y):
     p = np.clip(m.predict_proba(X)[:, 1], 1e-9, 1 - 1e-9)
     return float(np.mean(y * np.log(p) + (1 - y) * np.log(1 - p)))

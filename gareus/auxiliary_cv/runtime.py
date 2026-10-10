@@ -108,12 +108,17 @@ def aux_snapshot_rows(rows: list[dict], table: AuxStateTable) -> list[dict]:
 
 
 def _feature_atoms(model) -> set[int]:
+    if getattr(model, "schema_version", 1) == 2:
+        return {int(a) for feature in model.features for quad in feature.orbit for a in quad}
     return {int(a) for f in model.feature_schema.features for a in f.atom_indices}
 
 
 def canonical_topology_sha256(topology, model) -> str:
     """Content identity of the atom map the model's torsions index: every atom of the chains holding a
     feature atom, as (index, name, element, residue name, residue index, chain index)."""
+    if getattr(model, "schema_version", 1) == 2:
+        model.validate_topology(topology)
+        return model.topology_sha256
     wanted = _feature_atoms(model)
     atoms = list(topology.atoms())
     if wanted and max(wanted) >= len(atoms):
@@ -262,6 +267,15 @@ def check_aux_geometry(positions_nm, runtime: AuxRuntime, *, replica=None) -> No
     torsions, so z stays defined when only a zero-weight torsion is degenerate.
     """
     model = runtime.table.model
+    if getattr(model, "schema_version", 1) == 2:
+        quads = model.projection.quads
+        theta = openmm_dihedrals(positions_nm, quads)[0]
+        if np.isnan(theta).any():
+            bad = [quads[t] for t in np.flatnonzero(np.isnan(theta))]
+            where = "" if replica is None else f" on replica {replica}"
+            raise AuxObservationError(f"degenerate auxiliary torsion(s) {bad}{where} while auxiliary states are "
+                                      "active; failing the segment (spec 3.3)")
+        return
     all_quads, idx = unique_torsions(model)
     active_t = sorted(set(idx[active_feature_mask(model)].tolist()))
     quads = [all_quads[t] for t in active_t]

@@ -720,6 +720,9 @@ def _add_window_args(p: argparse.ArgumentParser) -> None:
                         "every worker and the worker burn-in discards their samples. Off by default.")
     p.add_argument("--ap-aux-reserve-slots", type=int, default=4,
                    help="Replica slots of the P1 reserve kept for auxiliary workers (R1/R3 never use them).")
+    p.add_argument("--ap-aux-feature-space", choices=("backbone", "sidechain", "mixed", "auto"), default="backbone",
+                   help="Feature space for aux discovery, frozen per campaign. Backbone preserves the existing "
+                        "search; sidechain, mixed and auto are reserved until their discovery integration is available.")
     p.add_argument("--ap-aux-validation", choices=("required", "off"), default="required",
                    help="Gate on aux worker admission: required (default) = adaptive_production/aux_validation.json "
                         "must be valid; off = skip it (k3 cap from aux_settings k3_max_unvalidated). Frozen per campaign.")
@@ -1514,11 +1517,17 @@ def _validate_aux_cv_args(p: argparse.ArgumentParser, args: argparse.Namespace) 
 
 
 def _validate_aux_discovery_args(p: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    from gareus.adaptive.aux_discovery.settings import aux_feature_space, aux_discovery_incompatibilities
+    try:
+        feature_space = aux_feature_space(args)
+    except ValueError as exc:
+        p.error(str(exc))
     if not getattr(args, "ap_aux_discovery", False):
+        if feature_space != "backbone":
+            p.error("--ap-aux-feature-space needs --ap-aux-discovery for nondefault feature spaces")
         return
     if str(getattr(args, "window_mode", "")) != "adaptive-production":
         p.error("--ap-aux-discovery needs --window-mode adaptive-production")
-    from gareus.adaptive.aux_discovery.settings import aux_discovery_incompatibilities
     bad = aux_discovery_incompatibilities(args)
     if bad:
         p.error(bad[0])
@@ -1988,6 +1997,7 @@ def _shim_adaptive_production(args: argparse.Namespace) -> None:
     args.adaptive_production_aux_discovery = bool(getattr(args, "ap_aux_discovery", False))
     args.adaptive_production_aux_reserve_slots = int(getattr(args, "ap_aux_reserve_slots", 4))
     args.adaptive_production_aux_validation = str(getattr(args, "ap_aux_validation", "required"))
+    args.adaptive_production_aux_feature_space = args.ap_aux_feature_space
     args.adaptive_production_aux_settings_override = bool(getattr(args, "ap_aux_settings_override", False))
     args.adaptive_production_cv2_bridge_sets = args.ap_cv2_bridge_sets
     args.adaptive_production_respring_min_neff = args.ap_respring_min_neff

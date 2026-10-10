@@ -66,12 +66,12 @@ def _check_params(state, assignments, observed, label) -> None:
 def aux_checkpoint_block(*, state_definition, force_info, assignments: Sequence[int],
                          observed_params: Sequence[tuple[float, float]], topology_sha256: str,
                          kernel_identity_digest: str, segment_id: str, ledger_anchor: Mapping[str, Any],
-                         data_boundary: Mapping[str, Any]) -> dict[str, Any]:
+                         data_boundary: Mapping[str, Any], sample_basis_sha256: str | None = None) -> dict[str, Any]:
     state = canonical_state_definition(state_definition)
     if len(observed_params) != len(assignments):
         raise IntegrityError("save-time check: observed parameters do not cover every replica")
     _check_params(state, assignments, observed_params, "save-time check")
-    return {
+    block = {
         "schema": AUX_CHECKPOINT_SCHEMA,
         "state_definition": state,
         "state_definition_sha256": state_definition_hash(state),
@@ -87,10 +87,17 @@ def aux_checkpoint_block(*, state_definition, force_info, assignments: Sequence[
                           "start_assignments": [int(x) for x in ledger_anchor["start_assignments"]]},
         "data_boundary": json_loads(json_bytes(dict(data_boundary))),
     }
+    if sample_basis_sha256 is not None:
+        if (not isinstance(sample_basis_sha256, str) or len(sample_basis_sha256) != 64
+                or any(c not in "0123456789abcdef" for c in sample_basis_sha256)):
+            raise IntegrityError("sample_basis_sha256 must be a lowercase SHA-256 digest")
+        block["sample_basis_sha256"] = sample_basis_sha256
+    return block
 
 
 def verify_aux_resume_static(manifest: Mapping[str, Any], *, aux_enabled: bool, state_definition, force_info,
-                             topology_sha256: str, kernel_identity_digest: str) -> None:
+                             topology_sha256: str, kernel_identity_digest: str,
+                             sample_basis_sha256: str | None = None) -> None:
     """The checks that need no Context: capability, schema, state definition, force, topology, kernel.
 
     Run before the resumed segment is registered (Task 14 F4), and again inside verify_aux_resume.
@@ -116,15 +123,19 @@ def verify_aux_resume_static(manifest: Mapping[str, Any], *, aux_enabled: bool, 
         raise IntegrityError("topology identity changed between checkpoint and this run")
     if block["kernel_identity_digest"] != str(kernel_identity_digest):
         raise IntegrityError("kernel identity digest changed between checkpoint and this run")
+    if block.get("sample_basis_sha256") != sample_basis_sha256:
+        raise IntegrityError("sample angle basis changed between checkpoint and this run")
 
 
 def verify_aux_resume(manifest: Mapping[str, Any], *, aux_enabled: bool, state_definition, force_info,
                       assignments: Sequence[int], observed_params: Sequence[tuple[float, float]],
-                      topology_sha256: str, kernel_identity_digest: str) -> None:
+                      topology_sha256: str, kernel_identity_digest: str,
+                      sample_basis_sha256: str | None = None) -> None:
     """Call with the Context parameters as restored by loadCheckpoint, BEFORE any re-apply."""
     verify_aux_resume_static(manifest, aux_enabled=aux_enabled, state_definition=state_definition,
                              force_info=force_info, topology_sha256=topology_sha256,
-                             kernel_identity_digest=kernel_identity_digest)
+                             kernel_identity_digest=kernel_identity_digest,
+                             sample_basis_sha256=sample_basis_sha256)
     block = manifest.get("aux")
     if block is None:
         return

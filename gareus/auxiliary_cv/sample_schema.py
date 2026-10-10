@@ -22,6 +22,8 @@ from .features import openmm_dihedrals, unique_torsions
 from .model import AuxModel
 
 AUX_SAMPLES_SCHEMA = "atlas-aux-samples-v1"
+AUX_SAMPLES_SCHEMA_V2 = "atlas-aux-samples-v2"
+SUPPORTED_AUX_SAMPLES_SCHEMAS = (AUX_SAMPLES_SCHEMA, AUX_SAMPLES_SCHEMA_V2)
 TORSION_CONVENTION = "openmm_theta_radians"
 PRECISIONS = ("double", "mixed", "single")
 #: Reduced-energy parity tolerance between stored runtime z and offline z (spec Section 17).
@@ -33,12 +35,31 @@ def _basis_sha(quads, labels) -> str:
                               "labels": list(labels)}))
 
 
+def _basis_sha_v2(quads, labels, shas, model_maps) -> str:
+    return digest(json_bytes({"convention": TORSION_CONVENTION, "quads": [list(q) for q in quads],
+                              "labels": list(labels), "model_shas": list(shas),
+                              "model_angle_maps": [[list(row) for row in mapping] for mapping in model_maps]}))
+
+
+def _feature_angle_map(model, basis_quads):
+    where = {q: i for i, q in enumerate(basis_quads)}
+    mapped = []
+    for feature in model.features:
+        try:
+            mapped.append(tuple(where[q] for q in feature.orbit))
+        except KeyError as exc:
+            raise IntegrityError(f"model feature {feature.name} is outside the recorded sample basis") from exc
+    return tuple(mapped)
+
+
 @dataclass(frozen=True)
 class AuxSampleSchema:
     torsion_quads: tuple[tuple[int, int, int, int], ...]
     torsion_labels: tuple[str, ...]
     model_shas: tuple[str, ...]
     basis_sha256: str
+    schema: str = AUX_SAMPLES_SCHEMA
+    model_angle_maps: tuple[tuple[tuple[int, ...], ...], ...] = ()
 
     @property
     def torsion_columns(self) -> tuple[str, ...]:
@@ -49,15 +70,40 @@ class AuxSampleSchema:
         return tuple(f"aux_z_{i:02d}" for i in range(len(self.model_shas)))
 
     def to_payload(self) -> dict[str, Any]:
-        return {"schema": AUX_SAMPLES_SCHEMA, "torsion_convention": TORSION_CONVENTION,
+        payload = {"schema": self.schema, "torsion_convention": TORSION_CONVENTION,
                 "torsion_quads": [[int(a) for a in q] for q in self.torsion_quads],
                 "torsion_labels": [str(x) for x in self.torsion_labels],
                 "model_shas": [str(x) for x in self.model_shas], "basis_sha256": str(self.basis_sha256)}
+        if self.schema == AUX_SAMPLES_SCHEMA_V2:
+            payload["model_angle_maps"] = [
+                {"model_sha256": sha, "feature_orbit_columns": [list(x) for x in mapping]}
+                for sha, mapping in zip(self.model_shas, self.model_angle_maps)]
+        return payload
 
     @classmethod
     def from_payload(cls, raw: Mapping[str, Any]) -> "AuxSampleSchema":
-        if raw.get("schema") != AUX_SAMPLES_SCHEMA or raw.get("torsion_convention") != TORSION_CONVENTION:
-            raise IntegrityError(f"aux sample schema must be {AUX_SAMPLES_SCHEMA} / {TORSION_CONVENTION}")
+        version = raw.get("schema")
+        if version not in SUPPORTED_AUX_SAMPLES_SCHEMAS or raw.get("torsion_convention") != TORSION_CONVENTION:
+            raise IntegrityError(f"aux sample schema must be one of {SUPPORTED_AUX_SAMPLES_SCHEMAS} / "
+                                 f"{TORSION_CONVENTION}")
+        if version == AUX_SAMPLES_SCHEMA_V2 and set(raw) != {
+                "schema", "torsion_convention", "torsion_quads", "torsion_labels", "model_shas",
+                "basis_sha256", "model_angle_maps"}:
+            raise IntegrityError("v2 sample schema has missing or unknown fields")
+        if version == AUX_SAMPLES_SCHEMA_V2:
+            raw_quads = raw.get("torsion_quads")
+            if (not isinstance(raw_quads, list) or any(not isinstance(q, list) or len(q) != 4 or
+                    any(isinstance(a, bool) or not isinstance(a, int) or a < 0 for a in q) or
+                    len(set(q)) != 4 for q in raw_quads) or len(set(tuple(q) for q in raw_quads)) != len(raw_quads)):
+                raise IntegrityError("v2 sample torsion basis has invalid or duplicate atom quadruplets")
+            raw_labels, raw_shas = raw.get("torsion_labels"), raw.get("model_shas")
+            if (not isinstance(raw_labels, list) or any(not isinstance(x, str) or not x for x in raw_labels)
+                    or len(set(raw_labels)) != len(raw_labels)):
+                raise IntegrityError("v2 sample torsion labels must be nonempty unique strings")
+            if (not isinstance(raw_shas, list) or len(raw_shas) != 1 or any(
+                    not isinstance(x, str) or len(x) != 64 or
+                    any(c not in "0123456789abcdef" for c in x) for x in raw_shas)):
+                raise IntegrityError("v2 sample schema requires one full model SHA-256")
         quads = tuple(tuple(int(a) for a in q) for q in raw["torsion_quads"])
         labels = tuple(str(x) for x in raw["torsion_labels"])
         if len(quads) != len(labels) or any(len(q) != 4 for q in quads):
@@ -65,20 +111,61 @@ class AuxSampleSchema:
         shas = tuple(str(x) for x in raw["model_shas"])
         if any(len(s) != 64 for s in shas):
             raise IntegrityError("aux sample schema model_shas must be full sha256 digests")
-        expected = _basis_sha(quads, labels)
+        model_maps = ()
+        if version == AUX_SAMPLES_SCHEMA_V2:
+            if len(shas) != 1:
+                raise IntegrityError("v2 sample schema requires exactly one admitted model")
+            maps_raw = raw.get("model_angle_maps")
+            if not isinstance(maps_raw, list) or len(maps_raw) != len(shas):
+                raise IntegrityError("v2 sample schema needs one explicit angle map per model")
+            parsed = []
+            for item, sha in zip(maps_raw, shas):
+                if not isinstance(item, dict) or set(item) != {"model_sha256", "feature_orbit_columns"} or item[
+                        "model_sha256"] != sha:
+                    raise IntegrityError("v2 sample model angle map identity mismatch")
+                rows = item["feature_orbit_columns"]
+                if not isinstance(rows, list):
+                    raise IntegrityError("v2 sample feature angle map must be a list")
+                feature_map = []
+                for row in rows:
+                    if (not isinstance(row, list) or not row or any(isinstance(i, bool) or
+                            not isinstance(i, int) or not 0 <= i < len(quads) for i in row)
+                            or len(set(row)) != len(row)):
+                        raise IntegrityError("v2 sample feature angle map contains invalid columns")
+                    feature_map.append(tuple(row))
+                parsed.append(tuple(feature_map))
+            model_maps = tuple(parsed)
+            expected = _basis_sha_v2(quads, labels, shas, model_maps)
+        else:
+            expected = _basis_sha(quads, labels)
         if raw.get("basis_sha256") != expected:
             raise IntegrityError(f"aux sample schema basis_sha256 {raw.get('basis_sha256')} != content {expected}")
-        return cls(quads, labels, shas, expected)
+        return cls(quads, labels, shas, expected, version, model_maps)
 
     def model_basis_index(self, model: AuxModel) -> np.ndarray:
         """Positions in the stored basis of ``unique_torsions(model)`` (first-appearance order), the
         column order Stage A ``z_from_dihedrals`` requires."""
         where = {q: i for i, q in enumerate(self.torsion_quads)}
+        if getattr(model, "schema_version", 1) == 2:
+            self._check_v2_model_map(model)
+            quads = model.projection.quads
+            missing = [q for q in quads if q not in where]
+            if missing:
+                raise IntegrityError(f"aux model {model.model_sha256} uses torsions outside the recorded basis: "
+                                     f"{missing}")
+            return np.asarray([where[q] for q in quads], dtype=np.int64)
         quads, _idx = unique_torsions(model)
         missing = [q for q in quads if q not in where]
         if missing:
             raise IntegrityError(f"aux model {model.model_sha256} uses torsions outside the recorded basis: {missing}")
         return np.asarray([where[q] for q in quads], dtype=np.int64)
+
+    def _check_v2_model_map(self, model) -> None:
+        if self.schema != AUX_SAMPLES_SCHEMA_V2 or model.model_sha256 not in self.model_shas:
+            raise IntegrityError("v2 model requires matching v2 sample basis identity")
+        model_position = self.model_shas.index(model.model_sha256)
+        if self.model_angle_maps[model_position] != _feature_angle_map(model, self.torsion_quads):
+            raise IntegrityError("sample feature-to-angle column map differs from frozen model basis")
 
 
 def build_sample_schema(topology, peptide_atoms, models: Sequence[AuxModel]) -> AuxSampleSchema:
@@ -89,6 +176,29 @@ def build_sample_schema(topology, peptide_atoms, models: Sequence[AuxModel]) -> 
             shas.append(m.model_sha256)
     if len(shas) > 1:
         raise IntegrityError("More than one auxiliary model per phase is Stage F (spec Section 16); MVP supports one")
+    v2_models = [m for m in models if getattr(m, "schema_version", 1) == 2]
+    if v2_models:
+        if len(models) != 1:
+            raise IntegrityError("v2 sample schema requires the single admitted model for this phase")
+        model = v2_models[0]
+        model.validate_topology(topology)
+        quads, labels, where = [], [], {}
+        model_map = []
+        for feature in model.features:
+            columns = []
+            for orbit_index, quad in enumerate(feature.orbit):
+                if quad not in where:
+                    where[quad] = len(quads)
+                    quads.append(quad)
+                    labels.append(f"{feature.name}.orbit_{orbit_index}")
+                columns.append(where[quad])
+            model_map.append(tuple(columns))
+        maps = (tuple(model_map),)
+        quads, labels = tuple(quads), tuple(labels)
+        schema = AuxSampleSchema(quads, labels, tuple(shas), _basis_sha_v2(quads, labels, tuple(shas), maps),
+                                 AUX_SAMPLES_SCHEMA_V2, maps)
+        schema.model_basis_index(model)
+        return schema
     quads, labels = backbone_torsion_quads(topology, peptide_atoms)
     quads = tuple(tuple(int(a) for a in q) for q in quads)
     schema = AuxSampleSchema(quads, tuple(labels), tuple(shas), _basis_sha(quads, labels))
@@ -110,7 +220,11 @@ def observe_carrier(xyz_nm, schema: AuxSampleSchema, models: Mapping[str, AuxMod
         if sha not in models:
             raise IntegrityError(f"no loaded aux model for schema model {sha}")
         model = models[sha]
-        z[i] = z_from_dihedrals(theta[schema.model_basis_index(model)][None, :], model)[0]
+        angle_index = schema.model_basis_index(model)
+        if getattr(model, "schema_version", 1) == 2:
+            z[i] = model.projection.from_angles(theta[angle_index][None, :])[0]
+        else:
+            z[i] = z_from_dihedrals(theta[angle_index][None, :], model)[0]
     return AuxObservation(theta, z)
 
 

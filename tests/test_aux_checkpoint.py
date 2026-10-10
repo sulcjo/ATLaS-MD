@@ -58,6 +58,15 @@ def test_block_round_trip_verifies():
     verify_aux_resume({"aux": _block(d, a)}, **_verify_kw(d, a))
 
 
+def test_v2_resume_binds_sample_angle_basis():
+    d, a = _defn(), [2, 0, 1]
+    sha = "e" * 64
+    manifest = {"aux": _block(d, a, sample_basis_sha256=sha)}
+    verify_aux_resume(manifest, **_verify_kw(d, a), sample_basis_sha256=sha)
+    with pytest.raises(IntegrityError, match="sample angle basis"):
+        verify_aux_resume(manifest, **_verify_kw(d, a), sample_basis_sha256="f" * 64)
+
+
 @pytest.mark.parametrize("case, match", [
     ("changed_model", "state_definition_sha256"),
     ("force_group", "force_info"),

@@ -57,6 +57,13 @@ def build_aux_force(openmm, model: AuxModel, *, force_group: int):
 def aux_sub_cv_spec(model: AuxModel) -> list[tuple[str, str, list[tuple[tuple[int, ...], float]]]]:
     """(name, CustomTorsionForce expression, [(atom quad, weight)]) of every sub-CV ``build_aux_force``
     writes for ``model``, in force order: zero coefficients dropped, grouped by (trig, sign convention)."""
+    if getattr(model, "schema_version", 1) == 2:
+        groups: dict[tuple[str, int], list[tuple[tuple[int, ...], float]]] = defaultdict(list)
+        for quad, trig, signed_harmonic, weight in model.projection.terms():
+            groups[(trig, signed_harmonic)].append((tuple(int(a) for a in quad), float(weight)))
+        return [(f"sc_{trig}_{'neg' if harmonic < 0 else 'pos'}{abs(harmonic)}",
+                 f"w*{trig}({harmonic}*theta)", groups[(trig, harmonic)])
+                for trig, harmonic in sorted(groups)]
     groups: dict[tuple[str, int], list[tuple[tuple[int, ...], float]]] = defaultdict(list)
     for feature, coeff in zip(model.feature_schema.features, model.coefficients):
         if coeff == 0.0:

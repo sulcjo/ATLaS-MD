@@ -23,6 +23,13 @@ AUX_CAMPAIGN_OPTIONS_SCHEMA = "atlas-aux-campaign-options-v1"
 CONTINUE_STATES_REQUIRED = ("--ap-aux-discovery needs --ap-continue-states: without it every phase re-pulls every "
                             "worker, so the per-carrier worker burn-in drops every worker row and most carriers' "
                             "ordinary rows in every phase")
+FEATURE_SPACES = ("backbone", "sidechain", "mixed", "auto")
+
+
+def _feature_space(value: Any) -> str:
+    if not isinstance(value, str) or value not in FEATURE_SPACES:
+        raise ValueError(f"aux setting 'feature_space': expected one of {FEATURE_SPACES}, got {value!r}")
+    return value
 
 
 @dataclass(frozen=True)
@@ -69,9 +76,15 @@ class AuxDiscoverySettings:
     max_frames: int = 400_000
     partition_seed: int = 0
     temperature_k: float = 300.0
+    feature_space: str = "backbone"
+
+    def __post_init__(self) -> None:
+        _feature_space(self.feature_space)
 
     def to_mapping(self) -> Dict[str, Any]:
         out = dataclasses.asdict(self)
+        if self.feature_space == "backbone":
+            out.pop("feature_space")
         return {k: (list(v) if isinstance(v, tuple) else v) for k, v in out.items()}
 
     @classmethod
@@ -100,6 +113,8 @@ def _real(name: str, x: Any) -> float:
 def _typed_setting(name: str, v: Any) -> Any:
     """Type and range check of one frozen aux setting (F03): finite, no booleans, positive counts/sizes."""
     default = _DEFAULTS[name]
+    if name == "feature_space":
+        return _feature_space(v)
     if isinstance(default, tuple):
         if not isinstance(v, (list, tuple)) or not v:
             raise ValueError(f"aux setting {name!r}: expected a non-empty list, got {v!r}")
@@ -134,7 +149,8 @@ def _atomic_write_json(path: Path, payload: Dict[str, Any]) -> None:
 
 def resolve_aux_settings(adaptive_dir: Path, settings: AuxDiscoverySettings, *,
                          override: bool) -> Tuple[AuxDiscoverySettings, Dict[str, Any]]:
-    """Freeze settings at first use; a recorded file wins unless ``override``."""
+    """Freeze settings at first use; ``override`` can replace settings but cannot change the feature space."""
+    require_aux_feature_space(adaptive_dir, settings.feature_space)
     path = Path(adaptive_dir) / AUX_SETTINGS_FILENAME
     if path.exists() and not override:
         rec = json.loads(path.read_text())
@@ -155,13 +171,41 @@ def aux_validation_mode(args) -> str:
     return mode
 
 
+def aux_feature_space(args) -> str:
+    return _feature_space(getattr(args, "ap_aux_feature_space", "backbone"))
+
+
+def require_aux_feature_space(adaptive_dir: Path, feature_space: str) -> None:
+    """Refuse changing the feature space in either campaign record, including legacy backbone records."""
+    current = _feature_space(feature_space)
+    for filename, schema, field in ((AUX_CAMPAIGN_OPTIONS_FILENAME, AUX_CAMPAIGN_OPTIONS_SCHEMA, "options"),
+                                    (AUX_SETTINGS_FILENAME, AUX_SETTINGS_SCHEMA, "settings")):
+        path = Path(adaptive_dir) / filename
+        if not path.exists():
+            continue
+        try:
+            rec = json.loads(path.read_text())
+            if rec.get("schema") != schema or not isinstance(rec.get(field), dict):
+                raise ValueError(f"schema {rec.get('schema')!r} / {field} {rec.get(field)!r}")
+            recorded = _feature_space(rec[field].get("feature_space", "backbone"))
+        except Exception as exc:
+            raise RuntimeError(f"{path} is not a valid {schema} record ({exc})") from exc
+        if recorded != current:
+            raise RuntimeError(f"{path}: this aux campaign records feature_space={recorded}, this job has "
+                               f"feature_space={current}; --ap-aux-feature-space is frozen per campaign")
+
+
 def resolve_aux_campaign_options(adaptive_dir: Path, args) -> Dict[str, Any]:
-    """Freeze the job options aux discovery depends on (today ``--ap-continue-states``) in the aux-specific record
+    """Freeze continue-states, validation mode and feature space in the aux-specific record
     ``aux_campaign_options.json`` at the campaign's first aux job; every later job must match it. A mismatch or an
     unreadable record raises (never adopted: a recorded False would re-pull every worker). Kept out of
     ``DECISION_SETTINGS_FIELDS`` so a non-aux campaign's decision_settings.json is unchanged."""
     path = Path(adaptive_dir) / AUX_CAMPAIGN_OPTIONS_FILENAME
     current = {"continue_states": bool(getattr(args, "ap_continue_states", False))}
+    feature_space = aux_feature_space(args)
+    require_aux_feature_space(adaptive_dir, feature_space)
+    if feature_space != "backbone":
+        current["feature_space"] = feature_space
     mode = aux_validation_mode(args)
     if mode != "required":                   # key written only when off: a required campaign's record is unchanged
         current["aux_validation"] = mode

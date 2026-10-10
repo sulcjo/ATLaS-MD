@@ -13,7 +13,8 @@ from typing import List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
-from gareus.adaptive.aux_discovery.settings import (AuxDiscoverySettings, aux_validation_mode,
+from gareus.adaptive.aux_discovery.settings import (AuxDiscoverySettings, aux_feature_space, aux_validation_mode,
+                                                    require_aux_feature_space,
                                                     resolve_aux_settings)
 from gareus.adaptive.aux_discovery.validation import ValidationStatus, check_validation_record
 
@@ -98,12 +99,19 @@ def phase_alignment_ok(args, *, calib_steps: int) -> Tuple[bool, str]:
         return False, str(exc)
 
 
-def _build_frames(*, adaptive_dir, registry, epoch, settings, args):
+def _build_frames(*, adaptive_dir, registry, epoch, settings, args, topology=None, system=None):
     from gareus.adaptive.aux_discovery.frames import build_frame_table
     lam = {int(s.state_id): float(s.gamd_lambda) for s in registry.all_states()}
     stride = int(settings.frame_stride_steps) or int(args.exchange_interval)
+    dictionary = None
+    if settings.feature_space != "backbone":
+        if topology is None or system is None:
+            raise RuntimeError("sidechain feature discovery requires the campaign topology and parameterized System")
+        from gareus.adaptive.aux_discovery.descriptors import sidechain_descriptor_definition
+        dictionary = sidechain_descriptor_definition(topology, system)
     return build_frame_table(adaptive_dir, epochs=range(0, int(epoch) + 1), registry_lambda=lam,
-                             stride_steps=stride, max_frames=settings.max_frames, seed=settings.partition_seed)
+                             stride_steps=stride, max_frames=settings.max_frames, seed=settings.partition_seed,
+                             sidechain_dictionary=dictionary, production_topology=topology if dictionary else None)
 
 
 def _full_topology(out_dir: Path):
@@ -206,11 +214,7 @@ def _unfreeze(adaptive_dir: Path) -> None:
             print(f"WARNING: could not remove partially frozen {name}: {exc}")
 
 
-def physical_system_check(args, out_dir) -> dict:
-    """Production computes ``physical_system_sha256`` of the bare System before adding the aux force and refuses
-    CMAP / virtual sites / non-canonical forces there (IntegrityError). Run the same check on the campaign's
-    system before admitting, so a doomed admission never freezes. Status ``ok``, ``refused`` (admission blocked)
-    or ``not_checked`` (the System could not be built here; production still checks)."""
+def _physical_system_context(args, out_dir):
     try:
         from openmm import app, unit
         import openmm
@@ -218,11 +222,23 @@ def physical_system_check(args, out_dir) -> dict:
         pdb = app.PDBFile(str(Path(out_dir) / "01_solvated_start.pdb"))
         system = create_system(app, unit, make_forcefield_from_args(app, args), pdb.topology, args,
                                include_barostat=False)
+        return {"status": "ok", "openmm": openmm, "system": system, "topology": pdb.topology}
     except Exception as exc:
         return {"status": "not_checked", "detail": f"{type(exc).__name__}: {exc}"}
+
+
+def physical_system_check(args, out_dir, *, context=None) -> dict:
+    """Production computes ``physical_system_sha256`` of the bare System before adding the aux force and refuses
+    CMAP / virtual sites / non-canonical forces there (IntegrityError). Run the same check on the campaign's
+    system before admitting, so a doomed admission never freezes. Status ``ok``, ``refused`` (admission blocked)
+    or ``not_checked`` (the System could not be built here; production still checks)."""
+    context = context or _physical_system_context(args, out_dir)
+    if context.get("status") != "ok":
+        return {"status": "not_checked", "detail": context.get("detail", "parameterized System unavailable")}
     from gareus.auxiliary_cv.runtime_definition import physical_system_sha256
     try:
-        return {"status": "ok", "physical_system_sha256": physical_system_sha256(openmm, system)}
+        return {"status": "ok", "physical_system_sha256": physical_system_sha256(
+            context["openmm"], context["system"])}
     except Exception as exc:                     # IntegrityError: CMAP, virtual sites, unknown force
         return {"status": "refused", "detail": f"{type(exc).__name__}: {exc}"}
 
@@ -232,6 +248,16 @@ def run_epoch_aux_discovery(*, adaptive_dir, epoch_dir, epoch, registry, diagnos
     adaptive_dir = Path(adaptive_dir); epoch_dir = Path(epoch_dir)
     actions = list(actions)
     if not getattr(policy, "aux_discovery", False) or int(epoch) < 1:
+        return actions
+    try:
+        feature_space = aux_feature_space(args)
+        require_aux_feature_space(adaptive_dir, feature_space)
+    except Exception as exc:
+        try:
+            _write_json(epoch_dir / REPORT_NAME, {"schema": REPORT_SCHEMA, "epoch": int(epoch),
+                                                 "status": "error", "error": f"{type(exc).__name__}: {exc}"})
+        except Exception as write_exc:
+            print(f"WARNING: could not write {epoch_dir / REPORT_NAME}: {write_exc}")
         return actions
     last_epoch = max_epochs is not None and int(epoch) >= int(max_epochs) - 1
     if (adaptive_dir / ADMISSION_FILENAME).exists():
@@ -247,7 +273,7 @@ def run_epoch_aux_discovery(*, adaptive_dir, epoch_dir, epoch, registry, diagnos
             # phase (epoch + 1) would never match and the pull transient would pool unfiltered (fix wave I2).
             report["status"] = "last_epoch"
             return actions
-        settings, srec = resolve_aux_settings(adaptive_dir, AuxDiscoverySettings(),
+        settings, srec = resolve_aux_settings(adaptive_dir, AuxDiscoverySettings(feature_space=feature_space),
                                               override=bool(getattr(args, "adaptive_production_aux_settings_override", False)))
         report["settings"] = srec.get("settings")
         if aux_validation_mode(args) == "off":
@@ -266,17 +292,36 @@ def run_epoch_aux_discovery(*, adaptive_dir, epoch_dir, epoch, registry, diagnos
         if limits["n_slots"] <= 0:
             report["status"] = "no_slots"
             return actions
-        physical = physical_system_check(args, out_dir)
+        context = _physical_system_context(args, out_dir) if settings.feature_space != "backbone" else None
+        physical = physical_system_check(args, out_dir, context=context)
         report["physical_system"] = physical
         if physical["status"] == "refused":
             report["status"] = "physical_system_unsupported"
             return actions
         # effective max = min(frozen settings.max_workers, free aux slots); the frozen settings record is untouched
         run_settings = dataclasses.replace(settings, max_workers=min(int(settings.max_workers), int(limits["n_slots"])))
-        ft = _build_frames(adaptive_dir=adaptive_dir, registry=registry, epoch=epoch, settings=settings, args=args)
+        ft = _build_frames(adaptive_dir=adaptive_dir, registry=registry, epoch=epoch, settings=settings, args=args,
+                           topology=None if context is None else context.get("topology"),
+                           system=None if context is None else context.get("system"))
         res = _discover(ft=ft, epoch=epoch, settings=run_settings, out_dir=out_dir, k3_max=val.k3_max,
                         eligible_parents=limits["eligible_parents"])
         report.update(res.report); report["status"] = res.status
+        if getattr(res.model, "schema_version", 1) == 2:
+            from gareus.adaptive.aux_discovery.validation import active_feature_coverage, feature_coverage_report
+            required_features = active_feature_coverage(res.model)
+            if aux_validation_mode(args) == "off":
+                report["validation"]["feature_coverage"] = feature_coverage_report({}, required_features)
+            else:
+                val = check_validation_record(adaptive_dir / VALIDATION_FILENAME,
+                                              timestep_fs=float(args.timestep_fs), model=res.model)
+                try:
+                    validation_record = json.loads((adaptive_dir / VALIDATION_FILENAME).read_text())
+                except (OSError, ValueError):
+                    validation_record = {}
+                report["validation"].update({"ok": val.ok, "reason": val.reason,
+                                              "k3_max": val.k3_max,
+                                              "feature_coverage": feature_coverage_report(
+                                                  validation_record, required_features)})
         if res.status != "ok":
             return actions
         if not val.ok:
@@ -295,13 +340,16 @@ def run_epoch_aux_discovery(*, adaptive_dir, epoch_dir, epoch, registry, diagnos
             return actions
         new = []
         for rank, c in enumerate(chosen):
+            aux_metadata = {"discovery_epoch": int(epoch), "placement_rank": rank,
+                            "burnin_phase_epoch": int(epoch) + 1,
+                            "forecast": {k: c[k] for k in ("O", "TV", "null", "net", "utility_q10")}}
+            if res.report.get("local_candidate") is not None:
+                aux_metadata["selected_candidate"] = res.report["local_candidate"]
             new.append((ACTION, int(c["state_id"]),
                         {"aux_center": float(c["c3"]), "aux_k_kcal_mol": float(c["k3"]),
                          "aux_model_sha256": res.model.model_sha256, "burnin_steps": 0},
                         f"aux_discovery epoch {int(epoch)}",
-                        {"aux": {"discovery_epoch": int(epoch), "placement_rank": rank,
-                                 "burnin_phase_epoch": int(epoch) + 1,
-                                 "forecast": {k: c[k] for k in ("O", "TV", "null", "net", "utility_q10")}}}))
+                        {"aux": aux_metadata}))
         freeze_started = True
         report["backfill"] = _freeze(adaptive_dir, epoch, res, new, settings, srec, val)
         report["admitted"] = [[a[1], a[2]] for a in new]
@@ -395,14 +443,17 @@ def _freeze(adaptive_dir: Path, epoch, res, new_actions, settings, srec, val) ->
     backfill = _backfill(adaptive_dir, epoch, res.model)     # BackfillIncomplete propagates: caller unfreezes
     part_sha = res.eval_partition.to_file(adaptive_dir / PARTITION_FILENAME)
     settings_sha = hashlib.sha256(json.dumps(srec.get("settings"), sort_keys=True).encode()).hexdigest()
-    _write_json(adaptive_dir / ADMISSION_FILENAME, {
+    admission = {
         "schema": ADMISSION_SCHEMA, "epoch": int(epoch), "model_sha256": res.model.model_sha256,
         "eval_partition_sha256": part_sha, "settings_sha256": settings_sha,
         "validation": ({"validation": "off", "k3_max": val.k3_max, "reason": val.reason}
                        if val.reason == "off" else {"k3_max": val.k3_max, "reason": val.reason}), "backfill": backfill,
         "workers": [{"parent_state_id": a[1], "aux_center": a[2]["aux_center"],
                      "aux_k_kcal_mol": a[2]["aux_k_kcal_mol"], "placement_rank": a[4]["aux"]["placement_rank"],
-                     "burnin_phase_epoch": a[4]["aux"]["burnin_phase_epoch"]} for a in new_actions]})
+                     "burnin_phase_epoch": a[4]["aux"]["burnin_phase_epoch"]} for a in new_actions]}
+    if res.report.get("local_candidate") is not None:
+        admission["selected_candidate"] = res.report["local_candidate"]
+    _write_json(adaptive_dir / ADMISSION_FILENAME, admission)
     return backfill
 
 

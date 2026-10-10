@@ -10,7 +10,7 @@ from ..correctness.bias import KJ_PER_KCAL
 from .duplicates import merge_identical_hamiltonians  # noqa: F401  (re-export, final fix wave I4d)
 from .evaluate import z_from_dihedrals
 from .model import AuxModel
-from .sample_schema import AUX_SAMPLES_SCHEMA, AuxSampleSchema
+from .sample_schema import SUPPORTED_AUX_SAMPLES_SCHEMAS, AuxSampleSchema
 
 AUDIT_THRESHOLD_FRACTION = 1e-3
 
@@ -142,8 +142,8 @@ def _segment_payloads(run_dir) -> dict[str, "dict | None"]:
     for seg_dir in sorted(p for p in root.iterdir() if p.is_dir()):
         manifest = load_manifest(seg_dir, expected_kind="samples")
         payload = (manifest or {}).get("payload_schema")
-        # Only atlas-aux-samples-v1 payloads are auxiliary; anything else (or none) reads as None.
-        out[seg_dir.name] = payload if isinstance(payload, dict) and payload.get("schema") == AUX_SAMPLES_SCHEMA else None
+        out[seg_dir.name] = (payload if isinstance(payload, dict) and
+                             payload.get("schema") in SUPPORTED_AUX_SAMPLES_SCHEMAS else None)
     return out
 
 

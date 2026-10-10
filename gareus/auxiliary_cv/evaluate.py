@@ -25,6 +25,12 @@ def z_from_dihedrals(theta, model: AuxModel) -> np.ndarray:
     ``unique_torsions(model)``; any other shape is refused.
     """
     theta = np.asarray(theta, dtype=np.float64)
+    if getattr(model, "schema_version", 1) == 2:
+        n_active = len(model.projection.quads)
+        if theta.ndim != 2 or theta.shape[1] != n_active or not np.isfinite(theta).all():
+            raise IntegrityError(f"theta must have shape (n_frames, {n_active}) for active v2 torsions, "
+                                 f"got {theta.shape}")
+        return np.asarray(model.projection.from_angles(theta), dtype=np.float64)
     n_unique = len(unique_torsions(model)[0])
     if theta.ndim != 2 or theta.shape[1] != n_unique:
         raise IntegrityError(f"theta must have shape (n_frames, {n_unique}) (one column per unique "
@@ -36,6 +42,8 @@ def z_from_dihedrals(theta, model: AuxModel) -> np.ndarray:
 
 
 def z_from_positions(xyz_nm, model: AuxModel) -> np.ndarray:
+    if getattr(model, "schema_version", 1) == 2:
+        return model.values(xyz_nm)
     quads, _idx = unique_torsions(model)
     return z_from_dihedrals(openmm_dihedrals(xyz_nm, quads), model)
 
@@ -60,6 +68,8 @@ def z_and_gradient(xyz_nm, model: AuxModel) -> tuple[float, np.ndarray]:
     x = np.asarray(xyz_nm, dtype=np.float64)
     if x.ndim != 2 or x.shape[1] != 3:
         raise IntegrityError("z_and_gradient takes one configuration of shape (n_atoms, 3)")
+    if getattr(model, "schema_version", 1) == 2:
+        return model.value_gradient(x)
     quads, idx = unique_torsions(model)
     active = active_feature_mask(model)
     used = np.zeros(len(quads), dtype=bool)

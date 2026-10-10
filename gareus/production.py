@@ -8388,7 +8388,9 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
             _aux_reseal_plan = prepare_aux_resume(
                 out_dir, _seg_registry, resume_manifest, state_definition=_aux_io.state_definition,
                 force_info=_aux_io.force_info, topology_sha256=_aux_io.topology_sha256,
-                kernel_identity_digest=kernel_identity_for_run(args, secondary_cv_metadata)["digest"])
+                kernel_identity_digest=kernel_identity_for_run(args, secondary_cv_metadata)["digest"],
+                sample_basis_sha256=(_aux_io.sample_schema.basis_sha256
+                                     if _aux_io.sample_schema.schema == "atlas-aux-samples-v2" else None))
             _aux_parent_seg_id = _aux_reseal_plan["parent_segment_id"]
         _seg_id = _seg_registry.open_segment(_run_id, _aux_parent_seg_id, _round_id)
         # Carry-over 5: the frozen v2 snapshot carries the state definition.
@@ -9298,7 +9300,9 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                     kernel_identity_digest=kernel_identity_for_run(args, secondary_cv_metadata)["digest"],
                     segment_id=_seg_id, ledger_anchor=_aux_anchor,
                     # Carry-over 12 (M1): safe before the first non-empty flush (generation 0, 0 rows).
-                    data_boundary=data_boundary(out_dir, _seg_id))
+                    data_boundary=data_boundary(out_dir, _seg_id),
+                    sample_basis_sha256=(_aux_io.sample_schema.basis_sha256
+                                         if _aux_io.sample_schema.schema == "atlas-aux-samples-v2" else None))
             return None
 
         def _aux_pre_apply(manifest_in, assignments_in):
@@ -9313,7 +9317,9 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                     observed_params=[_sim_pool.submit(r, read_aux_parameters, sims[r].context, _aux_io.force_info).result()
                                      for r in range(len(assignments_in))],
                     topology_sha256=_aux_io.topology_sha256,
-                    kernel_identity_digest=kernel_identity_for_run(args, secondary_cv_metadata)["digest"])
+                    kernel_identity_digest=kernel_identity_for_run(args, secondary_cv_metadata)["digest"],
+                    sample_basis_sha256=(_aux_io.sample_schema.basis_sha256
+                                         if _aux_io.sample_schema.schema == "atlas-aux-samples-v2" else None))
                 if _aux_io.state_definition["ensemble"] == "NVT":
                     check_fixed_box([_sim_pool.submit(r, context_box_nm, sims[r].context, unit).result()
                                      for r in range(len(assignments_in))],

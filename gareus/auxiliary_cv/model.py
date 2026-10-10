@@ -51,6 +51,9 @@ class AuxModel:
 
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any]) -> "AuxModel":
+        if isinstance(raw, Mapping) and raw.get("schema") == "atlas-aux-cv-model-v2":
+            from .sidechain_model import SidechainModel
+            return SidechainModel.from_mapping(raw)
         data = json_loads(json_bytes(dict(raw)))
         unknown = sorted(set(data) - _REQUIRED - _OPTIONAL)
         if unknown:

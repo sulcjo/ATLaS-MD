@@ -102,7 +102,7 @@ def _write_phase(phase, n_windows, aux, step0, rng, truth, label, record_z=True,
         truth[(label, replica, step)] = z
         kw = {}
         if aux and record_z:
-            kw = dict(torsions=[0.1, 0.2], aux_z=[z])
+            kw = dict(torsions=[0.1] * len(SCHEMA.torsion_quads), aux_z=[z])
         writer.write_sample(step=step, replica=replica, window_id=w, cv1=cv, cv2=None, potential=0.0,
                             boost_total=None, boost_dihedral=None, boost_nonbonded=None, **kw)
         last = max(last, step)

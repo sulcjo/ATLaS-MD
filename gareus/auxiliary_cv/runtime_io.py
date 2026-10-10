@@ -221,7 +221,8 @@ def anchor_ledger_events(out_dir, manifest: Mapping[str, Any]) -> dict:
 
 
 def prepare_aux_resume(out_dir, registry, manifest: Mapping[str, Any], *, state_definition, force_info,
-                       topology_sha256: str, kernel_identity_digest: str) -> dict[str, Any]:
+                       topology_sha256: str, kernel_identity_digest: str,
+                       sample_basis_sha256: str | None = None) -> dict[str, Any]:
     """Every auxiliary resume refusal that needs no Context, run BEFORE the resumed segment is registered.
 
     Task 14 F4 (fix round 2): read-only -- it never changes the registry. Order: static checkpoint binding
@@ -234,7 +235,8 @@ def prepare_aux_resume(out_dir, registry, manifest: Mapping[str, Any], *, state_
     from .checkpoint import verify_aux_ledger, verify_aux_resume_static
     from .ledger import refuse_duplicate_event_keys
     verify_aux_resume_static(manifest, aux_enabled=True, state_definition=state_definition, force_info=force_info,
-                             topology_sha256=topology_sha256, kernel_identity_digest=kernel_identity_digest)
+                             topology_sha256=topology_sha256, kernel_identity_digest=kernel_identity_digest,
+                             sample_basis_sha256=sample_basis_sha256)
     check_data_boundary(out_dir, manifest)
     verify_aux_ledger(manifest, anchor_ledger_events(out_dir, manifest))
     ckpt_seg, ckpt_step = str(manifest["aux"]["segment_id"]), int(manifest.get("absolute_step", 0))

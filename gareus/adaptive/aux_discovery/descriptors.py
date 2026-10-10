@@ -121,3 +121,33 @@ def evaluate_descriptors(xyz_nm: np.ndarray, d: DescriptorDefinition) -> Dict[st
     deg = np.degrees(theta)
     basin = basin_codes(deg[:, d.core_phi_cols], deg[:, n_phi + d.core_psi_cols])
     return {"tors": tors, "tors_theta_iupac": theta, "hc": hc, "hb": hb, "basin": basin}
+
+
+def sidechain_descriptor_definition(topology, system=None):
+    from gareus.auxiliary_cv.sidechain_dictionary import build_sidechain_dictionary
+    return build_sidechain_dictionary(topology, system)
+
+
+def evaluate_sidechain_descriptors(xyz_nm, dictionary, phase_map=None):
+    from gareus.auxiliary_cv.atom_mapping import _digest
+    from gareus.auxiliary_cv.sidechain_core import Projection
+    xyz = np.asarray(xyz_nm, dtype=np.float64)
+    if xyz.ndim != 3 or xyz.shape[2] != 3:
+        raise ValueError('sidechain coordinates must have shape (frames, atoms, 3)')
+    if phase_map is not None:
+        identity = _digest({'atom_keys': phase_map.production_atom_keys,
+                            'bonds': phase_map.production_bonds})
+        if identity != dictionary.topology_digest:
+            raise ValueError('dictionary and phase production topology identity differ')
+        atom_count = len(phase_map.trajectory_atom_keys)
+    else:
+        atom_count = len(dictionary.atom_keys)
+    if xyz.shape[1] != atom_count:
+        raise ValueError('coordinates do not match frozen atom mapping')
+    columns = []
+    for primitive in dictionary.primitives:
+        projection = Projection((primitive,), (1.,))
+        if phase_map is not None:
+            projection = projection.remap(phase_map.production_to_trajectory)
+        columns.append(projection.values(xyz))
+    return np.stack(columns, axis=1) if columns else np.empty((len(xyz), 0))

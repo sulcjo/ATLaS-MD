@@ -40,7 +40,8 @@ def _forecast(z, lab, lin_codes, c, k, shifts, RT, K, what="candidate"):
 
 
 def place_workers(z, lab, state_id, lineage, step, is_train, is_heldout, s: AuxDiscoverySettings, *,
-                  k_labels: int, k3_max: Optional[float] = None, eligible_parents=None) -> dict:
+                  k_labels: int, k3_max: Optional[float] = None, eligible_parents=None,
+                  local_support=None) -> dict:
     """``eligible_parents`` (None = any): the states a worker may be spawned from (active, ordinary, lambda = 0
     in the live registry after the epoch's other actions); a ranked candidate of another state is logged
     ``parent_not_eligible`` and never chosen. At most ``s.max_workers`` are chosen (0 = none)."""
@@ -55,11 +56,32 @@ def place_workers(z, lab, state_id, lineage, step, is_train, is_heldout, s: AuxD
     df = pd.DataFrame({"state_id": np.asarray(state_id), "lineage": np.asarray(lineage), "step": np.asarray(step),
                        "z": np.asarray(z), "lab": np.asarray(lab), "tr": np.asarray(is_train, dtype=bool),
                        "ho": np.asarray(is_heldout, dtype=bool)})
+    support_pair = None
+    support_region = None
+    if local_support is not None:
+        support_labels = np.asarray(local_support["labels"])
+        support_regions = np.asarray(local_support["regions"])
+        support_pair = tuple(int(x) for x in local_support["pair"])
+        support_region = int(local_support["region"])
+        if (support_labels.shape != (len(df),) or support_regions.shape != (len(df),)
+                or len(support_pair) != 2 or support_pair[0] == support_pair[1]):
+            raise ValueError("local placement support must bind labels, regions and a distinct group pair to every frame")
+        df["support_label"] = support_labels
+        df["support_region"] = support_regions
     df = df.sort_values(["state_id", "lineage", "step"], kind="mergesort").reset_index(drop=True)
     cands, skipped = [], []
     for sid, grp in df.groupby("state_id"):
         tr = grp[grp.tr]
         ho = grp[grp.ho]
+        if local_support is not None:
+            support_train = grp[grp.tr]
+            supported = support_train.support_region.to_numpy() == support_region
+            present = set(support_train.support_label.to_numpy()[supported].astype(int))
+            if not set(support_pair).issubset(present):
+                skipped.append({"state_id": int(sid), "n_train_frames": len(tr),
+                                "reason": "missing_local_candidate_support",
+                                "region": support_region, "pair": list(support_pair)})
+                continue
         if len(tr) < s.min_train_frames:
             skipped.append({"state_id": int(sid), "n_train_frames": len(tr), "reason": "too_few_training_frames"})
             continue

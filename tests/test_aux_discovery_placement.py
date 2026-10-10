@@ -66,6 +66,29 @@ def test_k3_cap_marks_ineligible():
     assert all(c["gates"]["k3_max"] is False and c["eligible"] is False for c in out["all_candidates"])
 
 
+def test_local_support_rejects_wrong_parent_and_forecasts_full_parent_distribution():
+    rng = np.random.default_rng(29)
+    per, n_states = 900, 2
+    sid = np.repeat(np.arange(n_states), per)
+    z = rng.normal(size=sid.size)
+    labels = (z > 0).astype(int)
+    lineage = np.tile(np.array([f"e0:{i % 30}" for i in range(per)]), n_states)
+    step = np.tile(np.arange(per) * 3000, n_states)
+    train = np.tile(np.arange(per) < 700, n_states)
+    regions = np.tile(np.repeat([0, 1], per // 2), n_states)
+    support_labels = labels.copy()
+    support_labels[sid == 1] = 0
+    settings = AuxDiscoverySettings(n_boot_place=10, n_null=10, n_null_boot=5)
+    out = place_workers(z, labels, sid, lineage, step, train, ~train, settings, k_labels=2,
+                        local_support={"labels": support_labels, "regions": regions,
+                                       "pair": (0, 1), "region": 0})
+    assert all(candidate["state_id"] == 0 for candidate in out["all_candidates"])
+    rejected = [row for row in out["skipped_states"] if row["state_id"] == 1]
+    assert rejected and rejected[0]["reason"] == "missing_local_candidate_support"
+    assert all(candidate["n_train_frames"] == 700 for candidate in out["all_candidates"])
+    assert all(candidate["k3"] > 0 for candidate in out["all_candidates"])
+
+
 def _overlap(du, what="test"):
     from gareus.adaptive.aux_discovery.placement import _forecast
     du = np.asarray(du, dtype=float)

@@ -111,12 +111,17 @@ def test_admission_freezes_files_and_emits_actions(tmp_path, monkeypatch):
     ad = tmp_path / "adaptive_production"; (ad / "epoch_001").mkdir(parents=True)
     _ok_validation(monkeypatch)
     monkeypatch.setattr(H, "_build_frames", lambda **kw: object())
-    monkeypatch.setattr(H, "_discover", lambda **kw: H.DiscoveryResultStub.ok_with_workers([(1, 1.2, 2.0)]))
+    res = H.DiscoveryResultStub.ok_with_workers([(1, 1.2, 2.0)])
+    res.report["local_candidate"] = {"partition_id": "partition-k2", "k": 2, "region": 3,
+                                     "pair": [0, 1], "family": "sidechain"}
+    monkeypatch.setattr(H, "_discover", lambda **kw: res)
     out = _run(ad, tmp_path)
     assert len(out) == 1 and out[0][0] == "admit_aux" and out[0][1] == 1
     assert out[0][2]["burnin_steps"] == 0 and out[0][4]["aux"]["burnin_phase_epoch"] == 2 and out[0][2]["aux_model_sha256"] == "e" * 64
     adm = json.loads((ad / "aux_admission.json").read_text())
     assert adm["schema"] == "atlas-aux-admission-v1" and adm["workers"][0]["parent_state_id"] == 1
+    assert adm["selected_candidate"] == res.report["local_candidate"]
+    assert out[0][4]["aux"]["selected_candidate"] == res.report["local_candidate"]
     assert (ad / "aux_model.json").exists() and (ad / "aux_eval_partition.pkl").exists()
 
 

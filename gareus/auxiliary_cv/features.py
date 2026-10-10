@@ -74,6 +74,12 @@ _EXPECTED = {"phi": ("C", "N", "CA", "C"), "psi": ("N", "CA", "C", "N")}
 
 def check_feature_atoms(model: AuxModel, topology, *, topology_sha256: str | None = None) -> None:
     """Refuse a model whose torsions are not the backbone phi/psi they claim on this topology."""
+    if getattr(model, "schema_version", 1) == 2:
+        if topology_sha256 is not None and topology_sha256 != model.topology_sha256:
+            raise IntegrityError(f"aux model was built for topology {model.topology_sha256}, "
+                                 f"this run's topology is {topology_sha256}")
+        model.validate_topology(topology)
+        return
     if topology_sha256 is not None and topology_sha256 != model.feature_schema.topology_sha256:
         raise IntegrityError(f"aux model was built for topology {model.feature_schema.topology_sha256}, "
                              f"this run's topology is {topology_sha256}")

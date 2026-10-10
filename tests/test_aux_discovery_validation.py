@@ -51,6 +51,21 @@ def test_cli_write(tmp_path):
     assert check_validation_record(out, timestep_fs=3.5).ok
 
 
+def test_cli_writes_feature_harmonic_coverage(tmp_path):
+    from types import SimpleNamespace
+    out = tmp_path / "v2.json"
+    subprocess.run([sys.executable, "-m", "gareus.adaptive.aux_discovery.validation", "write", "--out", str(out),
+                    "--commit", "abc", "--timestep-fs", "3.5", "--k3-max", "3.0",
+                    "--finite-timestep", "pass", "--finite-timestep-evidence", "a.log",
+                    "--npt", "pass", "--npt-evidence", "b.log", "--cost", "pass", "--cost-evidence", "c.log",
+                    "--feature-coverage", "pass", "--feature-coverage-evidence", "chi2-run.json",
+                    "--covered-feature", "chi2_A:10_PHE_cos|sidechain|2"], check=True)
+    model = SimpleNamespace(schema_version=2,
+                            features=(SimpleNamespace(name="chi2_A:10_PHE_cos", family="sidechain", harmonic=2),),
+                            coefficients=(0.4,))
+    assert check_validation_record(out, timestep_fs=3.5, model=model).ok
+
+
 def _reason(tmp, raw_rec):
     p = tmp / "aux_validation.json"
     p.write_text(raw_rec if isinstance(raw_rec, str) else json.dumps(raw_rec))
@@ -108,6 +123,44 @@ def test_malformed_mapping_refused(tmp_path):
 def test_valid_record_with_list_evidence_passes(tmp_path):
     checks = {n: {"status": "pass", "evidence": ["a", "b"]} for n in ("finite_timestep", "npt", "cost")}
     assert check_validation_record(_write(tmp_path, checks=checks), timestep_fs=3.5).ok
+
+
+def test_v2_requires_explicit_active_feature_and_harmonic_coverage(tmp_path):
+    from types import SimpleNamespace
+    feature = SimpleNamespace(name="chi2_A:10_PHE_cos", family="sidechain", harmonic=2)
+    model = SimpleNamespace(schema_version=2, features=(feature,), coefficients=(0.4,))
+    path = _write(tmp_path)
+    assert check_validation_record(path, timestep_fs=3.5, model=model).reason == \
+        "validation_evidence_missing:feature_coverage"
+    rec = json.loads(path.read_text())
+    rec["checks"]["feature_coverage"] = {"status": "pass", "evidence": ["chi2-harmonic2-run.json"],
+                                             "covered_features": [{"name": "chi2_A:10_PHE_cos",
+                                                                   "family": "sidechain", "harmonic": 2}]}
+    path.write_text(json.dumps(rec))
+    assert check_validation_record(path, timestep_fs=3.5, model=model).ok
+
+
+def test_backbone_coverage_does_not_cover_sidechain_harmonic_two(tmp_path):
+    from types import SimpleNamespace
+    feature = SimpleNamespace(name="chi2_A:10_PHE_cos", family="sidechain", harmonic=2)
+    model = SimpleNamespace(schema_version=2, features=(feature,), coefficients=(0.4,))
+    rec = json.loads(_write(tmp_path).read_text())
+    rec["checks"]["feature_coverage"] = {"status": "pass", "evidence": ["backbone-h1-run.json"],
+                                             "covered_features": [{"name": "psi_A:9_sin",
+                                                                   "family": "backbone", "harmonic": 1}]}
+    path = _write(tmp_path, checks=rec["checks"])
+    assert check_validation_record(path, timestep_fs=3.5, model=model).reason == \
+        "validation_evidence_missing:feature_coverage"
+
+
+def test_validation_off_coverage_report_shows_absent_physical_evidence():
+    from types import SimpleNamespace
+    from gareus.adaptive.aux_discovery.validation import active_feature_coverage, feature_coverage_report
+    feature = SimpleNamespace(name="chi2_A:10_PHE_cos", family="sidechain", harmonic=2)
+    model = SimpleNamespace(schema_version=2, features=(feature,), coefficients=(0.4,))
+    report = feature_coverage_report({}, active_feature_coverage(model))
+    assert report["status"] == "absent"
+    assert report["missing_features"] == [{"name": "chi2_A:10_PHE_cos", "family": "sidechain", "harmonic": 2}]
 
 
 def test_driver_start_refuses_malformed_record(tmp_path):

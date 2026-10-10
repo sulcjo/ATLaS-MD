@@ -52,12 +52,18 @@ def final_production_step(phase_dir: Path) -> Optional[int]:
     return int(value)
 
 
-def check_solute_indices(solute_pdb: Path, model) -> None:
+def check_solute_indices(solute_pdb: Path, model):
     """Solute-only XTC atom i must be production atom i for every feature atom: the solute PDB's atom
     names/residues at those indices must be the phi/psi the model's features claim."""
     import mdtraj as md
     from gareus.auxiliary_cv.features import check_feature_atoms
     top = md.load_topology(str(solute_pdb))
+    if getattr(model, "schema_version", 1) == 2:
+        from gareus.auxiliary_cv.atom_mapping import topology_metadata
+        from gareus.auxiliary_cv.sidechain_core import atom_map
+        keys, _bonds = topology_metadata(top)
+        mapping = atom_map(model.atom_keys, keys)
+        return model.projection.remap(mapping)
     atoms = list(top.atoms)
     for f in model.feature_schema.features:
         quad = [int(a) for a in f.atom_indices]
@@ -73,17 +79,24 @@ def check_solute_indices(solute_pdb: Path, model) -> None:
         check_feature_atoms(model, top.to_openmm())
     except Exception as exc:
         raise ValueError(f"{solute_pdb}: solute atom indices do not match the model's feature atoms: {exc}") from exc
+    return model
+
+
+def _z_from_mapped_positions(xyz_nm, model, mapped_model):
+    if getattr(model, "schema_version", 1) == 2:
+        return mapped_model.values(xyz_nm)
+    from gareus.auxiliary_cv.evaluate import z_from_positions
+    return z_from_positions(xyz_nm, model)
 
 
 def frame_z(phase_dir: Path, model, adaptive_dir: Optional[Path] = None) -> pd.DataFrame:
     """z for every XTC frame of the phase, (replica, step, aux_z) with step on the samples' clock
     (``xtc_step_offset``); a later resume file wins."""
-    from gareus.auxiliary_cv.evaluate import z_from_positions
     phase_dir = Path(phase_dir)
     top_path = census._find_topology(phase_dir, Path(adaptive_dir) if adaptive_dir else phase_dir.parent)
     if top_path is None:
         raise FileNotFoundError(f"{phase_dir}: no solute_only.pdb")
-    check_solute_indices(top_path, model)
+    phase_model = check_solute_indices(top_path, model)
     import mdtraj as md
     n_solute = md.load_topology(str(top_path)).n_atoms
     files = sorted(census._trajectory_files(phase_dir), key=lambda t: (t[0], t[1] or 0, str(t[2])))
@@ -104,7 +117,7 @@ def frame_z(phase_dir: Path, model, adaptive_dir: Optional[Path] = None) -> pd.D
             continue
         if xyz.shape[1] != n_solute:
             raise ValueError(f"{path}: {xyz.shape[1]} atoms per frame, solute PDB {top_path} has {n_solute}")
-        z = np.ravel(z_from_positions(xyz[keep].astype(np.float64), model))
+        z = np.ravel(_z_from_mapped_positions(xyz[keep].astype(np.float64), model, phase_model))
         blocks.append(pd.DataFrame({"replica": int(replica), "step": steps[keep] + offset, "aux_z": z}))
     if not blocks:
         return pd.DataFrame({"replica": np.zeros(0, np.int64), "step": np.zeros(0, np.int64), "aux_z": np.zeros(0)})
@@ -116,17 +129,23 @@ def _final_pdb_z(phase_dir: Path, replica: int, window: int, model, top_path: Pa
     replica's live Context; a replica's earlier stop at the same window is overwritten by it). None when the
     file does not exist; raises when its leading atoms are not the solute's."""
     import mdtraj as md
-    from gareus.auxiliary_cv.evaluate import z_from_positions
     path = Path(phase_dir) / "final_pdbs" / f"replica_{int(replica):03d}_window_{int(window):03d}.pdb"
     if not path.exists():
         return None
     solute = md.load_topology(str(top_path))
     t = md.load(str(path))
+    if getattr(model, "schema_version", 1) == 2:
+        from gareus.auxiliary_cv.atom_mapping import topology_metadata
+        from gareus.auxiliary_cv.sidechain_core import atom_map
+        keys, _bonds = topology_metadata(t.topology)
+        mapping = atom_map(model.atom_keys, keys)
+        projection = model.projection.remap(mapping)
+        return float(np.ravel(_z_from_mapped_positions(t.xyz[0].astype(np.float64), model, projection))[0])
     n = solute.n_atoms
     if t.n_atoms < n or any((a.name, a.residue.name, a.residue.resSeq) != (b.name, b.residue.name, b.residue.resSeq)
                             for a, b in zip(list(t.topology.atoms)[:n], solute.atoms)):
         raise ValueError(f"{path}: final_pdbs file's first {n} atoms are not the solute of {top_path}")
-    return float(np.ravel(z_from_positions(t.xyz[0, :n].astype(np.float64), model))[0])
+    return float(np.ravel(_z_from_mapped_positions(t.xyz[0, :n].astype(np.float64), model, model))[0])
 
 
 def write_phase_backfill(phase_dir: Path, model, *, adaptive_dir: Optional[Path] = None) -> dict:
@@ -309,11 +328,16 @@ def check_backfill_against_recorded(phase_dir: Path, model, *, tol: float = 0.05
                                      workers, temperature_k=temperature_k)
         covered = all(p['status'] == 'ok' for p in per)
         err = max(p["max_energy_err_kt"] for p in per) if covered else None
-        ok = bool(covered and np.isfinite(err) and err <= float(tol_kt))
+        err_all = max(p["max_energy_err_kt_all"] for p in per)
+        if getattr(model, "schema_version", 1) == 2:
+            ok = bool(covered and np.isfinite(err_all) and err_all <= float(tol_kt))
+        else:
+            ok = bool(covered and np.isfinite(err) and err <= float(tol_kt))
         out.update(per_worker=per, max_energy_err_kt=err, tol_kt=float(tol_kt), temperature_k=float(temperature_k),
-                   max_energy_err_kt_all=max(p['max_energy_err_kt_all'] for p in per),
+                   max_energy_err_kt_all=err_all,
                    status='ok' if ok else ('insufficient_worker_coverage' if not covered else 'energy_mismatch'))
-        what = (f"implies a worker energy error of {err:.3g} kT (> {tol_kt} kT)" if covered
+        checked_err = err_all if getattr(model, "schema_version", 1) == 2 else err
+        what = (f"implies a worker energy error of {checked_err:.3g} kT (> {tol_kt} kT)" if covered
                 else 'has insufficient_worker_coverage for the reconstruction check')
     else:
         ok = dev <= tol

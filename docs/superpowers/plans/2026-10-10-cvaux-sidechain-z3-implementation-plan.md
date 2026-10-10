@@ -1,6 +1,6 @@
 # Side-chain-aware z3: implementation and verification plan
 
-Status: ready for implementation after task-level regression checks; no implementation or simulation validation claimed.
+Status: implementation wired through v2 union-MBAR fixture; focused CPU/Reference checks pass. Live chi campaign and hardware/sampling validation remain pending.
 Date: 2026-10-10. Target: PR #141, branch `feat/cvaux-stage-a`.
 Baseline inspected: `fd5be0fdc284384a4bd5b1f6600a50994bf466eb` (unchanged at plan preparation).
 Specification: [side-chain z3 extension](../specs/2026-10-10-cvaux-sidechain-z3-extension-spec.md).
@@ -27,7 +27,7 @@ Counterexample B: one worker with centre 0 and width sigma=sqrt(RT/k), recorded 
 - One admitted z3 model per campaign, the current worker reserve and lambda=0 workers. No additional umbrella grid, REST2, worker retirement or simultaneous model collection.
 - `--ap-aux-feature-space backbone|sidechain|mixed|auto`, default backbone. Backbone-only search retains its prior code path and random draws. Aux-off paths remain unchanged. The reconstruction empty-coverage repair is an intentional correction on affected aux paths, not an opt-out compatibility promise.
 - Preserve `--ap-aux-validation required|off`, the unvalidated stiffness cap, per-carrier burn-in, log-space exchange, reconstruction refusals and heuristic crosscheck wording. Mathematical/schema checks remain active in both validation modes.
-- New-family candidates use local fitting. Legacy backbone candidates stay global for compatibility; auto compares both and records which search regime generated each candidate.
+- New-family candidates use local fitting. Auto also uses the local fit/scoring path for enabled backbone, sidechain and mixed families; it does not combine local sidechain scores with the legacy global backbone score. Backbone-only mode retains its prior path and RNG draws.
 - No native reference, folded label or post-hoc residue selection enters discovery. A native readout is permitted only in a separately declared benchmark.
 - Add failing targeted regressions before changing the relevant implementation. Do not run the whole suite by default, turn failures into skips or weaken numerical tolerances to make tests pass.
 - Each task is a reviewable commit on the same PR branch. Check its current head before writing; preserve concurrent changes. Do not overwrite the earlier repair work.
@@ -184,3 +184,17 @@ Execute T00 -> T01 -> T02 -> T03 -> T04 -> T05 -> T06 -> T07 -> T08 -> T09 -> T1
 Do not proceed to production admission if force/energy parity, sample mapping or partition identity is unresolved. No chi features, no informative null, inadequate local support, or no useful placement are normal no-admission outcomes. An unsupported chemistry case should not disable valid backbone sampling.
 
 The plan deliberately does not promise a universal side-chain reaction coordinate. A linear periodic projection may still miss cooperative nonlinear barriers, and one admitted model may address only one local obstruction. Those are scientific limitations to measure, not reasons to relax equilibrium bookkeeping.
+
+## Execution record (2026-10-10)
+
+Cards 1–7 are implemented in the current worktree. Card 8 component integration covers synthetic local discovery, v2 force observation and energy/gradient checks, sample schema/storage, v2 XTC/final-PDB backfill, v2 union-MBAR pooling, and existing production-loop pull/burn-in/crash-resume fixtures. A dedicated active-chi NPT adapter test passes on Reference and CPU; it checks volume scaling and a changed torsion input without modifying exchange or barostat algorithms.
+
+Final combined focused command:
+
+```bash
+python -m pytest tests/test_aux_discovery_local_pipeline.py tests/test_aux_discovery_placement.py tests/test_aux_feature_space.py tests/test_aux_admission_hook.py tests/test_aux_discovery_validation.py tests/test_aux_backfill_coverage.py tests/test_aux_backfill_v2.py tests/test_aux_backfill.py tests/test_aux_reconstruction_pooling.py tests/test_aux_sidechain_core.py tests/test_aux_sidechain_dictionary.py tests/test_aux_sidechain_model.py tests/test_aux_sidechain_runtime.py tests/test_aux_sidechain_npt.py tests/test_aux_sidechain_union.py tests/test_aux_sample_schema.py tests/test_aux_store_writers.py tests/test_aux_cv_force.py tests/test_aux_cv_composition.py tests/test_aux_cv_observation.py tests/test_aux_union_inputs.py tests/test_aux_admission_e2e.py -q
+```
+
+Result: **351 passed, 6 warnings in 163.72 s**. Runtime: Python 3.14.5, OpenMM 8.5.1, Reference and CPU platforms. `py_compile` and `git diff --check` passed. Five warnings are existing union fixtures falling back to 300 K; one is Biopython's source-tree warning.
+
+Not established: a single live v2 chi campaign through all production stages, CUDA/OpenCL force parity, long-timestep stability, controlled NPT distribution, or equal-GPU-hour auto/backbone benchmark. NVIDIA driver is unavailable in this environment. CPU/Reference correctness does not prove sampling validity or folding improvement.

@@ -4,16 +4,17 @@ Target: PR #141, `feat/cvaux-stage-a`. Work started from `4bcf845`.
 Purpose: finish integration in small tasks using the supplied, tested numerical kernels.
 Read this file first. The [detailed plan](2026-10-10-cvaux-sidechain-z3-implementation-plan.md) and [specification](../specs/2026-10-10-cvaux-sidechain-z3-extension-spec.md) explain the science. Do not implement everything in one prompt.
 
-## What is already done
+## Implementation status
 
 | File | Implemented | Still needs integration |
 |---|---|---|
-| `gareus/auxiliary_cv/sidechain_core.py` | Immutable periodic/orbit primitives, canonical terms, angle/position evaluator, analytic Cartesian gradient, explicit atom remapping, OpenMM force compiler | Production model schema, chemistry dictionary, observer/state/checkpoint adapters |
-| `gareus/adaptive/aux_discovery/local_search_core.py` | Regional L1 fitting, separate fit/tune/holdout, stable likelihoods, comparable scores, frozen exported projection, shared-shift best-of-search null across a partition matrix | Real frame/partition adapters, CV redundancy guards, production reporting and placement |
-| `gareus/adaptive/aux_backfill.py` | Empty worker coverage no longer reports zero error; full-frame discrepancy is reported; invalid inputs refused | v2 per-phase atom mapping and the stricter v2 all-frame verdict |
-| `gareus/adaptive/aux_admission_io.py` | Warning reports the unavailable-evidence status instead of None | v2 admission integration |
+| `gareus/auxiliary_cv/{sidechain_core,sidechain_dictionary,atom_mapping,sidechain_model}.py` | Immutable periodic/orbit primitives, parameter-checked chemistry dictionary, stable atom identities, validated production v2 model | CUDA/OpenCL and live campaign evidence pending |
+| `gareus/auxiliary_cv/{force,runtime,sample_schema,checkpoint}.py` | v2 force observer, raw-angle schema, topology/model identity and resume adapters | Live chi campaign pending |
+| `gareus/adaptive/aux_discovery/{descriptors,frames,pipeline,placement}.py` | Local fit/tune/holdout search, joint partition/family null, frozen projection, candidate-consistent placement and parent support | Real campaign sampling and benchmarking pending |
+| `gareus/adaptive/aux_backfill.py`, `aux_discovery/validation.py` | v2 atom remapping for XTC/final PDB, all-frame reconstruction verdict, feature/family/harmonic validation coverage | Physical validation evidence pending |
+| `gareus/adaptive/aux_admission_io.py` | Opt-in frame construction, v2 model-aware validation, candidate identity in admission, existing reserve/cap policy | Full production chi campaign pending |
 
-The kernels are not imported by production automatically. Side-chain discovery is NOT enabled by this commit. The backfill coverage correction is an intentional live bug fix for existing aux campaigns.
+Side-chain discovery remains opt-in; backbone default path stays pinned. Backfill coverage correction remains active for existing auxiliary campaigns.
 
 ## Copy this into the local model's first prompt
 
@@ -147,6 +148,8 @@ One model, existing caps and reserve. No admissible placements means no_worker. 
 
 Check: winner from k=2 while k=4 also passes; identity survives admission; wrong parent rejected; no_worker cleanly returned; nonzero stiffness and units correct. Existing ordinary-state behaviour stays pinned.
 
+Status: implemented. Production frame construction now uses the parameterized campaign System and topology for chi descriptors. Projection emission checks fitted/emitted z; the winner's partition, region, pair and family persist into admission. Focused tests: 61 passed.
+
 ## Card 7 — Finish v2 backfill and validation coverage
 
 Use `Projection.remap` in `aux_backfill` XTC and final-PDB paths for v2. Keep step evidence, sample keys, hashes and no-fallback rules. The empty-coverage fix is already supplied: do not undo None/status handling.
@@ -155,11 +158,15 @@ For v2, require nonempty relevant coverage and apply the existing energy toleran
 
 Check: reordered atom maps, missing orbit atom, empty coverage, error only outside two widths, checksum mismatch and both union selection paths. Run existing backfill/reconstruction suites as well as the new coverage tests.
 
+Status: implemented. Focused backfill, reconstruction, validation and union regressions: 103 passed.
+
 ## Card 8 — End-to-end and handover
 
 Exercise actual discovery -> admission -> force observation -> sample storage -> backfill -> union MBAR with a small deterministic fixture. Separately test force parity, cross-state energies, pull/carrier burn-in, crash/resume, and NPT volume moves under an active chi bias. Preserve the current exchange and barostat algorithms; integration tests verify their inputs.
 
 Record CPU/GPU/timestep checks actually executed. No GPU access means GPU validation remains pending, not passed. Compare auto/backbone with equal GPU-hours and worker budgets before claiming better folding efficiency. Update status in this file and the detailed plan only after checks pass.
+
+Status: component and campaign integration checks pass. Added v2 sample-storage-to-union-MBAR fixture and active-chi NPT adapter check; existing production-loop fixture covers pull/carrier burn-in and crash/resume. Combined focused suite: 351 passed, 6 warnings. Environment: Python 3.14.5, OpenMM 8.5.1, Reference and CPU platforms. NVIDIA driver unavailable. GPU parity, long-timestep stability, controlled NPT distribution, a real chi campaign and equal-budget benchmark remain pending; no sampling-improvement claim is made.
 
 ## Test commands and delivered evidence
 
@@ -169,6 +176,6 @@ Core and live backfill regression tests:
 python -m pytest tests/test_aux_sidechain_core.py tests/test_aux_local_search_core.py tests/test_aux_backfill_coverage.py tests/test_aux_backfill.py tests/test_aux_reconstruction_pooling.py -q
 ```
 
-The preparation run uses Python 3.12, OpenMM 8.6.1 on Reference, NumPy/scikit-learn from the task environment and isolated pytest/Arrow/DuckDB dependencies. Result: **80 passed, 0 skipped, 5 warnings**. OpenMM force comparison, symmetry/gradient tests, regional counterexample and existing backfill/union regression tests were executed. The five warnings are synthetic union fixtures using their existing default-temperature fallback.
+Final combined run used Python 3.14.5 and OpenMM 8.5.1 on Reference and CPU. Command covered local discovery/placement/admission, v2 validation/backfill, force/runtime/sample storage, v2 union MBAR, reconstruction, and production-loop crash/resume/burn-in fixtures. Result: **351 passed, 6 warnings in 163.72 s**. Five warnings are existing synthetic union fixtures using their default-temperature fallback; one is Biopython's source-tree warning. `py_compile` and `git diff --check` passed.
 
-Not executed here: CUDA/OpenCL, production NPT distribution validation, long-timestep stability, real chi campaign or performance benchmark. The new kernels remain unwired until the cards are completed.
+Not executed here: CUDA/OpenCL parity, production NPT distribution validation, long-timestep stability, a real chi campaign or performance benchmark. CPU/Reference tests establish software-path consistency only; they do not establish sampling validity.
