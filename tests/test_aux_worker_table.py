@@ -152,3 +152,21 @@ def test_return_label_uses_declared_conditioning_columns_cv1_only():
 
     out = return_label_change_fraction(frames, P(), 2)
     assert seen["shape"] == (n, 1) and out["n_episodes"] == 1 and out["fraction"] == 1.0
+
+
+def test_report_cautions_when_return_label_unavailable():
+    from gareus_report import _check_aux_workers, PASS, CAUTION
+    good = {"state_id": 2, "best_partner": 0, "best_partner_overlap": 0.4, "overlap_floor_ok": True}
+    assert _check_aux_workers({"aux_workers": {"workers": [good]}})["status"] == PASS
+    w = dict(good, return_label_status="unavailable", return_label_reason="frames not supplied")
+    chk = _check_aux_workers({"aux_workers": {"workers": [w]}})
+    assert chk["status"] == CAUTION
+    assert "return-label diagnostic unavailable" in chk["detail"] and "frames not supplied" in chk["detail"]
+
+
+def test_legacy_partition_gets_two_conditioning_columns():
+    from gareus.adaptive.aux_worker_table import _conditioning_matrix
+    frames = SimpleNamespace(cv1=np.arange(4.0), cv2=np.arange(4.0) * 2)
+    legacy = SimpleNamespace()   # no conditioning record
+    m = _conditioning_matrix(frames, legacy)
+    assert m.shape == (4, 2) and np.allclose(m[:, 1], frames.cv2)

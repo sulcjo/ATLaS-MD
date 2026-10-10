@@ -252,7 +252,11 @@ def _check_aux_workers(s: dict) -> Optional[dict]:
     unmeasured = [r for r in rows if _num(r.get("best_partner_overlap")) is None]
     if unmeasured:
         detail += f"; {len(unmeasured)} worker(s) with no measurable partner overlap"
-    return {"name": name, "status": CAUTION if (bad or unmeasured) else PASS, "detail": detail}
+    no_rl = [r for r in rows if r.get("return_label_status") == "unavailable"]
+    if no_rl:
+        reasons = sorted({str(r.get("return_label_reason") or "no reason recorded") for r in no_rl})
+        detail += f"; return-label diagnostic unavailable for {len(no_rl)} worker(s): " + " | ".join(reasons)
+    return {"name": name, "status": CAUTION if (bad or unmeasured or no_rl) else PASS, "detail": detail}
 
 
 def _headline(s: dict) -> list[dict]:
