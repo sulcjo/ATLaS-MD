@@ -29,15 +29,22 @@ def run_discovery(ft, *, train, holdout, settings: AuxDiscoverySettings, full_to
     rep = {"n_frames": int(ft.n), "n_train": int(np.sum(train)), "n_holdout": int(np.sum(holdout))}
     lineage = ft.lineage
     X = np.hstack([ft.hc, ft.hb]); fam = ["hc"] * ft.hc.shape[1] + ["hb"] * ft.hb.shape[1]
-    cv = np.c_[ft.cv1, ft.cv2]
+    # declared conditioning coordinates: CV1 always, CV2 only when the campaign has one (a CV1-only campaign is the
+    # supported 1-D case; a NaN inside a declared coordinate is invalid input, never read as "absent")
+    cv_names = ["cv1"] + (["cv2"] if getattr(ft, "cv2", None) is not None else [])
+    cv = np.column_stack([np.asarray(getattr(ft, nm)) for nm in cv_names])
     part = fit_partition(X, fam, cv, train, holdout, lineage, ft.step, settings, seed=settings.partition_seed,
-                         feature_names=list(ft.definition.hc_labels) + list(ft.definition.hb_labels), multi_k=True)
+                         feature_names=list(ft.definition.hc_labels) + list(ft.definition.hb_labels), multi_k=True,
+                         cv_names=cv_names)
     block = {"status": part.status, "k": part.choice.k, "table": part.choice.table,
              "hidden_fraction": part.hidden_fraction, "co_occurrence": part.co_occurrence,
              "lineage_info": part.lineage_info,
              "passing_k": [{"k": r["k"], "hidden_fraction": r["hidden_fraction"],
                             "co_occurrence": r["co_occurrence"], "lineage_info": r["lineage_info"],
                             "triggered": r["triggered"]} for r in (part.per_k or [])]}
+    cond = getattr(part, "conditioning", None)
+    if cond is not None:
+        block["conditioning"] = cond
     block["per_k_trigger"] = {str(r["k"]): r["triggered"] for r in (part.per_k or [])}
     rep["partition"] = block
     rep["discovery"] = block  # alias for readers of the pre-U13 report
@@ -45,13 +52,17 @@ def run_discovery(ft, *, train, holdout, settings: AuxDiscoverySettings, full_to
         return DiscoveryResult(part.status, rep)
     if part.status == "keep":
         return DiscoveryResult("keep", rep, eval_partition=part.frozen)
+    sel = list((cond or {}).get("selected") or cv_names)   # z3 guards use the selected dimensions only
+    nbins = getattr(part, "n_cond_bins", None) or None
     sources = [(r["k"], r["labels"], _cooccurring_pairs(r["labels"], part.bins, holdout, settings))
                for r in part.per_k if r["triggered"]]
-    best, allc = search_z3_sources(ft, sources, part.bins, train, holdout, settings)
+    best, allc = search_z3_sources(ft, sources, part.bins, train, holdout, settings, nbins=nbins,
+                                  cond_dims=sel)
     rep["z3_search"] = {"candidates": [c.summary() for c in allc], "chosen": best.summary() if best else None,
                         "sources_k": [k for k, _, _ in sources]}
     if best is not None:
-        gate = z3_null_gate(ft, sources, best, part.bins, train, holdout, settings)
+        gate = z3_null_gate(ft, sources, best, part.bins, train, holdout, settings, nbins=nbins,
+                             cond_dims=sel)
         rep["z3_search"]["null_gate"] = gate
         if not gate["passed"]:
             best = None

@@ -127,3 +127,121 @@ def test_frozen_roundtrip_and_chunked_predict(tmp_path):
     f = tmp_path / "p.pkl"; res.frozen.to_file(f)
     g = P.FrozenPartition.from_file(f)
     np.testing.assert_array_equal(g.predict(X, cv), res.choice.labels)
+
+
+# ---- F05: conditioning coordinate contract -------------------------------------------------------------------
+import pytest
+
+
+def _fit(cv, names=None, **kw):
+    X, fam, _cv, tr, ho, lin, step, _ = _planted()
+    return P.fit_partition(X, fam, cv, tr, ho, lin, step, AuxDiscoverySettings(k_max=4), seed=0, cv_names=names, **kw), \
+        (X, fam, tr, ho, lin, step)
+
+
+def test_two_d_bins_equal_the_former_formula():
+    X, fam, cv, tr, ho, lin, step, _ = _planted()
+    res, _ = _fit(cv)
+    S = (cv - cv[tr].mean(0)) / cv[tr].std(0)
+    edges = [np.quantile(S[tr, a], np.linspace(0, 1, 7)[1:-1]) for a in range(2)]
+    legacy = np.digitize(S[:, 0], edges[0]) * 6 + np.digitize(S[:, 1], edges[1])
+    np.testing.assert_array_equal(res.bins, legacy)
+    assert res.n_cond_bins == 36 and res.conditioning["selected"] == ["cv1", "cv2"]
+
+
+def test_one_dimensional_campaign_uses_n_bins_not_squared():
+    X, fam, cv, *_ = _planted()
+    res, _ = _fit(cv[:, :1], names=["cv1"])
+    assert res.status in ("ok", "keep") and res.conditioning["selected"] == ["cv1"]
+    assert res.n_cond_bins == 6 and res.bins.max() < 6 and res.frozen.conditioning.n_bins == 6
+
+
+def test_constant_cv2_is_dropped_and_equals_the_one_d_fit():
+    X, fam, cv, *_ = _planted()
+    both = np.c_[cv[:, 0], np.full(len(cv), 0.3, np.float32)]
+    res, _ = _fit(both)
+    one, _ = _fit(cv[:, :1], names=["cv1"])
+    assert res.conditioning["dropped"] == {"cv2": "constant"} and res.conditioning["selected"] == ["cv1"]
+    np.testing.assert_array_equal(res.bins, one.bins)
+    np.testing.assert_array_equal(res.frozen.predict(X, both), one.frozen.predict(X, cv[:, :1]))
+
+
+def test_constant_cv1_with_useful_cv2():
+    X, fam, cv, *_ = _planted()
+    both = np.c_[np.full(len(cv), 5.0, np.float32), cv[:, 1]]
+    res, _ = _fit(both)
+    assert res.conditioning["dropped"] == {"cv1": "constant"} and res.conditioning["selected"] == ["cv2"]
+    assert res.status in ("ok", "keep") and res.n_cond_bins == 6
+
+
+def test_tiny_finite_variance_is_usable_and_the_threshold_is_scale_aware():
+    X, fam, cv, tr, *_ = _planted()
+    tiny = np.c_[cv[:, 0], (1e-6 * cv[:, 1]).astype(np.float32)]
+    assert _fit(tiny)[0].conditioning["selected"] == ["cv1", "cv2"]
+    # a huge mean with sd below 1e-12 * |mean| is constant; with a real spread it is not
+    spec, bad = P.fit_conditioning(np.c_[cv[:, 0], np.full(len(cv), 1e9, np.float32)], tr, 6)
+    assert bad is None and spec.dropped == {"cv2": "constant"}
+
+
+def test_one_unexpected_nan_is_invalid_input_not_a_crash():
+    X, fam, cv, *_ = _planted()
+    bad = cv.copy(); bad[17, 1] = np.nan
+    res, _ = _fit(bad)
+    assert res.status == "invalid_conditioning_input" and res.frozen is None
+    assert res.conditioning["nonfinite"] == ["cv2"]
+    inf = cv.copy(); inf[3, 0] = np.inf
+    assert _fit(inf)[0].status == "invalid_conditioning_input"
+
+
+def test_all_conditioning_constant_is_insufficient_conditioning_evidence():
+    X, fam, cv, *_ = _planted()
+    res, _ = _fit(np.ones_like(cv))
+    assert res.status == "insufficient_conditioning_evidence" and res.frozen is None
+    assert res.conditioning["dropped"] == {"cv1": "constant", "cv2": "constant"}
+
+
+def test_too_few_training_rows_stays_too_few_rows():
+    X, fam, cv, tr, ho, lin, step, _ = _planted()
+    few = np.zeros_like(tr); few[np.nonzero(tr)[0][:3]] = True
+    res = P.fit_partition(X, fam, cv, few, ho, lin, step, AuxDiscoverySettings(k_max=3), seed=0)
+    assert res.status == "insufficient_evidence" and res.choice.reason == "too_few_rows"
+
+
+def test_tied_quantiles_create_no_phantom_bins():
+    X, fam, cv, tr, *_ = _planted()
+    tied = np.c_[np.where(np.arange(len(cv)) % 10 == 0, 1.0, 0.0).astype(np.float32), cv[:, 1]]
+    spec, bad = P.fit_conditioning(tied, tr, 6)
+    assert bad is None and len(spec.edges[0]) == 1 and spec.n_bins == 2 * 6
+    bins = P.apply_bins(spec.transform(tied), spec.edges)
+    assert len(np.unique(bins)) <= spec.n_bins and bins.max() < spec.n_bins
+    assert P.s_bins(tied[:, :1], tr, 6).max() <= 1          # five identical edges collapsed to one, not 6 bins
+
+
+def test_holdout_never_refits_scales_and_schema_mismatch_raises():
+    X, fam, cv, tr, ho, lin, step, _ = _planted()
+    res, _ = _fit(cv)
+    spec = res.frozen.conditioning
+    np.testing.assert_allclose(spec.mean, cv[tr].mean(0), rtol=1e-6)
+    np.testing.assert_allclose(spec.sd, cv[tr].std(0), rtol=1e-6)
+    before = (spec.mean.copy(), spec.sd.copy(), [e.copy() for e in spec.edges])
+    shifted = cv.copy(); shifted[ho] = shifted[ho] * 50 + 100          # wildly different holdout distribution
+    res.frozen.predict(X, shifted)
+    assert np.array_equal(spec.mean, before[0]) and np.array_equal(spec.sd, before[1])
+    assert all(np.array_equal(a, b) for a, b in zip(spec.edges, before[2]))
+    S = spec.transform(shifted)
+    np.testing.assert_allclose(S[tr], (shifted[tr] - spec.mean) / spec.sd, rtol=1e-6)
+    with pytest.raises(ValueError, match="schema mismatch"):
+        res.frozen.predict(X, cv[:, :1])
+    nan = cv.copy(); nan[0, 0] = np.nan
+    with pytest.raises(ValueError, match="non-finite"):
+        res.frozen.predict(X, nan)
+
+
+def test_legacy_frozen_partition_without_the_field_still_predicts_two_d(tmp_path):
+    X, fam, cv, *_ = _planted()
+    res, _ = _fit(cv)
+    f = res.frozen
+    del f.__dict__["conditioning"]                       # a pickle written before the contract
+    np.testing.assert_array_equal(f.predict(X, cv), res.choice.labels)
+    path = tmp_path / "p.pkl"; f.to_file(path)
+    np.testing.assert_array_equal(P.FrozenPartition.from_file(path).predict(X, cv), res.choice.labels)

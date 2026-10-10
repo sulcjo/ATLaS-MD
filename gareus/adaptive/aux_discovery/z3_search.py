@@ -3,7 +3,7 @@ torsion_only_candidate.py + prereg_v2 candidate gates), and emission as atlas-au
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
 from sklearn.linear_model import LogisticRegression
@@ -97,11 +97,15 @@ def scramble_labels(labels, lineage, step, rng) -> np.ndarray:
 
 
 def search_z3(ft, labels, bins, train, holdout, s: AuxDiscoverySettings, *, nbins: Optional[int] = None,
-              all_pairs: bool = False, pairs=None, k: Optional[int] = None, light: bool = False):
+              all_pairs: bool = False, pairs=None, k: Optional[int] = None, light: bool = False,
+              cond_dims: Optional[Sequence[str]] = None):
     """Candidates for one label vector. ``passed`` = finite + |corr(z, CV1/CV2)| guard only (U12); info gain,
     stability and basin gain are computed and reported but gate nothing. ``light`` skips stability and basin
-    gain (null searches need only the info gain)."""
-    nbins = int(nbins or s.s_bins ** 2)
+    gain (null searches need only the info gain). ``cond_dims`` = the conditioning coordinates the partition
+    actually used (default cv1, cv2): the |corr| guard applies to those only, so a dropped (constant) or absent
+    coordinate can never fail a candidate."""
+    nbins = int(nbins or int(np.max(bins)) + 1)
+    active = tuple(cond_dims) if cond_dims is not None else ("cv1", "cv2")
     X = np.asarray(ft.tors, float)
     mu, sd = X[train].mean(0), X[train].std(0)
     sd = np.where(sd > 0, sd, 1.0)
@@ -129,15 +133,19 @@ def search_z3(ft, labels, bins, train, holdout, s: AuxDiscoverySettings, *, nbin
             stab = abs(float(np.corrcoef(Xs[holdout] @ we, Xs[holdout] @ wo)[0, 1]))
             bg = float(sum(info_gain(z_raw, ft.basin[:, r].astype(int), bins, train, holdout, 5, nbins)
                            for r in range(ft.basin.shape[1])))
-        c1 = _cv_corr(z_raw, ft.cv1, holdout)
-        c2 = _cv_corr(z_raw, ft.cv2, holdout)
+        cvs = {nm: getattr(ft, nm, None) for nm in ("cv1", "cv2")}
+        c1, c2 = (_cv_corr(z_raw, cvs[nm], holdout) if nm in active and cvs[nm] is not None else None
+                  for nm in ("cv1", "cv2"))
         ig = info_gain(z_raw, labels, bins, train, holdout, K, nbins)
         fail, notes = [], []
         for name, v in (("info_gain", ig),) + ((() if light else (("stability", stab), ("basin_gain", bg)))):
             if not np.isfinite(v):
                 fail.append(f"nonfinite_{name}")
         if c1 is None:
-            fail.append("nonfinite_corr_cv1")
+            if "cv1" in active:
+                fail.append("nonfinite_corr_cv1")
+            else:
+                notes.append("cv1_not_applicable")
         if c2 is None:
             notes.append("cv2_not_applicable")
         for name, c in (("cv1", c1), ("cv2", c2)):
@@ -151,18 +159,19 @@ def search_z3(ft, labels, bins, train, holdout, s: AuxDiscoverySettings, *, nbin
 
 
 def search_z3_sources(ft, sources, bins, train, holdout, s: AuxDiscoverySettings, *, nbins: Optional[int] = None,
-                      light: bool = False, label_override=None):
+                      light: bool = False, label_override=None, cond_dims: Optional[Sequence[str]] = None):
     """``sources`` = [(k, labels, pairs)] over every passing+triggered discovery k. ``label_override`` (null
     searches) maps source index -> scrambled labels with the pair list unchanged."""
     allc: List[Z3Candidate] = []
     for i, (k, labels, pairs) in enumerate(sources):
         lab = labels if label_override is None else label_override[i]
-        allc.extend(search_z3(ft, lab, bins, train, holdout, s, nbins=nbins, pairs=pairs, k=k, light=light)[1])
+        allc.extend(search_z3(ft, lab, bins, train, holdout, s, nbins=nbins, pairs=pairs, k=k, light=light,
+                              cond_dims=cond_dims)[1])
     return pick_best(allc), allc
 
 
 def z3_null_gate(ft, sources, real_best, bins, train, holdout, s: AuxDiscoverySettings, *,
-                 nbins: Optional[int] = None) -> dict:
+                 nbins: Optional[int] = None, cond_dims: Optional[Sequence[str]] = None) -> dict:
     """U12 gate: the best real candidate's held-out info gain must exceed the best-of-candidates gain of every one
     of ``s.n_null_z3`` searches re-run on labels scrambled by an independent within-lineage circular shift."""
     n_null = int(s.n_null_z3)
@@ -176,7 +185,8 @@ def z3_null_gate(ft, sources, real_best, bins, train, holdout, s: AuxDiscoverySe
         if null_best and max(null_best) >= real_best.info_gain:
             break   # already failed: one null at least as good as the real best
         scr = [scramble_labels(lab, ft.lineage, ft.step, rng) for _, lab, _ in sources]
-        b, _ = search_z3_sources(ft, sources, bins, train, holdout, s, nbins=nbins, light=True, label_override=scr)
+        b, _ = search_z3_sources(ft, sources, bins, train, holdout, s, nbins=nbins, light=True, label_override=scr,
+                                cond_dims=cond_dims)
         # a null search that finds no candidate (L1 shrinks every coefficient to zero) or a negative best has
         # gain 0: "no discovery" is the floor the real candidate must clear
         null_best.append(max(0.0, float(b.info_gain)) if b is not None and np.isfinite(b.info_gain) else 0.0)

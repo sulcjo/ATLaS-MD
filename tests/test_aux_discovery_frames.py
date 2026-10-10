@@ -139,3 +139,14 @@ def test_wrong_step_clock_fails_loudly_not_as_an_empty_phase(tmp_path: Path):
     with pytest.raises(RuntimeError, match="offset 10200"):
         build_frame_table(tmp_path, epochs=[0], registry_lambda={100: 0.0}, stride_steps=3000,
                           max_frames=10 ** 6, seed=0)
+
+
+def test_cv1_only_schema_loads_without_cv2(tmp_path: Path):
+    ph = make_phase(tmp_path, "epoch_000", {"replica_0.xtc": (0, 0, [300, 3300])}, {0: 0.0}, lambda s: s / 1e4)
+    f = ph / "samples" / "seg_000" / "data.parquet"
+    pd.read_parquet(f).drop(columns=["cv2"]).to_parquet(f)
+    assert "cv2" not in load_phase_samples(ph).columns
+    ft = build_frame_table(tmp_path, epochs=[0], registry_lambda={100: 0.0}, stride_steps=3000,
+                           max_frames=100, seed=0)
+    assert ft.cv2 is None and ft.n == 2 and np.allclose(ft.cv1, ft.step / 1e4)
+    assert ft.take(np.array([0])).cv2 is None

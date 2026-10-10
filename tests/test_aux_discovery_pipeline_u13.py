@@ -76,3 +76,52 @@ def test_planted_torsion_predicting_contact_groups_passes(monkeypatch):
     assert res.status == "ok", res.report.get("partition")
     assert res.report["z3_search"]["null_gate"]["passed"]
     assert res.eval_partition is not None
+
+
+# ---- F05: absent / constant CV2 through the real discovery call ---------------------------------------------
+def test_cv1_only_campaign_runs_the_real_discovery_one_dimensionally():
+    ft = _ft(n=3000, seed=1, tors_linked=False)
+    ft.cv2 = None                                   # what frames.build_frame_table gives a CV1-only campaign
+    tr, ho = _split(ft.n)
+    res = P.run_discovery(ft, train=tr, holdout=ho, settings=AuxDiscoverySettings(), full_topology=None,
+                          k3_max=3, epoch=1)
+    cond = res.report["partition"]["conditioning"]
+    assert cond["selected"] == ["cv1"] and cond["declared"] == ["cv1"] and cond["n_bins"] == 6
+    assert res.status in ("ok", "keep", "broaden", "insufficient_evidence", "no_worker")
+
+
+def test_constant_cv2_matches_the_cv1_only_report_and_never_fails_the_correlation_guard():
+    a, b = _ft(n=3000, seed=1, tors_linked=False), _ft(n=3000, seed=1, tors_linked=False)
+    a.cv2 = None
+    b.cv2 = np.zeros(b.n, np.float32)
+    tr, ho = _split(a.n)
+    kw = dict(train=tr, holdout=ho, settings=AuxDiscoverySettings(), full_topology=None, k3_max=3, epoch=1)
+    ra, rb = P.run_discovery(a, **kw), P.run_discovery(b, **kw)
+    assert rb.report["partition"]["conditioning"]["dropped"] == {"cv2": "constant"}
+    assert ra.status == rb.status
+    assert ra.report["partition"]["k"] == rb.report["partition"]["k"]
+    for c in rb.report.get("z3_search", {}).get("candidates", []):
+        assert "nonfinite_corr_cv2" not in c["fail"] and "nonfinite_corr_cv1" not in c["fail"]
+
+
+def test_constant_cv1_does_not_fail_candidates_via_the_dropped_coordinate():
+    ft = _ft(n=3000, seed=1, tors_linked=False)
+    ft.cv1 = np.full(ft.n, 2.0, np.float32)
+    tr, ho = _split(ft.n)
+    res = P.run_discovery(ft, train=tr, holdout=ho, settings=AuxDiscoverySettings(), full_topology=None,
+                          k3_max=3, epoch=1)
+    assert res.report["partition"]["conditioning"]["selected"] == ["cv2"]
+    for c in res.report.get("z3_search", {}).get("candidates", []):
+        assert "nonfinite_corr_cv1" not in c["fail"]
+
+
+def test_nan_and_all_constant_conditioning_report_specific_statuses():
+    tr, ho = _split(3000)
+    kw = dict(train=tr, holdout=ho, settings=AuxDiscoverySettings(), full_topology=None, k3_max=3, epoch=1)
+    ft = _ft(n=3000, seed=1, tors_linked=False); ft.cv2[5] = np.nan
+    r = P.run_discovery(ft, **kw)
+    assert r.status == "invalid_conditioning_input" and r.report["partition"]["conditioning"]["nonfinite"] == ["cv2"]
+    ft = _ft(n=3000, seed=1, tors_linked=False); ft.cv1 = np.zeros(ft.n, np.float32); ft.cv2 = np.zeros(ft.n, np.float32)
+    r = P.run_discovery(ft, **kw)
+    assert r.status == "insufficient_conditioning_evidence"
+    assert r.report["partition"]["conditioning"]["dropped"] == {"cv1": "constant", "cv2": "constant"}

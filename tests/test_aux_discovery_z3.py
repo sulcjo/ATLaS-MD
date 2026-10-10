@@ -263,3 +263,18 @@ def test_failing_null_gate_gives_broaden(monkeypatch):
                           k3_max=3, epoch=1)
     assert res.status == "broaden"
     assert "passing_k" in res.report["partition"] and "null_gate" in res.report["z3_search"]
+
+
+def test_correlation_guard_uses_only_the_selected_conditioning_dimensions():
+    ft, lab = _planted()
+    ft.cv1 = np.full(ft.n, 3.0, np.float32)                      # constant: a dropped coordinate
+    tr = np.arange(ft.n) < 4500; ho = ~tr; bins = np.zeros(ft.n, int)
+    _, dflt = Z.search_z3(ft, lab, bins, tr, ho, AuxDiscoverySettings(), nbins=1, all_pairs=True)
+    assert dflt and all("nonfinite_corr_cv1" in c.fail for c in dflt)          # undeclared drop still fails
+    best, allc = Z.search_z3(ft, lab, bins, tr, ho, AuxDiscoverySettings(), nbins=1, all_pairs=True,
+                             cond_dims=["cv2"])
+    assert best is not None and best.passed and "cv1_not_applicable" in best.notes
+    ft.cv2 = None                                                # CV1-only campaign, cv1 the only dimension
+    ft.cv1 = np.random.default_rng(1).normal(size=ft.n).astype(np.float32)
+    best, _ = Z.search_z3(ft, lab, bins, tr, ho, AuxDiscoverySettings(), nbins=1, all_pairs=True, cond_dims=["cv1"])
+    assert best is not None and best.passed and "cv2_not_applicable" in best.notes

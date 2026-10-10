@@ -46,7 +46,7 @@ class FrameTable:
     state_id: np.ndarray
     lam: np.ndarray
     cv1: np.ndarray
-    cv2: np.ndarray
+    cv2: Optional[np.ndarray]   # None = CV1-only campaign (no cv2 column in the samples)
     tors: np.ndarray
     tors_theta_iupac: np.ndarray
     hc: np.ndarray
@@ -64,16 +64,18 @@ class FrameTable:
         return np.char.add(np.char.add(self.phase.astype(str), ":"), self.replica.astype(str))
 
     def take(self, idx: np.ndarray) -> "FrameTable":
-        arrays = {k: getattr(self, k)[idx] for k in _ARRAY_FIELDS}
+        arrays = {k: (None if getattr(self, k) is None else getattr(self, k)[idx]) for k in _ARRAY_FIELDS}
         return FrameTable(**arrays, definition=self.definition, sources=self.sources)
 
 
 def load_phase_samples(phase_dir: Path) -> pd.DataFrame:
     """replica, step, window_id, cv1, cv2, gamd_lambda; one row per (replica, step), last segment wins."""
     import duckdb
-    q = (f"select replica, step, window_id, cv1, cv2, gamd_lambda, filename from "
-         f"read_parquet('{Path(phase_dir)}/samples/*/*.parquet', filename=true, union_by_name=true)")
-    df = duckdb.connect().execute(q).df()
+    src = f"read_parquet('{Path(phase_dir)}/samples/*/*.parquet', filename=true, union_by_name=true)"
+    con = duckdb.connect()
+    has_cv2 = "cv2" in set(con.execute(f"select * from {src} limit 0").df().columns)   # CV1-only: no column
+    q = f"select replica, step, window_id, cv1, {'cv2, ' if has_cv2 else ''}gamd_lambda, filename from {src}"
+    df = con.execute(q).df()
     df["seg"] = [int(m.group(1)) if (m := re.search(r"seg_(\d+)", f)) else 0 for f in df["filename"]]
     df = df.sort_values(["replica", "step", "seg"], kind="stable").drop_duplicates(["replica", "step"], keep="last")
     return df.drop(columns=["filename", "seg"]).reset_index(drop=True)
@@ -213,6 +215,11 @@ def build_frame_table(adaptive_dir: Path, *, epochs: Iterable[int], registry_lam
             results.append(_phase_frames((l, p, root, definition, registry_lambda, stride_steps)))
     cols = {k: [] for k in _ARRAY_FIELDS}
     sources = []
+    cv2_flags = {("cv2" in sub.columns) for _l, (_d, blocks, _u) in zip(todo, results) for sub, _ in blocks}
+    if len(cv2_flags) > 1:
+        raise ValueError("some phases have a cv2 sample column and some do not: the campaign's conditioning "
+                         "coordinates are not declared consistently")
+    has_cv2 = cv2_flags == {True}
     for (label, phase_dir), (_def, blocks, n_unmapped) in zip(todo, results):
         n_phase = 0
         for sub, desc in blocks:
@@ -225,13 +232,14 @@ def build_frame_table(adaptive_dir: Path, *, epochs: Iterable[int], registry_lam
             cols["state_id"].append(sub["state_id"].to_numpy(np.int64))
             cols["lam"].append(np.zeros(n))
             cols["cv1"].append(sub["cv1"].to_numpy(np.float32))
-            cols["cv2"].append(sub["cv2"].to_numpy(np.float32))
+            if has_cv2:
+                cols["cv2"].append(sub["cv2"].to_numpy(np.float32))
             for k in _DESC_FIELDS:
                 cols[k].append(desc[k])
         sources.append({"phase": label, "dir": str(phase_dir), "n_frames": int(n_phase), "n_dropped_unmapped": n_unmapped})
     if definition is None or not cols["step"]:
         raise RuntimeError(f"no lambda = 0 frames in epochs {sorted(wanted)} under {root}")
-    arrays = {k: np.concatenate(v) for k, v in cols.items()}
+    arrays = {k: (np.concatenate(v) if v else None) for k, v in cols.items()}
     arrays["phase"] = arrays["phase"].astype(str)
     ft = FrameTable(**arrays, definition=definition, sources=sources)
     if ft.n > int(max_frames):
