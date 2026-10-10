@@ -62,6 +62,10 @@ def test_admitted_aux_analysis_is_never_pass(tmp_path):
     assert s["health"]["overall"] != "PASS"
     assert any(c["name"] == "Auxiliary states" and c["status"] == "caution" for c in s["health"]["checks"])
     assert "aux_crosscheck" in s and "aux_workers" in s          # the aux-specific checks still run
+    assert s["auxiliary_cv_pmf"]["available"]
+    assert Path(s["files"]["cvaux_pmf_unbiased_csv"]).is_file()
+    assert Path(s["files"]["cvaux_pmf_png"]).is_file()
+    assert "CVaux PMF" in (out / "pmf_summary.md").read_text()
     excl = s["aux_burnin_exclusions"]                             # F01: the exclusion record reaches the summary
     assert excl["rule"] == "aux_burnin_carrier_v1"
     assert [(r["phase"], r["state_id"], r["reason"]) for r in excl["records"]] == [("epoch_001", 2, "aux_burnin_carrier")]

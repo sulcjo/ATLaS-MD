@@ -2219,6 +2219,74 @@ def run_secondary_cv_analyses(d: 'Data', args, base_logw: np.ndarray, selected: 
     return dominant_pmf_info, dominant_fes_info
 
 
+def analyze_auxiliary_cv_pmf(d, args, base_logw, selected, boost_ok, kbt_kcal, out, warnings):
+    if not (d.meta.get('aux_models') or d.meta.get('aux_states')):
+        return {'available': False, 'reason': 'No auxiliary CV model'}
+    z = getattr(d, 'aux_z', None)
+    if z is None:
+        z = d.meta.get('aux_z')
+    if z is None:
+        return {'available': False, 'reason': 'Auxiliary CV samples unavailable'}
+    z = np.asarray(z, dtype=np.float64)
+    if z.ndim == 2 and z.shape[1] == 1:
+        z = z[:, 0]
+    logw = np.asarray(base_logw, dtype=np.float64)
+    boost = np.asarray(d.boost_kj, dtype=np.float64)
+    if z.shape != (len(d.cv),) or logw.shape != z.shape or boost.shape != z.shape:
+        raise ValueError('Auxiliary CV samples and MBAR weights must be aligned scalar arrays')
+    chosen = selected
+    if d.meta.get('gamd_ladder') or not boost_ok:
+        chosen = 'umbrella_only'
+    mask = np.isfinite(z) & np.isfinite(logw)
+    if chosen != 'umbrella_only':
+        mask &= np.isfinite(boost)
+    n = int(np.count_nonzero(mask))
+    if n < max(20, d.u_nk.shape[1]):
+        return {'available': False, 'reason': 'Too few finite auxiliary CV samples', 'n_samples': n}
+    _agm = _bridge()
+    bins = make_bins(z[mask], int(args.bins), None, None)
+    result, _, chosen = _agm._observable_pmf_from_logw(
+        z[mask], logw[mask], boost[mask], bins, chosen, d.beta, kbt_kcal,
+        smooth_logfac_sigma=_agm._eff_smooth(args, 'gamd_smooth_sigma'))
+    out = Path(out)
+    out.mkdir(parents=True, exist_ok=True)
+    csv_path = out / 'cvaux_pmf_unbiased.csv'
+    _agm._write_csv_rows(csv_path, [
+        {'method': chosen, 'bin': i, 'cvaux_z': float(x),
+         'probability': float(result['prob'][i]),
+         'pmf_kcal_mol': float(result['pmf'][i]) if np.isfinite(result['pmf'][i]) else '',
+         'counts': int(result['counts'][i])}
+        for i, x in enumerate(result['cv_A'])])
+    files = {'cvaux_pmf_unbiased_csv': str(csv_path),
+             'cvaux_pmf_summary_json': str(out / 'cvaux_pmf_summary.json')}
+    try:
+        import matplotlib.pyplot as plt
+        from gareus.mbar_analysis import plotstyle as ps
+        fig, ax = plt.subplots(figsize=(8, 5))
+        try:
+            finite = np.isfinite(result['pmf'])
+            ax.plot(result['cv_A'][finite], result['pmf'][finite])
+            ps.style_line_axes(ax, xlabel='CVaux z3 (dimensionless)',
+                               ylabel='PMF (kcal/mol, shifted)',
+                               title=f'CVaux PMF ({ps.pretty_method(chosen)})')
+            fig.tight_layout()
+            fig.savefig(out / 'cvaux_pmf_unbiased.png', dpi=200)
+            files['cvaux_pmf_png'] = str(out / 'cvaux_pmf_unbiased.png')
+        finally:
+            plt.close(fig)
+    except Exception as exc:
+        warnings.append(f'Auxiliary CV PMF plot failed: {exc}')
+    finite = np.isfinite(result['pmf'])
+    info = {'available': True, 'coordinate': 'z3', 'units': 'dimensionless',
+            'model_sha256': d.meta.get('aux_model_sha256'),
+            'selected_unbiased_method': chosen, 'n_samples': n,
+            'bins': int(len(bins) - 1),
+            'pmf_span_kcal_mol': float(np.ptp(result['pmf'][finite])),
+            'files': files}
+    _agm.wjson(out / 'cvaux_pmf_summary.json', info)
+    return info
+
+
 def analyze_secondary_cv_pmf(d: Data, args, base_logw: np.ndarray, selected: str, boost_ok: bool, kbt_kcal: float, out: Path, warnings: list[str], progress: Optional['Progress']) -> dict:
     """1D PMF along the secondary collective variable (cv2_A from samples.csv)."""
     _agm = _bridge()

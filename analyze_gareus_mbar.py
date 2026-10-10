@@ -5351,6 +5351,10 @@ def _analyze_population(d, args, out: Path, progress: Optional[Progress] = None,
     thermo_info=analyze_thermo_decomposition(d,args,m,kbt_kcal=kbt_kcal,out=out,warnings=warn)
     chignolin_fes_info=analyze_chignolin_fes(d,args,logw,selected,boost_ok,kbt_kcal,out,warn,progress)
     secondary_cv_pmf_info,cv1_cv2_fes_info=run_secondary_cv_analyses(d,args,logw,selected,boost_ok,kbt_kcal,out,warn,progress,f_k_global=m['f_k'])
+    auxiliary_cv_pmf_info = None
+    if d.meta.get('aux_models') or d.meta.get('aux_states'):
+        from gareus.mbar_analysis.pmf import analyze_auxiliary_cv_pmf
+        auxiliary_cv_pmf_info = analyze_auxiliary_cv_pmf(d,args,logw,selected,boost_ok,kbt_kcal,out,warn)
     poincare_info=analyze_poincare_map(d,args,logw,selected,boost_ok,kbt_kcal,out,warn,progress)
     poincare_torsions_info=analyze_poincare_residue_torsions(d,args,out,poincare_info,warn,progress)
     epoch_cv_info=_analyze_epoch_cv_exploration(d.prod_dir,out,d.meta,warn)
@@ -5416,6 +5420,8 @@ def _analyze_population(d, args, out: Path, progress: Optional[Progress] = None,
     s['thermo_decomposition']=thermo_info
     s['chignolin_fes']=chignolin_fes_info
     s['secondary_cv_pmf']=secondary_cv_pmf_info
+    if auxiliary_cv_pmf_info is not None:
+        s['auxiliary_cv_pmf'] = auxiliary_cv_pmf_info
     s['poincare_map']=poincare_info
     s['poincare_residue_torsions']=poincare_torsions_info
     s['cv1_cv2_2d_fes']=cv1_cv2_fes_info
@@ -5428,7 +5434,7 @@ def _analyze_population(d, args, out: Path, progress: Optional[Progress] = None,
     for _info in (rg_info,fes2d_info,pca2d_info,extra_obs_info,chignolin_fes_info,
                   poincare_info,poincare_torsions_info,secondary_cv_pmf_info,
                   cv1_cv2_fes_info,epoch_cv_info,tica_epoch_info,torsion_pca_scree_info,conv_info,
-                  ladder_crosscheck_summary):
+                  ladder_crosscheck_summary,auxiliary_cv_pmf_info):
         if isinstance(_info,dict) and _info.get('files'):
             s['files'].update(_info['files'])
     # Presentation-only result-health verdict + warning triage (derived from the
