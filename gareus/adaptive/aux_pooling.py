@@ -332,12 +332,14 @@ def burnin_selection(phase, replica, step, state_id, burnin_workers: Mapping[str
 
 def merge_burnin_records(records: Iterable[dict]) -> dict:
     """One record over several per-phase ``burnin_selection`` records (phases are disjoint)."""
-    out = {"rule": BURNIN_RULE, "phases": [], "records": []}
+    out = {"rule": BURNIN_RULE, "phases": [], "records": [], "superseded": []}
     for rec in records:
         out["phases"].extend(rec["phases"])
         out["records"].extend(rec["records"])
+        out["superseded"].extend(rec.get("superseded") or [])
     out["phases"].sort(key=lambda e: e["phase"])
     out["records"].sort(key=lambda e: (e["phase"], e["state_id"]))
+    out["superseded"].sort(key=lambda e: (e["phase"], e["segment"]))
     return out
 
 
@@ -349,6 +351,104 @@ def burnin_dropped_by_state(record: dict) -> Dict[str, int]:
     return out
 
 
+REASON_SUPERSEDED = "superseded_by_resume"
+_KEY_SHIFT = 40                    # (replica, step) -> replica << 40 | step for overlap tests
+
+
+def segment_order(phase_dir) -> Dict[str, int]:
+    """Durable segment order of one phase: the position in its append-only ``segments.json`` (the segment
+    registry appends every gareus invocation). Empty when the phase has no readable registry."""
+    import json
+    try:
+        segs = json.loads((Path(phase_dir) / "segments.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(segs, list):
+        return {}
+    return {str(seg.get("segment_id")): i for i, seg in enumerate(segs) if isinstance(seg, dict)}
+
+
+def resume_supersession(phase, replica, step, segment_id, segment_orders: Mapping[str, Mapping[str, int]], *,
+                        where: str = "aux union"):
+    """Exclude whole segments a later restart superseded (one phase at a time; aux union paths only).
+
+    Within a phase, segments are taken in their durable ``segments.json`` order. When a later segment L's
+    (replica, step) keys overlap an earlier, not yet superseded segment E's and L starts at or before E's
+    first step, L is a restarted history: every row of E is excluded (reason ``superseded_by_resume``).
+    Segments whose keys do not overlap (a continuation starts after the earlier one's last step) are kept.
+    An overlap where L starts inside E (not a restart from E's start), or involving a segment with no
+    durable order or no segment id, refuses (AuxPoolingRefused). Returns ``(keep, records)``,
+    records = [{phase, segment, superseded_by, rows_excluded, reason}].
+    """
+    from gareus.correctness.observation_keys import integer_key
+    from gareus.kernel_identity import AuxPoolingRefused
+    labels = np.asarray(phase, dtype=object).astype(str)
+    n = labels.shape[0]
+    keep = np.ones(n, dtype=bool)
+    records: list = []
+    if replica is None or n == 0:
+        return keep, records
+    rep = integer_key(replica, "replica", n)
+    st = integer_key(step, "step", n)
+    if st.size and int(st.max()) >= (1 << _KEY_SHIFT):
+        raise AuxPoolingRefused(f"{where}: step {int(st.max())} too large for the supersession key")
+    key = (rep << _KEY_SHIFT) | st
+    seg = None if segment_id is None else np.asarray(segment_id, dtype=object).astype(str)
+    for label in sorted(set(labels.tolist())):
+        idx = np.flatnonzero(labels == label)
+        if seg is None:
+            continue                              # one unlabelled pool: duplicate keys refuse downstream
+        segs = sorted(set(seg[idx].tolist()))
+        if len(segs) < 2:
+            continue
+        order = segment_orders.get(label) or {}
+        rows = {s_: idx[seg[idx] == s_] for s_ in segs}
+        keys = {s_: np.unique(key[r]) for s_, r in rows.items()}
+        unordered = [s_ for s_ in segs if s_ not in order]
+        ranked = sorted((s_ for s_ in segs if s_ in order), key=lambda s_: order[s_])
+        for u in unordered:
+            if any(np.intersect1d(keys[u], keys[o], assume_unique=True).size for o in segs if o != u):
+                raise AuxPoolingRefused(f"{where}: {label}: segment {u!r} overlaps another segment's (replica, "
+                                        "step) keys but has no durable order in segments.json: refusing")
+        superseded = set()
+        for j, later in enumerate(ranked):
+            for earlier in ranked[:j]:
+                if earlier in superseded:
+                    continue
+                if not np.intersect1d(keys[earlier], keys[later], assume_unique=True).size:
+                    continue
+                e_first = int(st[rows[earlier]].min())
+                l_first = int(st[rows[later]].min())
+                if l_first > e_first:
+                    raise AuxPoolingRefused(
+                        f"{where}: {label}: segment {later!r} overlaps {earlier!r} but starts at step {l_first}, "
+                        f"inside it (first step {e_first}): neither a restart nor a continuation, refusing")
+                superseded.add(earlier)
+                keep[rows[earlier]] = False
+                records.append({"phase": label, "segment": earlier, "superseded_by": later,
+                                "rows_excluded": int(rows[earlier].size), "reason": REASON_SUPERSEDED})
+    records.sort(key=lambda e: (e["phase"], e["segment"]))
+    return keep, records
+
+
+def union_aux_selection(phase, replica, step, segment_id, state_id, burnin_workers: Mapping[str, Iterable[int]], *,
+                        segment_orders: Mapping[str, Mapping[str, int]], evidence: Optional[Mapping[str, str]] = None,
+                        where: str = "aux union"):
+    """The row selection both aux union paths apply: resume supersession, then (on the surviving rows, keys
+    validated) per-carrier worker burn-in. Returns ``(keep, record, not_superseded)``: ``record`` is the burn-in
+    record plus ``superseded`` (the supersession records); ``not_superseded`` the rows supersession kept."""
+    not_superseded, superseded = resume_supersession(phase, replica, step, segment_id, segment_orders, where=where)
+    keep = not_superseded.copy()
+    sub = np.flatnonzero(keep)
+    labels = np.asarray(phase, dtype=object)
+    bk, record = burnin_selection(labels[sub], None if replica is None else np.asarray(replica)[sub],
+                                  np.asarray(step)[sub], np.asarray(state_id)[sub], burnin_workers,
+                                  evidence=evidence, where=where)
+    keep[sub] = bk
+    record["superseded"] = superseded
+    return keep, record, not_superseded
+
+
 def aux_term_kcal(z: np.ndarray, center: float, k_kcal: float) -> np.ndarray:
     return 0.5 * float(k_kcal) * (np.asarray(z, dtype=np.float64) - float(center)) ** 2
 
@@ -356,4 +456,4 @@ def aux_term_kcal(z: np.ndarray, center: float, k_kcal: float) -> np.ndarray:
 __all__ = ["phase_z", "phase_runtime_model_shas", "require_spot_check", "spot_check_due_phases",
            "spot_check_is_final", "require_persisted_model_segments",
            "expected_backfill_sha256", "burnin_selection", "merge_burnin_records", "burnin_dropped_by_state",
-           "exclusion_records", "worker_table", "aux_term_kcal", "phase_epoch", "Z_COLUMN", "KJ_PER_KCAL"]
+           "exclusion_records", "resume_supersession", "segment_order", "union_aux_selection", "worker_table", "aux_term_kcal", "phase_epoch", "Z_COLUMN", "KJ_PER_KCAL"]

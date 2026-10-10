@@ -3882,6 +3882,7 @@ def build_union_state_mbar_inputs(
     sample_rows: List[Dict[str, Any]] = []
     _burnin_workers: Dict[str, Any] = {}
     _burnin_evidence: Dict[str, str] = {}
+    _segment_orders: Dict[str, Dict[str, int]] = {}
     if _aux_workers:
         from .adaptive.aux_seeding_record import read_burnin_workers  # noqa: PLC0415
     # Per source: (primary_center, primary_k, secondary_center, secondary_k) vectors
@@ -3929,6 +3930,7 @@ def build_union_state_mbar_inputs(
                 "usable_for_mbar": int(source_label.startswith("final") or include_epochs),
                 "_source_index": source_index,
                 **({"_replica": _float_or_none(row.get("replica")), "_z_recorded": _float_or_none(row.get("aux_z_00")),
+                    "_segment": str(row.get("segment_id") or ""),
                     "_z_has_column": "aux_z_00" in row}
                    if _aux_workers else {}),
             })
@@ -3950,6 +3952,7 @@ def build_union_state_mbar_inputs(
             # F01: this phase's US-pulled workers, from its seeding record (no record = every worker).
             _burnin_workers[source_label], _burnin_evidence[source_label] = read_burnin_workers(
                 Path(sample_dir), _aux_workers, where=source_label)
+            _segment_orders[source_label] = _ap.segment_order(Path(sample_dir))
 
     if not sample_rows:
         raise RuntimeError(f"no usable sample rows found under {adaptive_dir}")
@@ -3962,14 +3965,17 @@ def build_union_state_mbar_inputs(
     _burnin_dropped: Dict[str, int] = {}
     _burnin_record = None
     if _aux_workers:
-        # F01 worker burn-in: per carrier, inside each phase whose seeding record says a worker was US-pulled
-        # there (aux_pooling.burnin_selection, the analyzer loader's rule too); burnin_phase_epoch never filters.
-        _bk, _burnin_record = _ap.burnin_selection(
+        # Resume supersession (a restarted segment replaces the whole earlier one), then F01 worker burn-in:
+        # per carrier, inside each phase whose seeding record says a worker was US-pulled there
+        # (aux_pooling.union_aux_selection, the analyzer loader's rule too); burnin_phase_epoch never filters.
+        _bk, _burnin_record, _ = _ap.union_aux_selection(
             np.asarray([r["source"] for r in sample_rows], dtype=object),
             np.asarray([r["_replica"] for r in sample_rows], dtype=np.float64),
             np.asarray([r["step"] for r in sample_rows], dtype=np.int64),
+            np.asarray([r["_segment"] for r in sample_rows], dtype=object),
             np.asarray([r["sampled_state_id"] for r in sample_rows], dtype=np.int64),
-            _burnin_workers, evidence=_burnin_evidence, where="adaptive union build")
+            _burnin_workers, segment_orders=_segment_orders, evidence=_burnin_evidence,
+            where="adaptive union build")
         _burnin_dropped = _ap.burnin_dropped_by_state(_burnin_record)
         sample_rows = [r for r, k in zip(sample_rows, _bk.tolist()) if k]
         if not sample_rows:

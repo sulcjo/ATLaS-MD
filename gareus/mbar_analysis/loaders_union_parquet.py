@@ -622,7 +622,9 @@ def load_parquet_adaptive_union(adaptive_dir: Path, n_threads: int = 0, n_worker
             _bw, _bev = read_burnin_workers(epoch_dir, _aux_worker_ids, where=_label)
             _burn_phases.append((_label, _bw, _bev,
                                  samples['replica'][_burn_vidx] if 'replica' in samples else None,
-                                 samples['step'][_burn_vidx], remapped[_burn_vidx], valid[_burn_vidx]))
+                                 samples['step'][_burn_vidx], remapped[_burn_vidx], valid[_burn_vidx],
+                                 samples['segment_id'][_burn_vidx] if 'segment_id' in samples else None,
+                                 _ap.segment_order(epoch_dir)))
             for _k, _rec in _aux_cols.items():
                 block[:, _k] += beta * _ap.KJ_PER_KCAL * _ap.aux_term_kcal(_z, _rec['aux_center'], _rec['aux_k_kcal_mol'])
             if hasattr(block, 'flush'):
@@ -696,14 +698,16 @@ def load_parquet_adaptive_union(adaptive_dir: Path, n_threads: int = 0, n_worker
     _aux_burnin: dict = {}
     _aux_burnin_record = None
     if _aux_cols:
-        # Worker burn-in (F01, aux_pooling.burnin_selection = the driver union build's rule): decided per phase
+        # Resume supersession + worker burn-in (F01, aux_pooling.union_aux_selection = the driver's rule): per phase
         # on its pre-stride rows, then restricted to the rows the stride kept (phase order = row order).
-        _keeps, _recs = [], []
-        for _label, _bw, _bev, _rep_b, _step_b, _sid_b, _stride_kept in _burn_phases:
-            _bk, _brec = _ap.burnin_selection(np.full(_step_b.size, _label, dtype=object), _rep_b, _step_b, _sid_b,
-                                              {_label: _bw}, evidence={_label: _bev}, where='adaptive union loader')
-            _keeps.append(_bk[_stride_kept]); _recs.append(_brec)
+        _keeps, _recs, _not_sup = [], [], []
+        for _label, _bw, _bev, _rep_b, _step_b, _sid_b, _stride_kept, _seg_b, _order_b in _burn_phases:
+            _bk, _brec, _bns = _ap.union_aux_selection(np.full(_step_b.size, _label, dtype=object), _rep_b, _step_b,
+                                                 _seg_b, _sid_b, {_label: _bw}, segment_orders={_label: _order_b},
+                                                 evidence={_label: _bev}, where='adaptive union loader')
+            _keeps.append(_bk[_stride_kept]); _recs.append(_brec); _not_sup.append(_bns[_stride_kept])
         _aux_keep = np.concatenate(_keeps) if _keeps else np.ones(len(cv), dtype=bool)
+        _aux_not_sup = np.concatenate(_not_sup) if _not_sup else np.ones(len(cv), dtype=bool)
         _aux_burnin_record = _ap.merge_burnin_records(_recs)
         if low_memory and (analysis_stride > 1 or analysis_stride_offset > 0):
             # the stride already removed rows: count what this pool actually loses (carriers unchanged)
@@ -711,7 +715,7 @@ def load_parquet_adaptive_union(adaptive_dir: Path, n_threads: int = 0, n_worker
             _reasons = {e['phase']: e['reason'] for e in _aux_burnin_record['phases']}
             _aux_burnin_record['records'] = _ap.exclusion_records(
                 _labels[epoch_src], replica, np.asarray(state_ids, dtype=np.int64)[window.astype(np.int64)],
-                ~_aux_keep, _reasons)
+                _aux_not_sup & ~_aux_keep, _reasons)
             _aux_burnin_record['analysis_stride_applied_before_count'] = True
         _aux_burnin = _ap.burnin_dropped_by_state(_aux_burnin_record)
         keep = _aux_keep if keep is None else (keep & _aux_keep)

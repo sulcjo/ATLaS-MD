@@ -328,3 +328,82 @@ def test_low_memory_stride_never_leaks_a_carrier_whose_first_visit_was_strided_o
     assert d.meta["aux_burnin_exclusions"]["analysis_stride_applied_before_count"] is True
     n_loaded_epoch1 = sum(1 for (lab, r, t) in camp.truth if lab == "epoch_001")
     assert sum(r["rows_excluded"] for r in d.meta["aux_burnin_exclusions"]["records"]) < n_loaded_epoch1
+
+
+# ---------------------------------------------------------------- resume supersession (controller ruling)
+
+from gareus.adaptive.aux_pooling import resume_supersession  # noqa: E402
+
+_ORDER = {"epoch_001": {"seg_001": 0, "seg_002": 1, "seg_003": 2}}
+
+
+def _segments(*specs):
+    """specs: (segment, replica, steps) -> phase/replica/step/segment columns."""
+    rep, step, seg = [], [], []
+    for s_, r, steps in specs:
+        for t in steps:
+            rep.append(r); step.append(t); seg.append(s_)
+    n = len(step)
+    return np.full(n, "epoch_001", dtype=object), np.asarray(rep), np.asarray(step), np.asarray(seg, dtype=object)
+
+
+def test_restart_supersedes_the_whole_earlier_segment():
+    # seg_002 restarted from step 100 (no checkpoint): seg_001 is excluded entirely, also its rows past seg_002's end
+    ph, rep, step, seg = _segments(("seg_001", 0, range(100, 1100, 100)), ("seg_001", 1, range(100, 1100, 100)),
+                                   ("seg_002", 0, range(100, 600, 100)), ("seg_002", 1, range(100, 600, 100)))
+    keep, rec = resume_supersession(ph, rep, step, seg, _ORDER)
+    assert not keep[seg == "seg_001"].any() and keep[seg == "seg_002"].all()
+    assert rec == [{"phase": "epoch_001", "segment": "seg_001", "superseded_by": "seg_002", "rows_excluded": 20,
+                    "reason": "superseded_by_resume"}]
+
+
+def test_continuation_after_the_earlier_last_step_is_kept():
+    ph, rep, step, seg = _segments(("seg_001", 0, range(100, 600, 100)), ("seg_002", 0, range(600, 1100, 100)),
+                                   ("seg_003", 0, range(1100, 1300, 100)))
+    keep, rec = resume_supersession(ph, rep, step, seg, _ORDER)
+    assert keep.all() and rec == []
+
+
+def test_restart_inside_the_earlier_segment_is_ambiguous_and_refuses():
+    ph, rep, step, seg = _segments(("seg_001", 0, range(100, 1100, 100)), ("seg_002", 0, range(500, 900, 100)))
+    with pytest.raises(AuxPoolingRefused, match="neither a restart nor a continuation"):
+        resume_supersession(ph, rep, step, seg, _ORDER)
+
+
+def test_overlapping_segment_without_durable_order_refuses():
+    ph, rep, step, seg = _segments(("seg_001", 0, range(100, 600, 100)), ("seg_009", 0, range(100, 600, 100)))
+    with pytest.raises(AuxPoolingRefused, match="no durable order"):
+        resume_supersession(ph, rep, step, seg, _ORDER)
+
+
+def test_duplicates_within_one_segment_still_refuse():
+    from gareus.adaptive.aux_pooling import union_aux_selection
+    from gareus.correctness.observation_keys import ObservationKeyRefusal
+    ph, rep, step, seg = _segments(("seg_001", 0, [100, 200, 200]))
+    with pytest.raises(ObservationKeyRefusal, match="duplicate"):
+        union_aux_selection(ph, rep, step, seg, np.zeros(3, dtype=np.int64), {}, segment_orders=_ORDER)
+
+
+def test_restarted_phase_both_paths_select_identical_keys(tmp_path):
+    camp = build_campaign(tmp_path, exchange=True, restart_epoch_001=True)
+    d = _loader(camp)
+    meta = _driver(camp)
+    rec = d.meta["aux_burnin_exclusions"]
+    assert rec["superseded"] == [{"phase": "epoch_001", "segment": "seg_001", "superseded_by": "seg_002",
+                                  "rows_excluded": 3 * ROWS_PER_WINDOW, "reason": "superseded_by_resume"}]
+    assert meta["aux_burnin_exclusions"] == rec
+    first = {2: 100_010, 1: 100_000 + 10 * (EXCHANGE_PERIOD + 1), 0: 100_000 + 10 * (2 * EXCHANGE_PERIOD + 1)}
+    expected = _expected_kept(camp, {"epoch_001": first})
+    assert _loader_keys(d) == expected                    # each key once: seg_001's copy superseded
+    # the kept epoch_001 rows are seg_002's (its z is the truth the restart wrote)
+    z = dict(zip(_loader_keys_list(d), np.asarray(d.aux_z).tolist()))
+    assert all(z[k] == pytest.approx(camp.truth[k]) for k in expected if k[0] == "epoch_001")
+    with open(meta["samples_csv"], newline="") as fh:
+        drv = {(r["source"], int(r["step"])) for r in csv.DictReader(fh)}
+    assert drv and drv <= {(lab, t) for lab, _, t in expected}
+
+
+def _loader_keys_list(d):
+    labels = [Path(p).name for p in d.meta["_epoch_source_run_dirs"]]
+    src = np.asarray(d.meta["_epoch_source"])
+    return [(labels[int(s)], int(r), int(t)) for s, r, t in zip(src, np.asarray(d.replica), np.asarray(d.step))]

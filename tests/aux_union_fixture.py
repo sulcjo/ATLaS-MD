@@ -86,12 +86,12 @@ def write_seeding_record(phase, status, *, worker_id=2, window=2):
                                          branch="pull" if status == "pulled" else "continue_states"))
 
 
-def _write_phase(phase, n_windows, aux, step0, rng, truth, label, record_z=True, exchange=False):
+def _write_phase(phase, n_windows, aux, step0, rng, truth, label, record_z=True, exchange=False, parent=None):
     from gareus.store import ParquetSampleWriter, SegmentRegistry, WindowSnapshot
     phase.mkdir(parents=True, exist_ok=True)
     (phase / "gareus_metadata.json").write_text(json.dumps({"temperature_K": 300.0}))
     seg_reg = SegmentRegistry(phase)
-    seg = seg_reg.open_segment("run_001", None, 1)
+    seg = seg_reg.open_segment("run_001", parent, 1)
     writer = ParquetSampleWriter(phase / "samples" / seg, aux_schema=SCHEMA if aux and record_z else None,
                                  aux_runtime=RUNTIME if aux and record_z else None, flush_rows=10000)
     last = step0
@@ -142,7 +142,7 @@ DEFAULT_SEEDING = {"epoch_001": "pulled", "final": "continued"}
 
 
 def build_campaign(tmp_path, *, backfill=True, admission=True, spot_check=_DEFAULT, backfill_record=_DEFAULT,
-                   final_records_z=True, seeding_records=_DEFAULT, exchange=False):
+                   final_records_z=True, seeding_records=_DEFAULT, exchange=False, restart_epoch_001=False):
     """Adaptive dir with state_registry files, frozen aux files and three phases.
 
     The admission record carries, by default, a passing ``spot_check`` (epoch_001 and final ran with the model,
@@ -150,7 +150,9 @@ def build_campaign(tmp_path, *, backfill=True, admission=True, spot_check=_DEFAU
     pooling). ``spot_check=None`` omits the record, a dict replaces it; ``backfill_record`` replaces the list;
     ``final_records_z=False`` = the final phase ran with the model (aux snapshot) but its samples hold no z.
     ``seeding_records`` = {phase label: "pulled" | "continued" | None (no record)}, default DEFAULT_SEEDING;
-    ``exchange=True`` writes the post-admission phases on the rotating exchange schedule (carriers exist)."""
+    ``exchange=True`` writes the post-admission phases on the rotating exchange schedule (carriers exist).
+    ``restart_epoch_001=True`` writes epoch_001 a second time as seg_002 (parent seg_001, same steps, new data):
+    a restart without a checkpoint, whose truth z replaces the first history's."""
     ad = tmp_path / "adaptive"
     ad.mkdir(parents=True)
     rng = np.random.default_rng(7)
@@ -159,6 +161,8 @@ def build_campaign(tmp_path, *, backfill=True, admission=True, spot_check=_DEFAU
     reg.save(ad)
     _write_phase(ad / "epoch_000", 2, False, 0, rng, truth, "epoch_000")
     _write_phase(ad / "epoch_001", 3, True, 100_000, rng, truth, "epoch_001", exchange=exchange)
+    if restart_epoch_001:
+        _write_phase(ad / "epoch_001", 3, True, 100_000, rng, truth, "epoch_001", exchange=exchange, parent="seg_001")
     _write_phase(ad / "final", 3, True, 200_000, rng, truth, "final", record_z=final_records_z, exchange=exchange)
     for label, status in (DEFAULT_SEEDING if seeding_records is _DEFAULT else seeding_records).items():
         if status is not None:
