@@ -4,7 +4,8 @@ z of every sample: the recorded ``aux_z_00`` of a phase that ran with the admitt
 backfill fallback), else the phase's ``aux_z_backfill.parquet`` (a phase run without the model), joined on
 exactly (replica, step), after its bytes match the sha256 the admission record holds for that phase. A row of
 ANY state without z refuses the pooling (the worker restraint is evaluated for every sample under every worker
-state); z is never filled. Worker burn-in = the worker's samples of the phase(s) of epoch ``burnin_phase_epoch``.
+state); z is never filled. Worker burn-in (F01) = per carrier, inside each phase whose seeding record says the
+worker was US-pulled there: ``burnin_selection`` (``burnin_phase_epoch`` is reporting only, never a filter).
 Pooling also needs a passing post-admission spot check once one is due (``require_spot_check``).
 """
 from __future__ import annotations
@@ -254,15 +255,98 @@ def phase_z(label: str, phase_dir: Path, replica, step, model_sha256: str, recor
     return z
 
 
-def burnin_keep(state_ids: np.ndarray, label_epoch: Optional[int], workers: Dict[int, dict]) -> np.ndarray:
-    """Keep mask over rows of ONE phase: False for worker-state rows when the phase is the worker's burn-in epoch."""
-    keep = np.ones(np.asarray(state_ids).shape[0], dtype=bool)
-    if label_epoch is None:
-        return keep
-    for sid, rec in workers.items():
-        if rec.get("burnin_phase_epoch") is not None and int(rec["burnin_phase_epoch"]) == int(label_epoch):
-            keep &= np.asarray(state_ids) != int(sid)
-    return keep
+BURNIN_RULE = "aux_burnin_carrier_v1"
+REASON_CARRIER = "aux_burnin_carrier"
+REASON_NO_REPLICA = "aux_burnin_no_replica"
+
+
+def exclusion_records(phase, replica, state_id, excluded, reason_of_phase: Mapping[str, str]) -> list:
+    """[{phase, state_id, n_replicas, rows_excluded, reason}] over the excluded rows, by (phase, sampled state)."""
+    excluded = np.asarray(excluded, dtype=bool)
+    if not excluded.any():
+        return []
+    labels = np.asarray(phase, dtype=object).astype(str)[excluded]
+    sid = np.asarray(state_id, dtype=np.int64)[excluded]
+    rep = None if replica is None else np.asarray(replica, dtype=np.int64)[excluded]
+    out = []
+    for label in sorted(set(labels.tolist())):
+        in_phase = labels == label
+        for s in sorted(set(sid[in_phase].tolist())):
+            rows = in_phase & (sid == s)
+            out.append({"phase": label, "state_id": int(s),
+                        "n_replicas": (0 if rep is None or reason_of_phase[label] == REASON_NO_REPLICA
+                                       else int(np.unique(rep[rows]).size)),
+                        "rows_excluded": int(rows.sum()), "reason": reason_of_phase[label]})
+    return out
+
+
+def burnin_selection(phase, replica, step, state_id, burnin_workers: Mapping[str, Iterable[int]], *,
+                     evidence: Optional[Mapping[str, str]] = None, where: str = "aux burn-in"):
+    """Per-carrier worker burn-in exclusion (F01); the one rule both union paths use.
+
+    Rows are observations keyed by (phase, replica, step), phase-local. ``burnin_workers[phase]`` = the worker
+    states started by a US pull in that phase (``aux_seeding_record.read_burnin_workers``). Within such a
+    phase, every replica trajectory loses its rows from its first visit (smallest step, never row order) to a
+    pulled worker to the end of the phase; rows before it, other replicas and every other phase are kept.
+    ``replica`` None (no replica column) in a phase that needs the exclusion excludes that whole phase.
+
+    Returns ``(keep, record)``: a keep mask over the rows and ``{"rule", "phases": [{phase, burnin_workers,
+    evidence, carriers: [{replica, first_excluded_step}], reason}], "records": exclusion_records(...)}``.
+    """
+    from gareus.correctness.observation_keys import integer_key, validate_observation_keys
+    labels = np.asarray(phase, dtype=object).astype(str)
+    n = labels.shape[0]
+    sid = integer_key(np.asarray(state_id), "state_id", n)
+    if replica is None:
+        step_a = integer_key(step, "step", n)
+        rep = None
+    else:
+        _, rep, step_a = validate_observation_keys(labels, replica, step, where=where)
+    keep = np.ones(n, dtype=bool)
+    phases, reasons = [], {}
+    for label in sorted(set(labels.tolist())):
+        workers = sorted({int(w) for w in burnin_workers.get(label, ())})
+        if not workers:
+            continue
+        in_phase = np.flatnonzero(labels == label)
+        at_worker = np.isin(sid[in_phase], workers)
+        if not at_worker.any():
+            continue
+        entry = {"phase": label, "burnin_workers": workers, "evidence": (evidence or {}).get(label)}
+        if rep is None:
+            keep[in_phase] = False
+            entry.update(carriers=None, reason=REASON_NO_REPLICA)
+        else:
+            reps, inv = np.unique(rep[in_phase], return_inverse=True)
+            first = np.full(reps.size, np.iinfo(np.int64).max, dtype=np.int64)
+            np.minimum.at(first, inv[at_worker], step_a[in_phase][at_worker])
+            keep[in_phase] = step_a[in_phase] < first[inv]
+            hit = first < np.iinfo(np.int64).max
+            entry.update(carriers=[{"replica": int(r), "first_excluded_step": int(f)}
+                                   for r, f in zip(reps[hit], first[hit])], reason=REASON_CARRIER)
+        reasons[label] = entry["reason"]
+        phases.append(entry)
+    return keep, {"rule": BURNIN_RULE, "phases": phases,
+                  "records": exclusion_records(labels, rep, sid, ~keep, reasons)}
+
+
+def merge_burnin_records(records: Iterable[dict]) -> dict:
+    """One record over several per-phase ``burnin_selection`` records (phases are disjoint)."""
+    out = {"rule": BURNIN_RULE, "phases": [], "records": []}
+    for rec in records:
+        out["phases"].extend(rec["phases"])
+        out["records"].extend(rec["records"])
+    out["phases"].sort(key=lambda e: e["phase"])
+    out["records"].sort(key=lambda e: (e["phase"], e["state_id"]))
+    return out
+
+
+def burnin_dropped_by_state(record: dict) -> Dict[str, int]:
+    """{state_id: rows excluded over all phases} from a burn-in record."""
+    out: Dict[str, int] = {}
+    for r in record["records"]:
+        out[str(r["state_id"])] = out.get(str(r["state_id"]), 0) + int(r["rows_excluded"])
+    return out
 
 
 def aux_term_kcal(z: np.ndarray, center: float, k_kcal: float) -> np.ndarray:
@@ -271,4 +355,5 @@ def aux_term_kcal(z: np.ndarray, center: float, k_kcal: float) -> np.ndarray:
 
 __all__ = ["phase_z", "phase_runtime_model_shas", "require_spot_check", "spot_check_due_phases",
            "spot_check_is_final", "require_persisted_model_segments",
-           "expected_backfill_sha256", "burnin_keep", "worker_table", "aux_term_kcal", "phase_epoch", "Z_COLUMN", "KJ_PER_KCAL"]
+           "expected_backfill_sha256", "burnin_selection", "merge_burnin_records", "burnin_dropped_by_state",
+           "exclusion_records", "worker_table", "aux_term_kcal", "phase_epoch", "Z_COLUMN", "KJ_PER_KCAL"]

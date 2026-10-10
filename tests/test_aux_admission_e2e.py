@@ -39,7 +39,9 @@ def _assert_integrator_kind(run, pep_gamd):
 
 @pytest.mark.parametrize("pep_gamd", [False, True], ids=["cmd", "pep-gamd"])
 def test_admission_through_epoch_loop_and_resume(tmp_path, small_adaptive_campaign, pep_gamd):
-    run = small_adaptive_campaign(tmp_path, aux=True, pep_gamd=pep_gamd)
+    # --ap-continue-states (as chignolin_11): the worker is US-pulled in epoch_002 only (its burn-in phase, F01);
+    # final continues its end state, so the worker's final rows pool.
+    run = small_adaptive_campaign(tmp_path, aux=True, pep_gamd=pep_gamd, continue_states=True)
     ad = run.adaptive
     _assert_integrator_kind(run, pep_gamd)
     assert run.discover_calls == [1]                                      # admitted once, never re-discovered
@@ -81,6 +83,15 @@ def test_admission_through_epoch_loop_and_resume(tmp_path, small_adaptive_campai
     rep2 = json.loads((ad / "epoch_002" / "aux_discovery_report.json").read_text())
     assert rep2["spot_check"][-1]["max_energy_err_kt"] == spot["max_energy_err_kt"]
 
+    # F01 seeding evidence written at phase setup: pulled in epoch_002, continued in final
+    from gareus.adaptive.aux_seeding_record import SEEDING_RECORD_FILENAME
+    seeding = {lab: json.loads((run.phase_dir(lab) / SEEDING_RECORD_FILENAME).read_text())["workers"]
+               for lab in ("epoch_002", "final")}
+    assert [(e["state_id"], e["seeding"]) for e in seeding["epoch_002"]] == [(int(w.state_id), "pulled")]
+    assert [(e["state_id"], e["seeding"]) for e in seeding["final"]] == [(int(w.state_id), "continued")]
+    for label in ("epoch_000", "epoch_001"):                              # no aux runtime there, no record
+        assert not (run.phase_dir(label) / SEEDING_RECORD_FILENAME).exists(), label
+
     # union pools every phase and includes the worker (manual build and the driver's own end-of-campaign union)
     from gareus.adaptive_production import build_union_state_mbar_inputs
     meta = build_union_state_mbar_inputs(ad, reg, output_prefix="e2e")
@@ -90,6 +101,9 @@ def test_admission_through_epoch_loop_and_resume(tmp_path, small_adaptive_campai
     assert np.isfinite(d["aux_z"]).all() and d["aux_z"].shape[0] == meta["n_samples"]
     col = meta["state_ids"].index(int(w.state_id))
     assert d["aux_k"][col] == pytest.approx(w.metadata["aux"]["aux_k_kcal_mol"]) and meta["N_k"][col] > 0
+    excl = meta["aux_burnin_exclusions"]
+    assert [p["phase"].split("/")[0] for p in excl["phases"]] == ["epoch_002"]      # only the pulled phase
+    assert excl["phases"][0]["burnin_workers"] == [int(w.state_id)] and excl["phases"][0]["carriers"]
     import pandas as pd
     sources = {str(x).split("/")[0] for x in pd.read_csv(meta["samples_csv"])["source"]}
     assert {"epoch_000", "epoch_001", "epoch_002", "final"} <= sources, sources

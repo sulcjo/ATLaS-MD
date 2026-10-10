@@ -2,8 +2,10 @@
 
 epoch_000 = pre-admission (ordinary states 0, 1; z only in aux_z_backfill.parquet);
 epoch_001 and final = post-admission (states 0, 1 and worker 2; z recorded as aux_z_00).
-The worker's burnin_phase_epoch is 1, so its epoch_001 samples are burn-in.
-Steps are unique across the whole campaign so (step) alone identifies a sample.
+Seeding records (F01, Task 11): by default epoch_001 records the worker as US-pulled (its burn-in phase) and
+final as continued, so only epoch_001's worker carriers are excluded; ``seeding_records`` overrides them.
+Steps are unique across the whole campaign so (step) alone identifies a sample -- except with
+``exchange=True``, where every replica is sampled at every step of a phase on a rotating window schedule.
 """
 from __future__ import annotations
 
@@ -54,7 +56,37 @@ def _write_map(phase, n_windows):
                         "secondary_center": "", "secondary_k": ""})
 
 
-def _write_phase(phase, n_windows, aux, step0, rng, truth, label, record_z=True):
+EXCHANGE_PERIOD = 10               # exchange layout: replica r sits at window (r + t // EXCHANGE_PERIOD) % n
+
+
+def _exchange_schedule(n_windows, step0):
+    """[(step, replica, window)]: every replica at every time point t, rotating through the windows."""
+    out = []
+    for t in range(ROWS_PER_WINDOW):
+        for r in range(n_windows):
+            out.append((step0 + 10 * (t + 1), r, (r + t // EXCHANGE_PERIOD) % n_windows))
+    return out
+
+
+def _window_major_schedule(n_windows, step0):
+    out, step = [], step0
+    for w in range(n_windows):
+        for i in range(ROWS_PER_WINDOW):
+            step += 10
+            out.append((step, i % 2, w))
+    return out
+
+
+def write_seeding_record(phase, status, *, worker_id=2, window=2):
+    """``<phase>/aux_seeding_record.json`` as production writes it (``status`` pulled | continued)."""
+    from gareus.adaptive.aux_seeding_record import seeding_record_payload, write_seeding_record as _write
+    pulled = {window} if status == "pulled" else set()
+    _write(phase, seeding_record_payload(worker_windows=[window], state_of_window={window: worker_id},
+                                         pulled_windows=pulled, continued_source={window: "state_export"},
+                                         branch="pull" if status == "pulled" else "continue_states"))
+
+
+def _write_phase(phase, n_windows, aux, step0, rng, truth, label, record_z=True, exchange=False):
     from gareus.store import ParquetSampleWriter, SegmentRegistry, WindowSnapshot
     phase.mkdir(parents=True, exist_ok=True)
     (phase / "gareus_metadata.json").write_text(json.dumps({"temperature_K": 300.0}))
@@ -62,20 +94,18 @@ def _write_phase(phase, n_windows, aux, step0, rng, truth, label, record_z=True)
     seg = seg_reg.open_segment("run_001", None, 1)
     writer = ParquetSampleWriter(phase / "samples" / seg, aux_schema=SCHEMA if aux and record_z else None,
                                  aux_runtime=RUNTIME if aux and record_z else None, flush_rows=10000)
-    step, last = step0, step0
-    for w in range(n_windows):
-        for i in range(ROWS_PER_WINDOW):
-            step += 10
-            replica = i % 2
-            cv = float(rng.normal(CENTRES[w], 0.03))
-            z = float(rng.normal(0.4, 0.3))
-            truth[(label, replica, step)] = z
-            kw = {}
-            if aux and record_z:
-                kw = dict(torsions=[0.1, 0.2], aux_z=[z])
-            writer.write_sample(step=step, replica=replica, window_id=w, cv1=cv, cv2=None, potential=0.0,
-                                boost_total=None, boost_dihedral=None, boost_nonbonded=None, **kw)
-            last = step
+    last = step0
+    schedule = _exchange_schedule(n_windows, step0) if exchange else _window_major_schedule(n_windows, step0)
+    for step, replica, w in schedule:
+        cv = float(rng.normal(CENTRES[w], 0.03))
+        z = float(rng.normal(0.4, 0.3))
+        truth[(label, replica, step)] = z
+        kw = {}
+        if aux and record_z:
+            kw = dict(torsions=[0.1, 0.2], aux_z=[z])
+        writer.write_sample(step=step, replica=replica, window_id=w, cv1=cv, cv2=None, potential=0.0,
+                            boost_total=None, boost_dihedral=None, boost_nonbonded=None, **kw)
+        last = max(last, step)
     writer.close()
     seg_reg.close_segment(seg, last)
     if aux:
@@ -108,14 +138,19 @@ PASSING_SPOT_CHECK = {"epoch": 1, "ok": True, "max_abs_dev": 1e-3, "max_energy_e
 _DEFAULT = object()
 
 
+DEFAULT_SEEDING = {"epoch_001": "pulled", "final": "continued"}
+
+
 def build_campaign(tmp_path, *, backfill=True, admission=True, spot_check=_DEFAULT, backfill_record=_DEFAULT,
-                   final_records_z=True):
+                   final_records_z=True, seeding_records=_DEFAULT, exchange=False):
     """Adaptive dir with state_registry files, frozen aux files and three phases.
 
     The admission record carries, by default, a passing ``spot_check`` (epoch_001 and final ran with the model,
     so the check is due) and epoch_000's backfill entry with the file's real sha256 (Task 10: both govern
     pooling). ``spot_check=None`` omits the record, a dict replaces it; ``backfill_record`` replaces the list;
-    ``final_records_z=False`` = the final phase ran with the model (aux snapshot) but its samples hold no z."""
+    ``final_records_z=False`` = the final phase ran with the model (aux snapshot) but its samples hold no z.
+    ``seeding_records`` = {phase label: "pulled" | "continued" | None (no record)}, default DEFAULT_SEEDING;
+    ``exchange=True`` writes the post-admission phases on the rotating exchange schedule (carriers exist)."""
     ad = tmp_path / "adaptive"
     ad.mkdir(parents=True)
     rng = np.random.default_rng(7)
@@ -123,8 +158,11 @@ def build_campaign(tmp_path, *, backfill=True, admission=True, spot_check=_DEFAU
     reg = _registry()
     reg.save(ad)
     _write_phase(ad / "epoch_000", 2, False, 0, rng, truth, "epoch_000")
-    _write_phase(ad / "epoch_001", 3, True, 100_000, rng, truth, "epoch_001")
-    _write_phase(ad / "final", 3, True, 200_000, rng, truth, "final", record_z=final_records_z)
+    _write_phase(ad / "epoch_001", 3, True, 100_000, rng, truth, "epoch_001", exchange=exchange)
+    _write_phase(ad / "final", 3, True, 200_000, rng, truth, "final", record_z=final_records_z, exchange=exchange)
+    for label, status in (DEFAULT_SEEDING if seeding_records is _DEFAULT else seeding_records).items():
+        if status is not None:
+            write_seeding_record(ad / label, status)
     if backfill:
         _write_backfill(ad / "epoch_000", "epoch_000", truth)
     MODEL.write(ad / "aux_model.json")

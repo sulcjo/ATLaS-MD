@@ -152,7 +152,8 @@ _SMALL_CAMPAIGN_PEP_GAMD = ["--run-mode", "gamd", "--gamd-boost-type", "pep-gamd
                             "--gamd-recon-boosted-tol", "0.05", "--gamd-multiwindow-recon-report-interval", "1"]
 
 
-def _small_campaign_argv(out: Path, windows_csv: Path, aux: bool, pep_gamd: bool = False):
+def _small_campaign_argv(out: Path, windows_csv: Path, aux: bool, pep_gamd: bool = False,
+                        continue_states: bool = False):
     argv = ["--seq", "GA", "--out", str(out), "--seed", "2026", "--platform", "CPU", "--setup-platform", "CPU",
             "--box-shape", "dodecahedron", "--padding-nm", "0.55", "--ionic-strength-molar", "0.0",
             "--temperature-k", "300.0", "--run-mode", "cmd", "--timestep-fs", "1.0", "--friction-per-ps", "5.0",
@@ -168,6 +169,9 @@ def _small_campaign_argv(out: Path, windows_csv: Path, aux: bool, pep_gamd: bool
             "--tui-mode", "none"]
     if pep_gamd:      # later flags win: --run-mode gamd replaces cmd
         argv = argv + _SMALL_CAMPAIGN_PEP_GAMD
+    if continue_states:
+        # continuation reads the parent's restraints from its checkpoint manifest: write one per phase
+        argv = argv + ["--ap-continue-states", "--checkpoint-interval", "1000"]
     return argv + (["--ap-aux-discovery"] if aux else [])
 
 
@@ -254,6 +258,7 @@ def small_adaptive_campaign():
     """Factory: a real (CPU, --run-mode cmd) GA-dipeptide adaptive-production campaign through
     ``gareus.cli.main``: epochs 0-2 + final, 3 windows, 1000 steps per phase, XTC every sample.
 
+    ``continue_states=True`` adds --ap-continue-states (the worker is pulled in its first phase only).
     ``aux=True`` adds --ap-aux-discovery, a passing aux_validation.json and the fixed discovery above.
     ``kill_after="registry_save:epoch_001"`` raises CampaignKilled right after the first
     WindowStateRegistry.save whose registry holds an aux worker (epoch 1's post-action save), before the
@@ -266,12 +271,13 @@ def small_adaptive_campaign():
 
     mp = pytest.MonkeyPatch()
 
-    def _build(tmp_path: Path, *, aux: bool = True, kill_after: str = "", pep_gamd: bool = False):
+    def _build(tmp_path: Path, *, aux: bool = True, kill_after: str = "", pep_gamd: bool = False,
+               continue_states: bool = False):
         out = Path(tmp_path) / "run"
         out.mkdir(parents=True)
         windows = Path(tmp_path) / "windows.csv"
         windows.write_text(_SMALL_CAMPAIGN_WINDOWS)
-        argv = _small_campaign_argv(out, windows, aux, pep_gamd)
+        argv = _small_campaign_argv(out, windows, aux, pep_gamd, continue_states)
         calls = []
         mp.setattr(ap, "propose_actions_from_diagnostics", lambda *a, **k: [])
         mp.setattr(ap, "evaluate_adaptive_convergence_gate",

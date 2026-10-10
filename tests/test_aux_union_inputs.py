@@ -112,6 +112,7 @@ def test_no_workers_outputs_unchanged(tmp_path):
     d = np.load(meta["arrays_npz"])
     assert "aux_z" not in d.files and "aux_model_sha256" not in meta
     assert all("burnin_dropped" not in v for v in meta["subsample_counts_per_state"].values())
+    assert "aux_burnin_exclusions" not in meta
 
 
 def test_builder_refuses_when_admitted_worker_not_in_registry(tmp_path):

@@ -6782,6 +6782,24 @@ def _seed_topup_windows_from_parent_states(
     return window_start_positions, window_start_velocities, window_start_boxes, seed_by_window
 
 
+def _write_aux_seeding_record(out_dir, aux_table, branch, pulled_windows, continued_state_windows,
+                              pdb_seeded_windows, fallback) -> None:
+    """``<out_dir>/aux_seeding_record.json``: per aux worker window (aux k > 0), pulled or continued (F01)."""
+    from .adaptive.aux_seeding_record import seeding_record_payload, write_seeding_record
+    workers = [w for w in range(aux_table.n) if float(aux_table.k_kcal[w]) > 0.0]
+    source = {}
+    for w in workers:
+        if branch == "topup":
+            source[w] = "topup_state_export"
+        elif w in pdb_seeded_windows:
+            source[w] = "final_pdb"
+        elif w in continued_state_windows or branch == "extension":
+            source[w] = "state_export"
+    write_seeding_record(out_dir, seeding_record_payload(
+        worker_windows=workers, state_of_window=state_id_of_window_from_epoch_map(out_dir),
+        pulled_windows=pulled_windows, continued_source=source, branch=branch, fallback=fallback))
+
+
 def remap_subset_window_indices(pull_dir: Path, missing) -> None:
     """Renumber a subset pull's per-window report rows (0..n-1 over ``missing``) to full window
     indices, so report readers that index by window see the right windows. PDB file names keep
@@ -7452,6 +7470,8 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
         # --ap-continue-states: existing states continue from their newest earlier end
         # state; only states new to this phase (no parent end state) are pulled.
         _continue_seeds = None
+        # F01 seeding evidence (aux runs only): which windows this phase starts by a US pull.
+        _seed_fallback = None
         if (_topup_phase_info.get("continue_parent_dirs") and not is_topup_segment
                 and not bool(_topup_phase_info.get("is_extension"))):
             try:
@@ -7463,6 +7483,7 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
             except SeedMismatchError as exc:
                 print(f"WARNING: {out_dir}: parent end states rejected ({exc}); pulling every window instead")
                 _continue_seeds = None
+                _seed_fallback = "seed_mismatch"
         if bool(_topup_phase_info.get("is_extension")) and not is_topup_segment:
             try:
                 _extension_seeds = _seed_extension_windows_from_parent_ends(
@@ -7476,6 +7497,7 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                 # pulling fresh uses no parent data at all, so it is the safe fallback.
                 print(f"WARNING: extension {out_dir}: parent end states rejected ({exc}); pulling every window instead")
                 _extension_seeds = None
+                _seed_fallback = "seed_mismatch"
 
         if _continue_seeds is not None:
             (_cont_pos, _cont_vel, window_start_boxes, topup_seed_by_window,
@@ -7510,10 +7532,12 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
             else:
                 window_start_positions, window_start_velocities = _cont_pos, _cont_vel
                 dropped_window_indices = []
+            _seed_branch, _pulled_windows = "continue_states", set(_cont_missing)
         elif _extension_seeds is not None:
             (window_start_positions, window_start_velocities, window_start_boxes,
              topup_seed_by_window, pdb_seeded_windows) = _extension_seeds
             dropped_window_indices = []
+            _seed_branch, _pulled_windows = "extension", set()
         elif is_topup_segment:
             # Effective top-ups (spec 4.4 rev 2): continue every window's chain
             # from its parent segment's exported final State instead of
@@ -7534,6 +7558,7 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                 _release_run_lock_best_effort(out_dir)
                 raise
             dropped_window_indices = []
+            _seed_branch, _pulled_windows = "topup", set()
         else:
             starting_structure_system = create_system(app, unit, forcefield, topology, args, include_barostat=False)
             add_umbrella_cv_forces(openmm, starting_structure_system, topology, primary_cv_def, args,
@@ -7552,6 +7577,7 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
             )
             window_start_boxes = [None] * nrep
             topup_seed_by_window = {}
+            _seed_branch, _pulled_windows = "pull", set(range(nrep))
 
         if dropped_window_indices:
             if getattr(args, "_aux_runtime", None) is not None:
@@ -7620,6 +7646,12 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
             ladder_active = resolve_ladder_active(state_lambdas, out_dir)
             if ladder_active and not ladder_supports_boost_type(args):
                 raise ValueError("a gamd_lambda ladder requires --gamd-boost-type pep-gamd-lower-dual or lower-dihedral")
+
+        if _aux_table is not None:
+            # F01: durable seeding evidence before any MD (aux refuses window drops, so indices are this
+            # phase's own); the union pools treat a pulled worker's phase as its burn-in phase.
+            _write_aux_seeding_record(out_dir, _aux_table, _seed_branch, _pulled_windows, continued_state_windows,
+                                      pdb_seeded_windows, _seed_fallback)
 
         if use_gamd:
             reusable_gamd = load_reusable_shared_gamd_setup(args, out_dir)

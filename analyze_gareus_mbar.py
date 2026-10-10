@@ -5403,6 +5403,9 @@ def _analyze_population(d, args, out: Path, progress: Optional[Progress] = None,
     s['ladder_crosscheck']=ladder_crosscheck_summary
     if aux_crosscheck_summary is not None: s['aux_crosscheck']=aux_crosscheck_summary
     if aux_workers_summary is not None: s['aux_workers']=aux_workers_summary
+    if d.meta.get('aux_burnin_exclusions') is not None:
+        # F01: which carriers' rows the union excluded as worker burn-in (aux-admitted analyses only).
+        s['aux_burnin_exclusions']=d.meta['aux_burnin_exclusions']
     if _aux_na is not None:
         # Written only for auxiliary-state analyses: gareus_report grades the unaudited rows NA from it.
         s['aux_states']={'reason':_aux_na,'models':[str(x) for x in d.meta.get('aux_models') or []]}

@@ -3880,6 +3880,10 @@ def build_union_state_mbar_inputs(
                                         f"admission record {str(_aux_rec.get('model_sha256'))[:12]}")
 
     sample_rows: List[Dict[str, Any]] = []
+    _burnin_workers: Dict[str, Any] = {}
+    _burnin_evidence: Dict[str, str] = {}
+    if _aux_workers:
+        from .adaptive.aux_seeding_record import read_burnin_workers  # noqa: PLC0415
     # Per source: (primary_center, primary_k, secondary_center, secondary_k) vectors
     # over the union states, native where that source's own map records them.
     source_params: List[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = []
@@ -3942,6 +3946,10 @@ def build_union_state_mbar_inputs(
                 admission=_aux_rec, adaptive_dir=adaptive_dir)
             for _r, _zv in zip(_new, _z.tolist()):
                 _r["aux_z"] = float(_zv)
+        if _aux_workers:
+            # F01: this phase's US-pulled workers, from its seeding record (no record = every worker).
+            _burnin_workers[source_label], _burnin_evidence[source_label] = read_burnin_workers(
+                Path(sample_dir), _aux_workers, where=source_label)
 
     if not sample_rows:
         raise RuntimeError(f"no usable sample rows found under {adaptive_dir}")
@@ -3951,19 +3959,19 @@ def build_union_state_mbar_inputs(
     # equilibrated_subsample, then rebuild sample_rows from kept indices.
     # All downstream numpy arrays are derived from sample_rows so alignment is
     # preserved automatically.
-    _burnin_dropped: Dict[int, int] = {}
+    _burnin_dropped: Dict[str, int] = {}
+    _burnin_record = None
     if _aux_workers:
-        # Worker burn-in: the worker's samples of the phase(s) of its burnin_phase_epoch (never burnin_steps).
-        _label_epoch = {lab: _ap.phase_epoch(lab) for lab in {r["source"] for r in sample_rows}}
-        _kept_rows = []
-        for _r in sample_rows:
-            _rec = _aux_workers.get(int(_r["sampled_state_id"]))
-            if (_rec is not None and _rec.get("burnin_phase_epoch") is not None
-                    and _label_epoch[_r["source"]] == int(_rec["burnin_phase_epoch"])):
-                _burnin_dropped[int(_r["sampled_state_id"])] = _burnin_dropped.get(int(_r["sampled_state_id"]), 0) + 1
-                continue
-            _kept_rows.append(_r)
-        sample_rows = _kept_rows
+        # F01 worker burn-in: per carrier, inside each phase whose seeding record says a worker was US-pulled
+        # there (aux_pooling.burnin_selection, the analyzer loader's rule too); burnin_phase_epoch never filters.
+        _bk, _burnin_record = _ap.burnin_selection(
+            np.asarray([r["source"] for r in sample_rows], dtype=object),
+            np.asarray([r["_replica"] for r in sample_rows], dtype=np.float64),
+            np.asarray([r["step"] for r in sample_rows], dtype=np.int64),
+            np.asarray([r["sampled_state_id"] for r in sample_rows], dtype=np.int64),
+            _burnin_workers, evidence=_burnin_evidence, where="adaptive union build")
+        _burnin_dropped = _ap.burnin_dropped_by_state(_burnin_record)
+        sample_rows = [r for r, k in zip(sample_rows, _bk.tolist()) if k]
         if not sample_rows:
             raise RuntimeError(f"no usable sample rows found under {adaptive_dir} (all were worker burn-in)")
     from .mbar_subsample import equilibrated_subsample as _es  # noqa: PLC0415
@@ -4112,6 +4120,7 @@ def build_union_state_mbar_inputs(
     }
     meta.update(_ladder_meta)
     if _aux_workers:
+        meta["aux_burnin_exclusions"] = _burnin_record
         meta["aux_model_sha256"] = str(_aux_rec["model_sha256"])
         meta["aux_state_ids"] = sorted(_aux_workers)
     json_path = out_prefix.with_suffix(".json")
