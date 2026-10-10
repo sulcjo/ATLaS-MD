@@ -120,3 +120,23 @@ def test_driver_start_refuses_malformed_record(tmp_path):
     _write(tmp_path, timestep_fs=float("nan"))
     with pytest.raises(RuntimeError, match="validation_unreadable"):
         _require_valid_aux_validation(tmp_path, args)
+
+
+def test_driver_start_leaves_fail_and_timestep_mismatch_to_admission(tmp_path):
+    import types
+    from gareus.adaptive_production import _require_valid_aux_validation
+    args = types.SimpleNamespace(timestep_fs=3.5)
+    _write(tmp_path, checks={**_GOOD_CHECKS, "npt": {"status": "fail", "evidence": ["x"]}})
+    _require_valid_aux_validation(tmp_path, args)
+    _write(tmp_path)
+    _require_valid_aux_validation(tmp_path, types.SimpleNamespace(timestep_fs=4.0))
+    _write(tmp_path, checks={**_GOOD_CHECKS, "npt": "pass"})
+    with pytest.raises(RuntimeError, match="validation_evidence_missing:npt"):
+        _require_valid_aux_validation(tmp_path, args)
+
+
+def test_cli_write_refuses_pass_without_evidence(tmp_path):
+    r = subprocess.run([sys.executable, "-m", "gareus.adaptive.aux_discovery.validation", "write", "--out",
+                        str(tmp_path / "v.json"), "--commit", "abc", "--timestep-fs", "3.5", "--k3-max", "3.0",
+                        "--finite-timestep", "pass", "--npt", "pass", "--cost", "pass"], capture_output=True)
+    assert r.returncode != 0 and not (tmp_path / "v.json").exists()

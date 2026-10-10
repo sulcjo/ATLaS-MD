@@ -85,6 +85,9 @@ def main(argv=None) -> int:
                        help="non-empty evidence (log paths, result summaries) for this check; required for pass")
     w.add_argument("--evidence", nargs="*", default=[])
     a = p.parse_args(argv)
+    for name in REQUIRED_CHECKS:
+        if getattr(a, name) == "pass" and not any(str(e).strip() for e in getattr(a, f"{name}_evidence")):
+            p.error(f"--{name.replace('_', '-')} pass needs non-empty --{name.replace('_', '-')}-evidence")
     rec = {"schema": VALIDATION_SCHEMA, "code_commit": a.commit, "timestep_fs": a.timestep_fs,
            "k3_max_validated": a.k3_max, "checks": {n: {"status": getattr(a, n), "evidence": list(getattr(a, f"{n}_evidence"))}
                       for n in REQUIRED_CHECKS},

@@ -8825,13 +8825,16 @@ def continuation_parent_dirs(adaptive_dir, epoch_dir, segment_name: str, *, enab
 
 def _require_valid_aux_validation(adaptive_dir: Path, args) -> None:
     """F03: driver-start check of ``aux_validation.json`` with the admission hook's typed validator, so a
-    malformed record fails before MD. A missing record is allowed (admission then reports validation_missing)."""
+    malformed record fails before MD. Missing, failed-check and timestep-mismatch records are left to admission."""
     from .adaptive.aux_discovery.validation import check_validation_record  # noqa: PLC0415
     path = Path(adaptive_dir) / "aux_validation.json"
     if not path.exists():
         return
     val = check_validation_record(path, timestep_fs=float(args.timestep_fs))
-    if not val.ok:
+    # A clean failed check or a timestep mismatch is a non-admission (the hook refuses, campaign continues
+    # without workers); only a malformed record raises.
+    if not val.ok and not (val.reason == "validation_timestep_mismatch"
+                           or val.reason.startswith("validation_failed:")):
         raise RuntimeError(f"{path} is not a valid aux validation record: {val.reason}")
 
 

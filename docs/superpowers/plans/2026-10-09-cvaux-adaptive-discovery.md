@@ -1935,7 +1935,7 @@ git commit -m "feat(cvaux-adaptive): pairwise L1 torsion z3 search with prereg g
 **Interfaces:**
 - Produces:
   - `place_workers(z: np.ndarray, lab: np.ndarray, state_id: np.ndarray, lineage: np.ndarray[str], step: np.ndarray, is_train: np.ndarray[bool], is_heldout: np.ndarray[bool], s: AuxDiscoverySettings, *, k_labels: int, k3_max: Optional[float] = None) -> dict` with keys exactly as c10 `placement.json` (`doc`, `n_states`, `n_candidates`, `n_eligible`, `gates`, `skipped_states`, `selection_log`, `chosen`, `top20`, `all_candidates`); candidates above `k3_max` get `eligible: False` and `gates["k3_max"] = False`.
-  - `VALIDATION_SCHEMA = "atlas-aux-validation-v1"`, `ValidationStatus(ok: bool, reason: str, k3_max: Optional[float])`, `check_validation_record(path: Path, *, timestep_fs: float) -> ValidationStatus`, CLI `python -m gareus.adaptive.aux_discovery.validation write --out PATH --commit SHA --timestep-fs F --k3-max K --finite-timestep {pass,fail} --npt {pass,fail} --cost {pass,fail} --evidence PATH...`.
+  - `VALIDATION_SCHEMA = "atlas-aux-validation-v1"`, `ValidationStatus(ok: bool, reason: str, k3_max: Optional[float])`, `check_validation_record(path: Path, *, timestep_fs: float) -> ValidationStatus`, CLI `python -m gareus.adaptive.aux_discovery.validation write --out PATH --commit SHA --timestep-fs F --k3-max K --finite-timestep {pass,fail} --npt {pass,fail} --cost {pass,fail} --evidence PATH...`. (Format changed by F03: each check is `{status, evidence}`; the CLI takes `--<check> {pass,fail} --<check>-evidence ...`, evidence required for pass.)
 
 - [ ] **Step 1: Write the failing placement tests**
 
@@ -2031,8 +2031,8 @@ def test_failed_check_and_timestep_mismatch(tmp_path):
 def test_cli_write(tmp_path):
     out = tmp_path / "v.json"
     subprocess.run([sys.executable, "-m", "gareus.adaptive.aux_discovery.validation", "write", "--out", str(out),
-                    "--commit", "abc", "--timestep-fs", "3.5", "--k3-max", "3.0", "--finite-timestep", "pass",
-                    "--npt", "pass", "--cost", "pass"], check=True)
+                    "--commit", "abc", "--timestep-fs", "3.5", "--k3-max", "3.0", "--finite-timestep", "pass", "--finite-timestep-evidence", "a.log",
+                    "--npt", "pass", "--npt-evidence", "b.log", "--cost", "pass", "--cost-evidence", "c.log"], check=True)
     assert check_validation_record(out, timestep_fs=3.5).ok
 ```
 
