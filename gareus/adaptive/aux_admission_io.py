@@ -400,6 +400,16 @@ def _registry_worker_records(registry) -> List[dict]:
     return out
 
 
+def _same_worker(a: Mapping, b: Mapping) -> bool:
+    """Worker identity: parent state + aux centre + aux k (as ``_worker_key_matches``)."""
+    try:
+        return (int(a["parent_state_id"]) == int(b["parent_state_id"])
+                and abs(float(a["aux_center"]) - float(b["aux_center"])) < 1e-9
+                and abs(float(a["aux_k_kcal_mol"]) - float(b["aux_k_kcal_mol"])) < 1e-9)
+    except (KeyError, TypeError, ValueError):
+        return a == b
+
+
 def reconcile_admission_with_registry(adaptive_dir: Path, registry) -> dict:
     """Make ``aux_admission.json``'s worker list exactly the registry's workers (final fix wave C1).
 
@@ -438,7 +448,12 @@ def reconcile_admission_with_registry(adaptive_dir: Path, registry) -> dict:
     rewritten = dict(admission)
     rewritten["workers"] = kept + [{k: v for k, v in h.items() if k != "state_id"} for h in pool]
     if dropped:
-        rewritten["refused_workers"] = list(admission.get("refused_workers") or []) + dropped
+        # Dedupe by worker identity: a kill-replay reconciles the same refusal again.
+        refused_prev = list(admission.get("refused_workers") or [])
+        for w in dropped:
+            if not any(_same_worker(r, w) for r in refused_prev):
+                refused_prev.append(w)
+        rewritten["refused_workers"] = refused_prev
     try:
         _write_json(path, rewritten)
     except Exception as exc:

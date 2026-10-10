@@ -141,10 +141,11 @@ def resolve_aux_settings(adaptive_dir: Path, settings: AuxDiscoverySettings, *,
     return settings, rec
 
 
-def aux_discovery_incompatibilities(args, *, topups: bool = False) -> List[str]:
+def aux_discovery_incompatibilities(args, *, topups: bool = False, reserve_slots=None) -> List[str]:
     """Options aux discovery cannot run with (spec Section 11); [] = compatible. One source for the parse-time
     refusal (``gareus.cli``) and the driver-start re-check against a campaign's frozen policy (fix wave I4).
-    ``topups``: the effective top-up switch (frozen policy or this job's flag)."""
+    ``topups``: the effective top-up switch (frozen policy or this job's flag). ``reserve_slots``: the campaign's
+    frozen ``aux_reserve_slots`` on a resume (overrides this job's flag)."""
     bad = []
     window_mode = str(getattr(args, "window_mode", "") or "")
     if window_mode and window_mode != "adaptive-production":
@@ -167,7 +168,7 @@ def aux_discovery_incompatibilities(args, *, topups: bool = False) -> List[str]:
                    "one trajectory frame per sample)")
     elif exch <= 0 or exch % traj:
         bad.append("--ap-aux-discovery needs exchange_interval to be a multiple of traj_interval")
-    slots = getattr(args, "ap_aux_reserve_slots", None)
+    slots = reserve_slots if reserve_slots is not None else getattr(args, "ap_aux_reserve_slots", None)
     if slots is None:
         slots = getattr(args, "adaptive_production_aux_reserve_slots", 4)
     if int(slots) < 1:

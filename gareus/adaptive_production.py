@@ -8891,7 +8891,8 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
         from .adaptive.aux_discovery.settings import aux_discovery_incompatibilities  # noqa: PLC0415
         _aux_bad = aux_discovery_incompatibilities(
             args, topups=bool(getattr(policy, "topups_enabled", False))
-            or _arg_bool(args, "adaptive_production_topups", False))
+            or _arg_bool(args, "adaptive_production_topups", False),
+            reserve_slots=int(policy.aux_reserve_slots))
         if _aux_bad:
             raise RuntimeError("this campaign's frozen decision settings enable aux-CV discovery "
                                f"({adaptive_dir / 'decision_settings.json'}), but this job's options are "
