@@ -146,6 +146,7 @@ SMALL_CAMPAIGN_AUX_K3 = 1.0
 
 _SMALL_CAMPAIGN_PEP_GAMD = ["--run-mode", "gamd", "--gamd-boost-type", "pep-gamd-lower-dual",
                             "--gamd-cmd-steps", "100", "--equil-steps", "100", "--gamd-averaging-window", "50",
+                            "--gamd-cmd-prep-steps", "50", "--gamd-equil-prep-steps", "50",
                             "--gamd-multiwindow-recon-prep-steps", "1", "--gamd-multiwindow-recon-cmd-steps", "2",
                             "--gamd-multiwindow-recon-steps", "2", "--gamd-recon-boosted-iters", "1",
                             "--gamd-recon-boosted-tol", "0.05", "--gamd-multiwindow-recon-report-interval", "1"]

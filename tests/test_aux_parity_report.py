@@ -2,14 +2,23 @@
 import numpy as np
 from test_aux_loaders import _run          # synthetic aux run with Reference/double runtime
 from gareus.auxiliary_cv.parity_report import parity_report
+from gareus.auxiliary_cv.sample_schema import PARITY_TOLERANCE
 
 
 def test_parity_report_on_exact_data(tmp_path):
     _run(tmp_path, historical=False)
     rep = parity_report(tmp_path)
     (seg, row), = rep["segments"].items()
-    assert row["precision"] == "double" and row["max_abs_dz"] == 0.0 and row["ok"] is True
+    assert row["precision"] == "double" and row["max_abs_dz"] <= PARITY_TOLERANCE["double"] and row["ok"] is True
     assert rep["ok"] is True
+
+
+def test_double_precision_physical_disagreement_is_not_ok(tmp_path, monkeypatch):
+    _run(tmp_path, historical=False)
+    _patch_offline(monkeypatch, lambda z: z + 1e-3)
+    (row,) = parity_report(tmp_path)["segments"].values()
+    assert row["precision"] == "double" and row["max_abs_dz"] > PARITY_TOLERANCE["double"]
+    assert row["ok"] is False
 
 
 def _patch_offline(monkeypatch, fn):

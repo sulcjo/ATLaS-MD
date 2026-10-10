@@ -909,6 +909,10 @@ def _add_gamd_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--gamd-cmd-steps", type=int, default=250000,
                    help="GaMD CMD pre-equilibration steps for Vmax/Vmin statistics (longer → better calibration, lower anharmonicity).")
     p.add_argument("--gamd-averaging-window", type=int, default=5000)
+    p.add_argument("--gamd-cmd-prep-steps", type=int, default=5000,
+                   help="Unrecorded Pep-GaMD cMD preparation steps before the cMD statistics stage (ntcmdprep). Lower only for short test runs.")
+    p.add_argument("--gamd-equil-prep-steps", type=int, default=5000,
+                   help="Unrecorded Pep-GaMD boosted-equilibration preparation steps (ntebprep). Lower only for short test runs.")
     p.add_argument("--gamd-multiwindow-recon-prep-steps", type=int, default=2000,
                    help="Unrecorded relaxation steps per window before multi-window GaMD recon starts collecting statistics (applies to both the cMD seed and the boosted passes).")
     p.add_argument("--gamd-multiwindow-recon-cmd-steps", type=int, default=20000,
@@ -1885,9 +1889,9 @@ def _shim_gamd(args: argparse.Namespace) -> None:
     args.sigma0p_kcal_mol = args.sigma0p
     args.sigma0d_kcal_mol = args.sigma0d
     args.gamd_equil_steps = args.equil_steps
-    # Dropped GaMD prep steps
-    args.gamd_cmd_prep_steps = 5000
-    args.gamd_equil_prep_steps = 5000
+    # GaMD prep steps: CLI options (default 5000); a namespace built without the parser keeps 5000.
+    args.gamd_cmd_prep_steps = int(getattr(args, "gamd_cmd_prep_steps", 5000))
+    args.gamd_equil_prep_steps = int(getattr(args, "gamd_equil_prep_steps", 5000))
     # Dropped exchange tuning
     args.exchange_random_pairs = 0
     args.exchange_max_pairs_per_interval = 0

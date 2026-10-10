@@ -17,10 +17,31 @@ def _workers(states):
     return [s for s in states if (s.metadata or {}).get("aux")]
 
 
+def _assert_integrator_kind(run, pep_gamd):
+    """The campaign really ran Pep-GaMD (or plain cMD): read the recorded method settings of every phase."""
+    manifests = sorted(run.out.rglob("run_manifest.json"))
+    assert manifests
+    for path in manifests:
+        ms = json.loads(path.read_text()).get("method_settings") or {}
+        if "gamd_boost_type" not in ms:
+            continue
+        if pep_gamd:
+            assert ms["gamd_boost_type"] == "pep-gamd-lower-dual", path
+            assert ms["pep_gamd_envelope_path"], path
+        else:
+            assert not str(ms["gamd_boost_type"]).startswith("pep-gamd"), path
+            assert ms["pep_gamd_envelope_path"] is None, path
+    if pep_gamd:
+        assert list(run.out.rglob("shared_gamd_setup_globals.json")), "no Pep-GaMD envelope was calibrated"
+        assert any(json.loads(p.read_text()).get("method_settings", {}).get("gamd_boost_type")
+                   == "pep-gamd-lower-dual" for p in manifests), "no manifest records the Pep-GaMD boost type"
+
+
 @pytest.mark.parametrize("pep_gamd", [False, True], ids=["cmd", "pep-gamd"])
 def test_admission_through_epoch_loop_and_resume(tmp_path, small_adaptive_campaign, pep_gamd):
     run = small_adaptive_campaign(tmp_path, aux=True, pep_gamd=pep_gamd)
     ad = run.adaptive
+    _assert_integrator_kind(run, pep_gamd)
     assert run.discover_calls == [1]                                      # admitted once, never re-discovered
     adm = json.loads((ad / "aux_admission.json").read_text())
     assert adm["epoch"] == 1 and len(adm["workers"]) == 1
