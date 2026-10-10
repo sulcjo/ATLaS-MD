@@ -581,7 +581,7 @@ def _post_admission_spot_check(adaptive_dir: Path, epoch_dir: Path, epoch, phase
     if not event.get("ok"):
         what = (f"frame-derived z implies a worker energy error of {event['max_energy_err_kt']:.3g} kT "
                 f"(> {event['tol_kt']} kT) on {event['phase']}" if event.get("max_energy_err_kt") is not None
-                else f"{event.get('error') or event.get('errors')}")
+                else f"{event.get('error') or event.get('errors') or event.get('status')}")
         print(f"WARNING: aux z spot check failed ({what}): pooling of this campaign is refused")
 
 

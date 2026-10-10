@@ -250,20 +250,34 @@ R_KCAL_MOL_K = 0.0019872041
 def worker_energy_error_kt(z_recorded, z_frame, workers, *, temperature_k: float = 300.0) -> List[dict]:
     """Per worker (c3, k3 kcal/mol per z^2): the largest error the frame-derived z would make in the worker's
     restraint energy, 0.5 k3 |(z1 - c3)^2 - (z2 - c3)^2| / RT, over the samples within 2 sigma_w of c3
-    (sigma_w = sqrt(RT / k3); either z). The pooled bias only matters where the worker samples, so that is
-    where the tolerance is judged (final fix wave I3: z units carry no physical scale)."""
+    (sigma_w = sqrt(RT / k3); either z). Also report errors over ALL joined frames.
+    The near-worker verdict is a heuristic, not an error bound for pooled MBAR.
+    No near-worker frames means unavailable evidence, never zero error."""
+    if isinstance(temperature_k, (bool, np.bool_)) or not np.isfinite(temperature_k) or temperature_k <= 0:
+        raise ValueError('temperature_k must be finite and positive')
     RT = R_KCAL_MOL_K * float(temperature_k)
     z1 = np.asarray(z_recorded, dtype=np.float64)
     z2 = np.asarray(z_frame, dtype=np.float64)
+    if z1.ndim != 1 or z1.shape != z2.shape or not z1.size or not np.isfinite(z1).all() or not np.isfinite(z2).all():
+        raise ValueError('reconstruction check needs matching nonempty finite 1D z arrays')
     out = []
     for c3, k3 in workers:
+        if isinstance(c3, (bool, np.bool_)) or isinstance(k3, (bool, np.bool_)):
+            raise ValueError('worker centre/strength must be real numbers, not booleans')
         c3, k3 = float(c3), float(k3)
+        if not np.isfinite(c3) or not np.isfinite(k3) or k3 < 0:
+            raise ValueError('worker centre/strength must be finite and strength nonnegative')
         sw = float(np.sqrt(RT / k3)) if k3 > 0 else float("inf")
         near = (np.abs(z1 - c3) <= 2.0 * sw) | (np.abs(z2 - c3) <= 2.0 * sw)
-        de = 0.5 * k3 * np.abs((z1 - c3) ** 2 - (z2 - c3) ** 2) / RT
+        de = (0.5 * k3 * np.abs((z1 - c3) ** 2 - (z2 - c3) ** 2) / RT
+              if k3 else np.zeros_like(z1))
+        if not np.isfinite(de).all():
+            raise ValueError('nonfinite reconstructed worker energy discrepancy')
         out.append({"aux_center": c3, "aux_k_kcal_mol": k3, "sigma_w": sw, "n_within_2sigma": int(near.sum()),
+                    "n_compared": int(z1.size), "status": "ok" if near.any() else "insufficient_worker_coverage",
+                    "max_energy_err_kt_all": float(de.max()),
                     "max_abs_dz_within": float(np.abs(z1 - z2)[near].max()) if near.any() else None,
-                    "max_energy_err_kt": float(de[near].max()) if near.any() else 0.0})
+                    "max_energy_err_kt": float(de[near].max()) if near.any() else None})
     return out
 
 
@@ -293,10 +307,14 @@ def check_backfill_against_recorded(phase_dir: Path, model, *, tol: float = 0.05
     if workers:
         per = worker_energy_error_kt(joined["aux_z_00"].to_numpy(np.float64), joined["aux_z"].to_numpy(np.float64),
                                      workers, temperature_k=temperature_k)
-        err = max(p["max_energy_err_kt"] for p in per)
-        ok = bool(np.isfinite(err) and err <= float(tol_kt))
-        out.update(per_worker=per, max_energy_err_kt=float(err), tol_kt=float(tol_kt), temperature_k=float(temperature_k))
-        what = f"implies a worker energy error of {err:.3g} kT (> {tol_kt} kT)"
+        covered = all(p['status'] == 'ok' for p in per)
+        err = max(p["max_energy_err_kt"] for p in per) if covered else None
+        ok = bool(covered and np.isfinite(err) and err <= float(tol_kt))
+        out.update(per_worker=per, max_energy_err_kt=err, tol_kt=float(tol_kt), temperature_k=float(temperature_k),
+                   max_energy_err_kt_all=max(p['max_energy_err_kt_all'] for p in per),
+                   status='ok' if ok else ('insufficient_worker_coverage' if not covered else 'energy_mismatch'))
+        what = (f"implies a worker energy error of {err:.3g} kT (> {tol_kt} kT)" if covered
+                else 'has insufficient_worker_coverage for the reconstruction check')
     else:
         ok = dev <= tol
         what = f"differs from z_from_positions by {dev:.3g} (> {tol})"
