@@ -222,7 +222,7 @@ class ParquetExchangeWriter:
 
     def write_event(self, *, step, attempt_seq, selected_replica, replica_i, replica_j, window_i, window_j,
                     kind, delta_e_kj, accepted, log_q_forward, log_q_reverse, p_accept, energy_version,
-                    assignments_after) -> None:
+                    assignments_after, log_p_accept=float("nan"), proposal_algorithm=None) -> None:
         from .auxiliary_cv.ledger import EVENT_KINDS, assignment_sha256
         if self._event_schema is None:
             raise ValueError("write_event needs a writer constructed with event_schema")
@@ -242,7 +242,9 @@ class ParquetExchangeWriter:
             "accepted": bool(accepted), "attempt_seq": int(attempt_seq),
             "selected_replica": int(selected_replica), "kind": kind, "delta_e_kj": delta,
             "log_q_forward": float(log_q_forward), "log_q_reverse": float(log_q_reverse),
-            "p_accept": float(p_accept), "energy_version": energy_version,
+            "p_accept": float(p_accept), "log_p_accept": float(log_p_accept),
+            "proposal_algorithm": None if proposal_algorithm is None else str(proposal_algorithm),
+            "energy_version": energy_version,
             "assignment_sha256_after": assignment_sha256(assignments_after),
         }
         b = self._buf
@@ -299,6 +301,8 @@ class ParquetExchangeWriter:
                 "log_q_forward": pa.array(b["log_q_forward"], type=pa.float64()),
                 "log_q_reverse": pa.array(b["log_q_reverse"], type=pa.float64()),
                 "p_accept": pa.array(b["p_accept"], type=pa.float64()),
+                "log_p_accept": pa.array(b["log_p_accept"], type=pa.float64()),
+                "proposal_algorithm": pa.array(b["proposal_algorithm"], type=pa.string()),
                 "energy_version": pa.array(b["energy_version"], type=pa.string()),
                 "assignment_sha256_after": pa.array(b["assignment_sha256_after"], type=pa.string()),
             }

@@ -1226,6 +1226,90 @@ def _gibbs_mh_acceptance_probability(
     return float(math.exp(log_alpha))
 
 
+#: The pre-F09 Gibbs proposal: weights clipped to +-745 and exponentiated, MH on rounded probabilities
+#: (a reverse q that underflows to 0 rejects the move). Legacy gibbs-walk runs keep it byte-identically.
+GIBBS_PROPOSAL_ALGORITHM_LEGACY = "gibbs_softmax_clipped_v1"
+#: Log-space softmax proposal + log-space MH (repair finding F09); used only when an auxiliary CV is active.
+GIBBS_PROPOSAL_ALGORITHM_V2 = "gibbs_softmax_log_v2"
+
+
+def _gibbs_log_proposal_distribution_v2(
+    beta: float,
+    bias_matrix_kj: np.ndarray,
+    replica_index: int,
+    current_window: int,
+    replica_of_window: np.ndarray,
+) -> dict[str, np.ndarray]:
+    """``gibbs_softmax_log_v2`` heat-bath proposal: ``log q = -beta*delta - logsumexp(-beta*delta)``.
+
+    No clipping and no candidate masking: every reduced energy the proposal reads (the held
+    windows x their holders block of ``beta * bias``) must be finite, else ``ValueError`` naming the
+    window, replica and value. ``probabilities`` = exp(log q) is only for the sampler API.
+    """
+    rep = int(replica_index)
+    wi = int(current_window)
+    beta_val = float(beta)
+    if not math.isfinite(beta_val):
+        raise ValueError(f"{GIBBS_PROPOSAL_ALGORITHM_V2}: non-finite beta {beta_val!r}")
+    holders = np.asarray(replica_of_window, dtype=np.int64)
+    all_windows = np.arange(holders.size, dtype=np.int32)
+    valid_mask = holders >= 0
+    valid_windows = all_windows[valid_mask]
+    target_reps = holders[valid_mask]
+    if valid_windows.size <= 0:
+        empty = np.asarray([], dtype=np.float64)
+        return {"windows": np.asarray([], dtype=np.int32), "target_replicas": np.asarray([], dtype=np.int64),
+                "deltas_kj": empty, "log_probabilities": empty, "probabilities": empty}
+    bias = np.asarray(bias_matrix_kj, dtype=np.float64)
+    block = beta_val * bias[np.ix_(valid_windows, target_reps)]
+    bad = np.argwhere(~np.isfinite(block))
+    if bad.size:
+        w, r = int(valid_windows[bad[0, 0]]), int(target_reps[bad[0, 1]])
+        raise ValueError(f"{GIBBS_PROPOSAL_ALGORITHM_V2}: non-finite reduced energy beta*bias[window {w}, "
+                         f"replica {r}] = {float(beta_val * bias[w, r])!r} ({bad.shape[0]} non-finite entries "
+                         f"in the held block; proposing replica {rep} at window {wi})")
+    old_e = bias[wi, rep] + bias[valid_windows, target_reps]
+    new_e = bias[valid_windows, rep] + bias[wi, target_reps]
+    delta = np.asarray(new_e - old_e, dtype=np.float64)
+    stay_idx = np.where(valid_windows == wi)[0]
+    if stay_idx.size:
+        delta[int(stay_idx[0])] = 0.0
+    log_w = -beta_val * delta
+    if not np.all(np.isfinite(log_w)):
+        raise ValueError(f"{GIBBS_PROPOSAL_ALGORITHM_V2}: non-finite -beta*delta for replica {rep} at window "
+                         f"{wi} (energy differences overflow)")
+    m = float(np.max(log_w))
+    log_q = log_w - (m + math.log(float(np.sum(np.exp(log_w - m)))))
+    return {
+        "windows": valid_windows.astype(np.int32, copy=False),
+        "target_replicas": target_reps.astype(np.int64, copy=False),
+        "deltas_kj": delta,
+        "log_probabilities": log_q,
+        "probabilities": np.exp(log_q),
+    }
+
+
+def _gibbs_log_mh_acceptance_v2(delta_kj: float, beta: float, log_q_forward: float, log_q_reverse: float) -> float:
+    """``log alpha = min(0, -beta*dU + log q_rev - log q_fwd)``; every input must be finite."""
+    vals = (float(delta_kj), float(beta), float(log_q_forward), float(log_q_reverse))
+    if not all(math.isfinite(v) for v in vals):
+        raise ValueError(f"{GIBBS_PROPOSAL_ALGORITHM_V2}: non-finite MH input (delta, beta, log_q_fwd, "
+                         f"log_q_rev) = {vals!r}")
+    delta, beta_val, lqf, lqr = vals
+    return min(0.0, -beta_val * delta + lqr - lqf)
+
+
+def gibbs_log_accept_decision(log_p_accept: float, uniform: float) -> bool:
+    """One uniform ``u`` in [0, 1) decides: accept iff ``log(u) < log_p_accept``; ``u == 0`` accepts."""
+    u = float(uniform)
+    lpa = float(log_p_accept)
+    if not (math.isfinite(u) and 0.0 <= u < 1.0) or math.isnan(lpa):
+        raise ValueError(f"{GIBBS_PROPOSAL_ALGORITHM_V2}: bad accept inputs (uniform {u!r}, log_p_accept {lpa!r})")
+    if u == 0.0:
+        return True
+    return math.log(u) < lpa
+
+
 def _exchange_probability(delta_kj: float, beta: float) -> float:
     """Metropolis probability for a proposed umbrella-window swap.
 
@@ -1294,6 +1378,7 @@ def apply_window_swap(
     *,
     p_override: Optional[float] = None,
     force_accept: bool = False,
+    log_p_accept: Optional[float] = None,
 ) -> "Optional[SwapOutcome]":
     """Decide and apply one umbrella-window swap; the pure core of the REUS move.
 
@@ -1317,6 +1402,9 @@ def apply_window_swap(
     than an rng handle so that the kernel is deterministic under test, and so
     the caller can preserve production's short-circuit: ``force_accept`` must
     not consume a random number, or every downstream RNG stream shifts.
+
+    ``log_p_accept`` (aux gibbs-walk only, ``gibbs_softmax_log_v2``) replaces the linear ``uniform < pacc``
+    test by :func:`gibbs_log_accept_decision` on the same single uniform; ``pacc`` is then exp(log_p_accept).
     """
     pair = swap_candidate_replicas(replica_of_window, wi, wj)
     if pair is None:
@@ -1328,12 +1416,19 @@ def apply_window_swap(
     old_e = float(bias_matrix_kj[wi, i] + bias_matrix_kj[wj, j])
     new_e = float(bias_matrix_kj[wj, i] + bias_matrix_kj[wi, j])
     delta = float(new_e - old_e)
-    pacc = float(p_override) if p_override is not None else _exchange_probability(delta, beta)
-    pacc = max(0.0, min(1.0, pacc)) if math.isfinite(pacc) else 0.0
-    if force_accept:
-        accepted = True
+    if log_p_accept is not None:
+        # gibbs_softmax_log_v2 (aux runs): the decision is made in log space on the one drawn uniform.
+        if force_accept or uniform is None:
+            raise ValueError("log_p_accept needs a drawn uniform and no force_accept")
+        pacc = math.exp(min(0.0, float(log_p_accept)))
+        accepted = gibbs_log_accept_decision(float(log_p_accept), float(uniform))
     else:
-        accepted = bool(float(uniform) < pacc) if uniform is not None else False
+        pacc = float(p_override) if p_override is not None else _exchange_probability(delta, beta)
+        pacc = max(0.0, min(1.0, pacc)) if math.isfinite(pacc) else 0.0
+        if force_accept:
+            accepted = True
+        else:
+            accepted = bool(float(uniform) < pacc) if uniform is not None else False
     if accepted:
         assignments[i], assignments[j] = assignments[j], assignments[i]
         replica_of_window[int(assignments[i])] = int(i)
@@ -1356,6 +1451,11 @@ class GibbsProposal(NamedTuple):
     pacc: float
     stayed: bool          # the proposal selected the current window
     no_candidates: bool   # every candidate was NaN-masked out
+    # gibbs_softmax_log_v2 only (authoritative logs; NaN on the legacy algorithm and where not applicable):
+    log_q_forward: float = float("nan")
+    log_q_reverse: float = float("nan")
+    log_p_accept: float = float("nan")
+    proposal_algorithm: str = GIBBS_PROPOSAL_ALGORITHM_LEGACY
 
 
 def gibbs_propose_one_replica(
@@ -1428,6 +1528,54 @@ def gibbs_propose_one_replica(
     return GibbsProposal(
         wi, wj, float(deltas[choice_index]), q_forward, q_reverse, float(pacc), False, False
     )
+
+
+def gibbs_propose_one_replica_v2(
+    bias_matrix_kj,
+    beta: float,
+    assignments,
+    replica_of_window,
+    replica_index: int,
+    choose,
+) -> "GibbsProposal":
+    """``gibbs_softmax_log_v2`` twin of :func:`gibbs_propose_one_replica` (auxiliary runs only, F09).
+
+    Same steps and the same single ``choose`` draw; log-probabilities are kept through selection, the
+    reverse proposal (against the hypothetical post-swap holder table) and MH, so a reverse q whose
+    exponential underflows still gives the correct finite acceptance. ``pacc`` = exp(log_p_accept) is
+    informational; the swap decision is :func:`gibbs_log_accept_decision` on ``log_p_accept``.
+    """
+    v2 = GIBBS_PROPOSAL_ALGORITHM_V2
+    nan = float("nan")
+    rep = int(replica_index)
+    wi = int(assignments[rep])
+    proposal = _gibbs_log_proposal_distribution_v2(float(beta), bias_matrix_kj, rep, wi, replica_of_window)
+    valid_windows = proposal["windows"]
+    if valid_windows.size <= 0:
+        return GibbsProposal(wi, wi, 0.0, 0.0, 0.0, 0.0, False, True, nan, nan, nan, v2)
+    choice_index = int(choose(int(valid_windows.size), proposal["probabilities"]))
+    wj = int(valid_windows[choice_index])
+    log_q_forward = float(proposal["log_probabilities"][choice_index])
+    q_forward = math.exp(log_q_forward)
+    if wj == wi:
+        return GibbsProposal(wi, wi, 0.0, q_forward, 0.0, 0.0, True, False, log_q_forward, nan, nan, v2)
+    holders_after = np.asarray(replica_of_window).astype(np.int64, copy=True)
+    holders_after[wi] = int(holders_after[wj])
+    holders_after[wj] = rep
+    reverse = _gibbs_log_proposal_distribution_v2(float(beta), bias_matrix_kj, rep, wj, holders_after)
+    rev_idx = np.where(reverse["windows"] == wi)[0]
+    if not rev_idx.size:
+        raise ValueError(f"{v2}: window {wi} missing from the reverse proposal of replica {rep} at window {wj}")
+    log_q_reverse = float(reverse["log_probabilities"][int(rev_idx[0])])
+    delta = float(proposal["deltas_kj"][choice_index])
+    log_p_accept = _gibbs_log_mh_acceptance_v2(delta, float(beta), log_q_forward, log_q_reverse)
+    return GibbsProposal(wi, wj, delta, q_forward, math.exp(log_q_reverse), math.exp(log_p_accept), False, False,
+                         log_q_forward, log_q_reverse, log_p_accept, v2)
+
+
+def select_gibbs_proposer(*, aux_active: bool):
+    """The gibbs-walk proposer: log-space v2 with an auxiliary CV active, else the unchanged legacy one."""
+    return gibbs_propose_one_replica_v2 if aux_active else gibbs_propose_one_replica
 
 
 
@@ -8749,7 +8897,7 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
             rep = int(replica_of_window[w])
             return rep if rep >= 0 else None
 
-        def _attempt_window_swap(wi: int, wj: int, primary_values: np.ndarray, bias_matrix_kj: np.ndarray, absolute_step: int, attempt: int, p_override: Optional[float] = None, force_accept: bool = False, aux_event: Optional[dict] = None) -> int:
+        def _attempt_window_swap(wi: int, wj: int, primary_values: np.ndarray, bias_matrix_kj: np.ndarray, absolute_step: int, attempt: int, p_override: Optional[float] = None, force_accept: bool = False, aux_event: Optional[dict] = None, log_p_accept: Optional[float] = None) -> int:
             """Attempt/apply a swap between two umbrella windows using vectorized bias energies."""
             def _aux_write_skip():
                 # A Gibbs move the swap kernel declined (no holder / no outcome) is still one ledger event.
@@ -8761,7 +8909,8 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                         replica_i=int(aux_event["selected_replica"]), replica_j=int(aux_event["selected_replica"]),
                         window_i=int(wi), window_j=int(wi), kind="skip", delta_e_kj=0.0, accepted=False,
                         log_q_forward=aux_event["log_q_forward"], log_q_reverse=aux_event["log_q_reverse"],
-                        p_accept=aux_event["p_accept"], energy_version=_aux_io.energy_version,
+                        p_accept=aux_event["p_accept"], log_p_accept=aux_event["log_p_accept"],
+                        proposal_algorithm=aux_event["proposal_algorithm"], energy_version=_aux_io.energy_version,
                         assignments_after=list(assignments))
 
             wi = int(wi)
@@ -8783,6 +8932,7 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                 bias_matrix_kj, beta, assignments, replica_of_window, wi, wj,
                 None if force_accept else rng.random(),
                 p_override=p_override, force_accept=force_accept,
+                log_p_accept=log_p_accept,
             )
             if outcome is None:
                 _aux_write_skip()
@@ -8805,14 +8955,17 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                     _sim_pool.submit(j, _apply_swap_to_replica, j).result()
                 observable_cache.clear()
             if _aux_io is not None:
+                # Pair modes pass no aux_event: no proposal logs, and no Gibbs proposal algorithm (null).
                 _f = aux_event or {"selected_replica": i, "log_q_forward": float("nan"),
-                                   "log_q_reverse": float("nan"), "p_accept": float("nan")}
+                                   "log_q_reverse": float("nan"), "p_accept": float("nan"),
+                                   "log_p_accept": float("nan"), "proposal_algorithm": None}
                 parquet_exchange_writer.write_event(
                     step=int(absolute_step), attempt_seq=_exchange_seq.next(int(absolute_step)),
                     selected_replica=int(_f["selected_replica"]), replica_i=int(i), replica_j=int(j),
                     window_i=int(wi), window_j=int(wj), kind="swap", delta_e_kj=float(outcome.delta_kj),
                     accepted=bool(outcome.accepted), log_q_forward=_f["log_q_forward"],
-                    log_q_reverse=_f["log_q_reverse"], p_accept=_f["p_accept"],
+                    log_q_reverse=_f["log_q_reverse"], p_accept=_f["p_accept"], log_p_accept=_f["log_p_accept"],
+                    proposal_algorithm=_f["proposal_algorithm"],
                     energy_version=_aux_io.energy_version, assignments_after=list(assignments))
             else:
                 parquet_exchange_writer.write_exchange(
@@ -8987,9 +9140,12 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                 limit = int(getattr(args, "exchange_max_pairs_per_interval", 0) or 0)
                 if limit > 0:
                     order = order[:limit]
+                # Aux runs use the log-space gibbs_softmax_log_v2 proposal + MH (F09); legacy
+                # runs keep the clipped algorithm and its RNG draw order byte-identically.
+                _gibbs_propose = select_gibbs_proposer(aux_active=_aux_io is not None)
                 for rep in order:
                     rep = int(rep)
-                    prop = gibbs_propose_one_replica(
+                    prop = _gibbs_propose(
                         bias_matrix_kj, float(beta), assignments, replica_of_window,
                         rep, lambda k, p: int(rng.choice(k, p=p)),
                     )
@@ -9025,6 +9181,7 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                         prop.current_window, prop.proposed_window, primary_values,
                         bias_matrix_kj, absolute_step, attempt, p_override=prop.pacc,
                         aux_event=_gibbs_aux_event,
+                        log_p_accept=prop.log_p_accept if _aux_io is not None else None,
                     )
                 parquet_exchange_writer.flush() if bool(getattr(args, "flush_every_log", True)) else None
                 return parity, attempt

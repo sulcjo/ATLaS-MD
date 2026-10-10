@@ -7,7 +7,13 @@ import numpy as np
 
 from ..correctness._io import IntegrityError, digest, json_bytes
 
-EXCHANGE_EVENT_SCHEMA = "atlas-exchange-events-v1"
+#: v2 (F09) adds ``log_p_accept`` and ``proposal_algorithm``. A v1 segment directory is never appended to
+#: (the writer refuses a payload-schema change); v1 segments still load, their rows read as the legacy algorithm.
+EXCHANGE_EVENT_SCHEMA = "atlas-exchange-events-v2"
+#: Gibbs proposal algorithm of a record without ``proposal_algorithm`` (written before F09): clipped weights,
+#: logs of rounded probabilities, -inf where a probability underflowed (the true log q is not recoverable).
+LEGACY_PROPOSAL_ALGORITHM = "gibbs_softmax_clipped_v1"
+LOG_SPACE_PROPOSAL_ALGORITHM = "gibbs_softmax_log_v2"
 #: skip = a proposal the swap kernel declined to attempt (no holder / no outcome).
 EVENT_KINDS = ("swap", "stay", "no_candidates", "skip")
 
@@ -124,3 +130,46 @@ def refuse_duplicate_event_keys(events: Mapping[str, np.ndarray]) -> None:
                              f"attempt_seq {int(keys[dup[0], 1])} in segment(s) {_segments_of(events, (a, b))}; "
                              "two segments record the same exchange decision (a pooled crashed parent and its "
                              "restarted child?) -- repair the segment registry before resuming or pooling")
+
+
+def _str_column(events, name, n):
+    if name not in events:
+        return np.full(n, None, dtype=object)
+    value = events[name]
+    mask = np.ma.getmaskarray(value) if np.ma.isMaskedArray(value) else np.zeros(n, dtype=bool)
+    data = np.asarray(np.ma.getdata(value), dtype=object)
+    return np.array([None if (m or x is None or (isinstance(x, float) and x != x)) else str(x)
+                     for x, m in zip(data, mask)], dtype=object)
+
+
+def _float_column(events, name, n):
+    if name not in events:
+        return np.full(n, np.nan)
+    value = events[name]
+    if np.ma.isMaskedArray(value):
+        return np.ma.filled(value.astype(np.float64), np.nan)
+    return np.asarray(value, dtype=np.float64)
+
+
+def proposal_logs(events: Mapping[str, np.ndarray]) -> dict[str, np.ndarray]:
+    """Per-row proposal algorithm and the log q / log alpha a reader may rely on (F09).
+
+    A row without ``proposal_algorithm`` (v1 ledger, or a null in a v2 one written by a Gibbs move)
+    is the legacy algorithm, unless it carries no proposal at all (pair modes: NaN log q's), which
+    stays ``None``. A legacy row's -inf log q / log alpha means a rounded probability underflowed, not
+    that the probability was zero: it becomes NaN (unrecoverable), never a finite or -inf claim.
+    Legacy rows never recorded ``log_p_accept``: NaN.
+    """
+    n = len(np.asarray(np.ma.getdata(events["step"]))) if "step" in events else 0
+    algorithm = _str_column(events, "proposal_algorithm", n)
+    lqf = _float_column(events, "log_q_forward", n)
+    lqr = _float_column(events, "log_q_reverse", n)
+    lpa = _float_column(events, "log_p_accept", n)
+    unknown = np.array([a is None for a in algorithm], dtype=bool)
+    has_proposal = ~(np.isnan(lqf) & np.isnan(lqr))
+    algorithm[unknown & has_proposal] = LEGACY_PROPOSAL_ALGORITHM
+    legacy = np.array([a == LEGACY_PROPOSAL_ALGORITHM for a in algorithm], dtype=bool)
+    for arr in (lqf, lqr):
+        arr[legacy & np.isneginf(arr)] = np.nan
+    lpa[legacy] = np.nan
+    return {"proposal_algorithm": algorithm, "log_q_forward": lqf, "log_q_reverse": lqr, "log_p_accept": lpa}

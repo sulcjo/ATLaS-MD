@@ -135,7 +135,10 @@ def test_event_rows_round_trip(tmp_path):
     t = pq.read_table(tmp_path / "data.parquet")
     assert t.column_names == LEGACY_EXCHANGE_COLUMNS + [
         "attempt_seq", "selected_replica", "kind", "delta_e_kj", "log_q_forward", "log_q_reverse",
-        "p_accept", "energy_version", "assignment_sha256_after"]
+        "p_accept", "log_p_accept", "proposal_algorithm", "energy_version", "assignment_sha256_after"]
+    # atlas-exchange-events-v2 (F09): a call without the new keywords records NaN / null
+    assert np.isnan(t.column("log_p_accept").to_pylist()).all()
+    assert t.column("proposal_algorithm").to_pylist() == [None, None]
     assert t.column("attempt_seq").to_pylist() == [0, 1] and t.column("kind").to_pylist() == ["swap", "skip"]
     assert t.column("assignment_sha256_after").to_pylist()[0] == assignment_sha256([1, 0, 2])
     assert load_manifest(tmp_path)["payload_schema"] == {"schema": EXCHANGE_EVENT_SCHEMA}

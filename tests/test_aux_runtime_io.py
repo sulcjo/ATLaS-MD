@@ -31,20 +31,49 @@ def test_counter_orders_within_step():
     assert [c.next(10), c.next(10), c.next(20), c.next(20), c.next(20)] == [0, 1, 0, 1, 2]
 
 
-def test_event_from_gibbs_stay_and_no_candidates_and_zero_q():
+_NAN = float("nan")
+
+
+def test_event_from_gibbs_stay_and_no_candidates_and_underflowed_q():
+    # F09 contract change: aux events take the proposal's own gibbs_softmax_log_v2 logs, never log(rounded q).
+    v2 = "gibbs_softmax_log_v2"
     stay = SimpleNamespace(current_window=2, proposed_window=2, delta_kj=0.0, q_forward=0.6, q_reverse=0.0,
-                           pacc=0.0, stayed=True, no_candidates=False)
+                           pacc=0.0, stayed=True, no_candidates=False, log_q_forward=math.log(0.6),
+                           log_q_reverse=_NAN, log_p_accept=_NAN, proposal_algorithm=v2)
     ev = event_from_gibbs(stay, step=100, seq=4, selected_replica=7, accepted=False, energy_version="v",
                           assignments_after=[0, 1])
-    assert ev["kind"] == "stay" and ev["replica_i"] == ev["replica_j"] == 7 and ev["log_q_reverse"] == float("-inf")
+    assert ev["kind"] == "stay" and ev["replica_i"] == ev["replica_j"] == 7 and math.isnan(ev["log_q_reverse"])
+    assert ev["proposal_algorithm"] == v2 and math.isnan(ev["p_accept"])
     none = SimpleNamespace(current_window=2, proposed_window=2, delta_kj=0.0, q_forward=0.0, q_reverse=0.0,
-                           pacc=0.0, stayed=False, no_candidates=True)
+                           pacc=0.0, stayed=False, no_candidates=True, log_q_forward=_NAN, log_q_reverse=_NAN,
+                           log_p_accept=_NAN, proposal_algorithm=v2)
     assert event_from_gibbs(none, step=1, seq=0, selected_replica=7, accepted=False, energy_version="v",
                             assignments_after=[0])["kind"] == "no_candidates"
-    move = SimpleNamespace(q_forward=0.25, q_reverse=0.0, pacc=0.4)
+    # q_reverse underflowed to 0.0, yet the ledger gets the finite log
+    move = SimpleNamespace(q_forward=0.25, q_reverse=0.0, pacc=0.4, log_q_forward=math.log(0.25),
+                           log_q_reverse=-1001.3, log_p_accept=math.log(0.4), proposal_algorithm=v2)
     f = aux_event_fields(move)
-    assert f["log_q_forward"] == pytest.approx(math.log(0.25)) and f["log_q_reverse"] == float("-inf")
-    assert f["p_accept"] == 0.4
+    assert f["log_q_forward"] == pytest.approx(math.log(0.25)) and f["log_q_reverse"] == -1001.3
+    assert f["p_accept"] == pytest.approx(0.4) and f["log_p_accept"] == pytest.approx(math.log(0.4))
+
+
+def test_aux_event_fields_refuses_a_legacy_proposal():
+    legacy = SimpleNamespace(q_forward=0.25, q_reverse=0.0, pacc=0.4)
+    with pytest.raises(ValueError, match="gibbs_softmax_log_v2"):
+        aux_event_fields(legacy)
+
+
+def test_aux_event_fields_round_trips_a_production_v2_proposal():
+    from gareus.auxiliary_cv.runtime_io import GIBBS_PROPOSAL_ALGORITHM_V2 as io_v2
+    from gareus.production import GIBBS_PROPOSAL_ALGORITHM_V2, select_gibbs_proposer
+    assert io_v2 == GIBBS_PROPOSAL_ALGORITHM_V2
+    c = np.array([math.sqrt(10.0), 0.0, 0.1])
+    z = np.array([0.0, math.sqrt(10.0), -0.1])
+    bias = 50.0 * (c[:, None] - z[None, :]) ** 2
+    prop = select_gibbs_proposer(aux_active=True)(bias, 1.0, np.arange(3), np.arange(3), 0, lambda k, p: 1)
+    f = aux_event_fields(prop)
+    assert prop.q_reverse == 0.0 and math.isfinite(f["log_q_reverse"]) and f["log_q_reverse"] == prop.log_q_reverse
+    assert f["log_p_accept"] == prop.log_p_accept and f["p_accept"] == pytest.approx(1.0 / (1.0 + math.e), rel=1e-9)
 
 
 def test_runtime_parity():

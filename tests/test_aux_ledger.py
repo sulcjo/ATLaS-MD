@@ -186,3 +186,70 @@ def test_replay_orders_same_step_swaps_by_attempt_seq_regardless_of_row_order(tm
     rev = {k: v[::-1] for k, v in ev.items() if hasattr(v, "__len__") and len(v) == n}
     assert int(np.asarray(rev["step"])[0]) == 300
     assert replay_assignments(rev, [0, 1, 2], after_step=0, up_to_step=200) == [1, 2, 0]
+
+
+# ── F09: proposal algorithm + authoritative logs; old (v1) records load as the legacy algorithm ──────────
+
+def _write_v1_segment(seg_dir, rows):
+    """A pre-F09 event chunk: no log_p_accept / proposal_algorithm columns (what v1 writers produced)."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    from gareus.parquet_manifest import append_file_to_manifest, file_record
+    seg_dir.mkdir(parents=True)
+    cols = {k: [r[k] for r in rows] for k in rows[0]}
+    types = {"step": pa.uint64(), "replica_i": pa.uint16(), "replica_j": pa.uint16(), "window_i": pa.uint16(),
+             "window_j": pa.uint16(), "delta_e": pa.float32(), "accepted": pa.bool_(), "attempt_seq": pa.uint32(),
+             "selected_replica": pa.int32(), "kind": pa.string(), "delta_e_kj": pa.float64(),
+             "log_q_forward": pa.float64(), "log_q_reverse": pa.float64(), "p_accept": pa.float64(),
+             "energy_version": pa.string(), "assignment_sha256_after": pa.string()}
+    tbl = pa.table({k: pa.array(cols[k], type=types[k]) for k in types})
+    path = seg_dir / "chunk_000001.parquet"
+    pq.write_table(tbl, path)
+    append_file_to_manifest(seg_dir, kind="exchanges", record=file_record(path, rows=tbl.num_rows,
+                            first_step=min(cols["step"]), last_step=max(cols["step"])),
+                            next_chunk_index=2, payload_schema={"schema": "atlas-exchange-events-v1"})
+
+
+def test_old_and_new_ledger_records_load_together(tmp_path):
+    from gareus.auxiliary_cv.ledger import LEGACY_PROPOSAL_ALGORITHM, proposal_logs
+    from gareus.query import load_exchanges
+    from gareus.store import SegmentRegistry
+    reg = SegmentRegistry(tmp_path)
+    a = reg.open_segment("run", None, 1)
+    old_row = dict(step=100, replica_i=0, replica_j=1, window_i=0, window_j=1, delta_e=0.0, accepted=False,
+                   attempt_seq=0, selected_replica=0, kind="swap", delta_e_kj=-1000.0, log_q_forward=0.0,
+                   log_q_reverse=float("-inf"), p_accept=0.0, energy_version="v3",
+                   assignment_sha256_after=assignment_sha256([0, 1, 2]))
+    _write_v1_segment(tmp_path / "exchanges" / a, [old_row])
+    reg.close_segment(a, 100)
+    b = reg.open_segment("run", a, 1)
+    w = _writer(tmp_path, b)
+    w.write_event(step=200, attempt_seq=0, selected_replica=0, replica_i=0, replica_j=1, window_i=0, window_j=1,
+                  kind="swap", delta_e_kj=-1000.0, accepted=True, log_q_forward=0.0, log_q_reverse=-1001.3132616875,
+                  p_accept=0.2689414213699951, log_p_accept=-1.3132616875182228,
+                  proposal_algorithm="gibbs_softmax_log_v2", energy_version="v3", assignments_after=[1, 0, 2])
+    _quiet(w, 300, 0, 2, 2, [1, 0, 2])                      # a writer call without the new keywords
+    w.flush()
+    reg.close_segment(b, 300)
+    ev = load_exchanges(tmp_path)
+    got = proposal_logs(ev)
+    order = np.argsort(np.asarray(ev["step"]))
+    alg = got["proposal_algorithm"][order].tolist()
+    assert alg == [LEGACY_PROPOSAL_ALGORITHM, "gibbs_softmax_log_v2", LEGACY_PROPOSAL_ALGORITHM]
+    lqr = got["log_q_reverse"][order]
+    assert np.isnan(lqr[0])                                 # historical -inf: unrecoverable, never finite or -inf
+    assert lqr[1] == -1001.3132616875                       # v2: the authoritative finite log
+    assert np.isnan(got["log_p_accept"][order][0]) and got["log_p_accept"][order][1] == -1.3132616875182228
+    assert replay_assignments(ev, [0, 1, 2], after_step=0, up_to_step=10**9) == [1, 0, 2]
+
+
+def test_v2_writer_refuses_to_append_to_a_v1_segment(tmp_path):
+    from gareus.parquet_manifest import ParquetManifestError
+    seg = tmp_path / "exchanges" / "seg_x"
+    _write_v1_segment(seg, [dict(step=1, replica_i=0, replica_j=0, window_i=0, window_j=0, delta_e=0.0,
+                                 accepted=False, attempt_seq=0, selected_replica=0, kind="stay", delta_e_kj=0.0,
+                                 log_q_forward=0.0, log_q_reverse=float("-inf"), p_accept=0.0, energy_version="v",
+                                 assignment_sha256_after=assignment_sha256([0]))])
+    from gareus.store import ParquetExchangeWriter
+    with pytest.raises(ParquetManifestError, match="payload schema"):
+        ParquetExchangeWriter(seg, event_schema=EXCHANGE_EVENT_SCHEMA)

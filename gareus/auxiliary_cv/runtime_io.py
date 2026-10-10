@@ -51,14 +51,25 @@ class ExchangeEventCounter:
         return seq
 
 
-def _log(q: float) -> float:
-    return math.log(q) if q > 0 else float("-inf")
+#: Mirrors gareus.production.GIBBS_PROPOSAL_ALGORITHM_V2 (pinned equal by test; production is not imported here).
+GIBBS_PROPOSAL_ALGORITHM_V2 = "gibbs_softmax_log_v2"
 
 
-def aux_event_fields(prop) -> dict[str, float]:
-    """The proposal fields of a Gibbs move (no ``selected_replica``); log q is -inf for q <= 0."""
-    return {"log_q_forward": _log(float(prop.q_forward)), "log_q_reverse": _log(float(prop.q_reverse)),
-            "p_accept": float(prop.pacc)}
+def aux_event_fields(prop) -> dict[str, Any]:
+    """The proposal fields of a Gibbs move (no ``selected_replica``), written straight from the proposal.
+
+    Auxiliary runs record only ``gibbs_softmax_log_v2`` proposals (F09): the log q's and log alpha are the
+    proposal's own authoritative logs (finite even when their exponentials underflow), never logs of
+    rounded probabilities. A proposal from another algorithm is refused rather than logged as -inf.
+    """
+    algorithm = getattr(prop, "proposal_algorithm", None)
+    if algorithm != GIBBS_PROPOSAL_ALGORITHM_V2:
+        raise ValueError(f"auxiliary exchange ledger records only {GIBBS_PROPOSAL_ALGORITHM_V2} Gibbs proposals, "
+                         f"got proposal_algorithm {algorithm!r}")
+    log_p_accept = float(prop.log_p_accept)
+    return {"log_q_forward": float(prop.log_q_forward), "log_q_reverse": float(prop.log_q_reverse),
+            "p_accept": math.exp(log_p_accept) if not math.isnan(log_p_accept) else float("nan"),
+            "log_p_accept": log_p_accept, "proposal_algorithm": GIBBS_PROPOSAL_ALGORITHM_V2}
 
 
 def event_from_gibbs(prop, *, step: int, seq: int, selected_replica: int, accepted: bool, energy_version: str,

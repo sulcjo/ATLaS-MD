@@ -57,6 +57,14 @@ def test_admission_through_epoch_loop_and_resume(tmp_path, small_adaptive_campai
     assert run.phase_has_column("epoch_002", "aux_z_00")
     s2 = run.samples("epoch_002")
     assert len(s2) > 0 and np.isfinite(s2["aux_z_00"].to_numpy(dtype=float)).all()
+    # F09: the aux phase's gibbs-walk ledger records the log-space proposal algorithm with finite logs
+    from gareus.query import load_exchanges
+    ev = load_exchanges(run.phase_dir("epoch_002"))
+    kinds = np.asarray(ev["kind"]).astype(str)
+    moves = kinds == "swap"
+    assert moves.any() and set(np.asarray(ev["proposal_algorithm"])[moves].tolist()) == {"gibbs_softmax_log_v2"}
+    assert np.isfinite(np.asarray(ev["log_q_reverse"], dtype=float)[moves]).all()
+    assert np.isfinite(np.asarray(ev["log_p_accept"], dtype=float)[moves]).all()
 
     # backfill for every pre-admission phase; recorded z matches z_from_positions on the post-admission phase
     from gareus.adaptive.aux_backfill import BACKFILL_FILENAME, check_backfill_against_recorded
