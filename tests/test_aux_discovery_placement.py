@@ -64,3 +64,38 @@ def test_k3_cap_marks_ineligible():
     out = place_workers(z, lab, sid, lineage, step, tr, ~tr, AuxDiscoverySettings(), k_labels=2, k3_max=0.01)
     assert out["n_eligible"] == 0 and out["chosen"] == []
     assert all(c["gates"]["k3_max"] is False and c["eligible"] is False for c in out["all_candidates"])
+
+
+def _overlap(du, what="test"):
+    from gareus.adaptive.aux_discovery.placement import _forecast
+    du = np.asarray(du, dtype=float)
+    z = np.sqrt(du) if np.all(np.isfinite(du)) else du
+    n = len(du)
+    out = _forecast(z, np.zeros(n, dtype=int), np.zeros(n, dtype=int), 0.0, 2.0, [0], 1.0, 1)
+    return out["O"]
+
+
+def test_forecast_overlap_stable_when_exp_minus_du_underflows():
+    assert _overlap([800.0] + [1000.0] * 99) == pytest.approx(0.009900990099, rel=1e-9)
+
+
+def test_forecast_overlap_invariant_to_common_energy_constant():
+    base = np.array([1.0, 2.5, 4.0, 7.0, 0.5])
+    assert _overlap(base + 900.0) == pytest.approx(_overlap(base), rel=1e-9)
+
+
+def test_forecast_overlap_identical_energies_is_one_half():
+    assert _overlap([3.0] * 50) == pytest.approx(0.5, abs=1e-12)
+
+
+def test_forecast_overlap_extreme_separation_is_finite_and_tends_to_1_over_n_plus_1():
+    o = _overlap([0.0] + [1e6] * 9)
+    assert np.isfinite(o) and o == pytest.approx(1 / 11, rel=1e-6)
+
+
+def test_forecast_refuses_nonfinite_energy():
+    from gareus.adaptive.aux_discovery.placement import _forecast
+    for bad in (np.nan, np.inf):
+        z = np.array([0.0, 1.0, bad])
+        with pytest.raises(ValueError, match="parent 7"):
+            _forecast(z, np.zeros(3, dtype=int), np.zeros(3, dtype=int), 0.0, 2.0, [0], 1.0, 1, what="parent 7")
