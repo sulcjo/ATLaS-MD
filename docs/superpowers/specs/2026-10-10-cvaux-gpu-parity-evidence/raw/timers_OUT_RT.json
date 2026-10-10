@@ -1,0 +1,75 @@
+{
+  "enabled": true,
+  "npt": {
+    "controllers": 0
+  },
+  "phases": {
+    "checkpoint_flush": {
+      "calls": 2,
+      "fraction_of_wall": 0.0009384264728111225,
+      "mean_s": 0.009039560798555613,
+      "seconds": 0.018079121597111225,
+      "seconds_per_2000_steps": 0.009039560798555613
+    },
+    "checkpoint_save": {
+      "calls": 2,
+      "fraction_of_wall": 0.01594307896584432,
+      "mean_s": 0.15357455890625715,
+      "seconds": 0.3071491178125143,
+      "seconds_per_2000_steps": 0.15357455890625715
+    },
+    "exchange": {
+      "calls": 8,
+      "fraction_of_wall": 0.007680314784632709,
+      "mean_s": 0.018495501368306577,
+      "seconds": 0.14796401094645262,
+      "seconds_per_2000_steps": 0.07398200547322631
+    },
+    "exchange.swap_apply": {
+      "calls": 156,
+      "fraction_of_wall": 0.004403272064498183,
+      "mean_s": 0.0005437859680312566,
+      "seconds": 0.08483061101287603,
+      "seconds_per_2000_steps": 0.04241530550643802
+    },
+    "log": {
+      "calls": 16,
+      "fraction_of_wall": 0.0006705430453246029,
+      "mean_s": 0.0008073907229118049,
+      "seconds": 0.012918251566588879,
+      "seconds_per_2000_steps": 0.006459125783294439
+    },
+    "md": {
+      "calls": 16,
+      "fraction_of_wall": 0.9504879188136851,
+      "mean_s": 1.1444681042339653,
+      "seconds": 18.311489667743444,
+      "seconds_per_2000_steps": 9.155744833871722
+    },
+    "progress": {
+      "calls": 16,
+      "fraction_of_wall": 1.6536143550727646e-05,
+      "mean_s": 1.9910919945687056e-05,
+      "seconds": 0.0003185747191309929,
+      "seconds_per_2000_steps": 0.00015928735956549644
+    },
+    "sample": {
+      "calls": 16,
+      "fraction_of_wall": 0.024097794330741492,
+      "mean_s": 0.02901578909950331,
+      "seconds": 0.46425262559205294,
+      "seconds_per_2000_steps": 0.23212631279602647
+    },
+    "sample.fetch": {
+      "calls": 16,
+      "fraction_of_wall": 0.02309438841842873,
+      "mean_s": 0.027807603240944445,
+      "seconds": 0.4449216518551111,
+      "seconds_per_2000_steps": 0.22246082592755556
+    }
+  },
+  "steps": 4000,
+  "top_level_sum_s": 19.262171369977295,
+  "unattributed_s": 0.003186248242855072,
+  "wall_s": 19.26535761822015
+}

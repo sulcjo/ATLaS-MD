@@ -1,0 +1,21 @@
+{
+  "/home/sulcjo/cvaux_parity_runs/OUT_CUDA_DOUBLE": {
+    "ok": true,
+    "segments": {
+      "seg_001": {
+        "k_max_kcal": 1.2,
+        "max_abs_dz": 0.0,
+        "max_reduced": 0.0,
+        "n_compared": 576,
+        "n_finite_mismatch": 0,
+        "n_nonfinite_offline": 0,
+        "n_nonfinite_stored": 0,
+        "ok": true,
+        "platform": "CUDA",
+        "precision": "double",
+        "rows": 576,
+        "tolerance": 1e-06
+      }
+    }
+  }
+}
