@@ -23,6 +23,10 @@ ADMISSION_FILENAME = "aux_admission.json"
 MODEL_FILENAME = "aux_model.json"
 PARTITION_FILENAME = "aux_eval_partition.pkl"
 VALIDATION_FILENAME = "aux_validation.json"
+HISTORY_FILENAME = "aux_discovery_history.json"
+HISTORY_SCHEMA = "aux_discovery_history_v1"
+HISTORY_NOTE = ("One entry per discovery attempt. The same epochs' frames are reused as holdout across attempts, so "
+                "per-attempt gates give NO campaign-wide false-discovery control.")
 ACTION = "admit_aux"
 _FROZEN_NAMES = (MODEL_FILENAME, PARTITION_FILENAME, PARTITION_FILENAME + ".sha256", ADMISSION_FILENAME)
 
@@ -32,6 +36,23 @@ def _write_json(path: Path, payload: dict) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(payload, indent=2, sort_keys=True, default=str))
     tmp.replace(path)
+
+
+def append_discovery_history(adaptive_dir: Path, report: dict, epoch: int) -> None:
+    """Append this attempt (boundary epoch, outcome, holdout boundary) to adaptive_production's history file."""
+    path = Path(adaptive_dir) / HISTORY_FILENAME
+    try:
+        rec = json.loads(path.read_text())
+        entries = list(rec.get("attempts") or [])
+    except Exception:
+        entries = []
+    n_hold = (report.get("discovery") or {}).get("n_holdout") if isinstance(report.get("discovery"), dict) else None
+    entries.append({"boundary_epoch": int(epoch), "status": report.get("status"),
+                    "holdout_epochs": [int(epoch)], "train_epochs": list(range(int(epoch))), "n_holdout_frames": report.get("n_holdout", n_hold),
+                    "attempt_index": len(entries) + 1,
+                    "z3_chosen": (report.get("z3_search") or {}).get("chosen") is not None,
+                    "null_gate_passed": ((report.get("z3_search") or {}).get("null_gate") or {}).get("passed")})
+    _write_json(path, {"schema": HISTORY_SCHEMA, "note": HISTORY_NOTE, "attempts": entries})
 
 
 def _resolved_distance_interval(args) -> int:
@@ -264,6 +285,12 @@ def run_epoch_aux_discovery(*, adaptive_dir, epoch_dir, epoch, registry, diagnos
         return actions
     finally:
         report["finished_unix"] = time.time()
+        report["false_discovery_control"] = "per_attempt_only"   # never campaign-wide: see aux_discovery_history.json
+        try:
+            if report.get("status") not in (None, "last_epoch", "no_slots"):
+                append_discovery_history(adaptive_dir, report, int(epoch))
+        except Exception as exc:
+            print(f"WARNING: could not append {HISTORY_FILENAME}: {exc}")
         try:
             _write_json(epoch_dir / REPORT_NAME, report)
         except Exception as exc:             # the hook never raises

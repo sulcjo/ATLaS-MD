@@ -5285,15 +5285,15 @@ def _analyze_population(d, args, out: Path, progress: Optional[Progress] = None,
                 with open(out/'pmf_aux_crosscheck.csv','w',newline='') as _fh:
                     _w=_csv.writer(_fh); _w.writerow(['axis','edge_lo','edge_hi','pmf_all_kcal','pmf_ordinary_kcal','count_all','count_ordinary']); _w.writerows(_rows)
                 aux_crosscheck_summary['files']={'pmf_aux_crosscheck_csv':str(out/'pmf_aux_crosscheck.csv')}
-            if _acc['status']=='fail':
-                warn.append(f"Aux ordinary-only cross-check FAILED: PMF from ordinary states only disagrees with the all-states PMF by "
+            if _acc['status']=='heuristic_fail':
+                warn.append(f"Aux ordinary-only cross-check (raw-count heuristic) FAILED: PMF from ordinary states only disagrees with the all-states PMF by "
                             f"{_acc.get('max_abs_diff_kcal',float('nan')):.3f} kcal/mol (tolerance {_acc['tolerance_kcal']:.3f}) -- "
                             f"the auxiliary states' bias terms or sampling are inconsistent with the ordinary ensemble.")
             aux_workers_summary={'workers':worker_table(d,m['f_k'],aux_states=_aux_state_ids,ordinary_states=_ordinary,state_lambdas=getattr(d,'state_lambdas',None)),
                                  'attribution':'none (no shams)','model_sha256':d.meta.get('aux_model_sha256')}
         except Exception as _exc:
             warn.append(f"Aux crosscheck/worker table unavailable: {type(_exc).__name__}: {_exc}")
-            aux_crosscheck_summary={'status':'error','reason':f'{type(_exc).__name__}: {_exc}','axes':{}}
+            aux_crosscheck_summary={'status':'error','method':'raw_count_heuristic','reason':f'{type(_exc).__name__}: {_exc}','axes':{}}
 
     # Never pool epoch_000 into the main PMF/GaMD-boost report: it runs under
     # a different GaMD envelope (the shared-envelope recalibration fires from

@@ -29,12 +29,12 @@ def _run(x, win, u, ordinary):
 
 def test_consistent_aux_passes():
     r = _run(*_toy(), ordinary=[0, 1])
-    assert r["status"] == "pass", r["axes"]["cv1"].get("max_abs_diff_kcal")
+    assert r["status"] == "heuristic_pass" and r["method"] == "raw_count_heuristic", r["axes"]["cv1"].get("max_abs_diff_kcal")
 
 
 def test_missing_aux_term_fails():
     r = _run(*_toy(bias_bug=True), ordinary=[0, 1])
-    assert r["status"] == "fail"
+    assert r["status"] == "heuristic_fail"
 
 
 def test_too_few_bins_is_skipped():
@@ -57,7 +57,7 @@ def test_report_rows_absent_without_aux_keys():
 
 def test_report_rows_grade_fail_and_caution():
     from gareus_report import build_health_verdict
-    v = build_health_verdict({"aux_crosscheck": {"status": "fail", "max_abs_diff_kcal": 1.2},
+    v = build_health_verdict({"aux_crosscheck": {"status": "heuristic_fail", "max_abs_diff_kcal": 1.2},
                               "aux_workers": {"workers": [{"state_id": 7, "best_partner": 3,
                                                            "best_partner_overlap": 0.05,
                                                            "overlap_floor_ok": False}]}})

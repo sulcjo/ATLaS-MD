@@ -9,7 +9,7 @@ import numpy as np
 from .partitions import FrozenPartition, fit_partition
 from .placement import place_workers
 from .settings import AuxDiscoverySettings
-from .z3_search import emit_model, search_z3_sources, z3_null_gate, z3_values, _cooccurring_pairs
+from .z3_search import NULL_UNINFORMATIVE_STATUS, emit_model, search_z3_sources, z3_null_gate, z3_values, _cooccurring_pairs
 
 
 @dataclass
@@ -66,6 +66,8 @@ def run_discovery(ft, *, train, holdout, settings: AuxDiscoverySettings, full_to
         rep["z3_search"]["null_gate"] = gate
         if not gate["passed"]:
             best = None
+            if gate.get("status") == NULL_UNINFORMATIVE_STATUS:
+                return DiscoveryResult(NULL_UNINFORMATIVE_STATUS, rep, eval_partition=part.frozen)
     if best is None:
         return DiscoveryResult("broaden", rep, eval_partition=part.frozen)
     model = emit_model(best, ft.definition, full_topology, label=f"z3-epoch{epoch:03d}",

@@ -212,24 +212,36 @@ def build_health_verdict(s: dict, min_neighbor_overlap: float = 0.30) -> dict:
     }
 
 
+AUX_CROSSCHECK_HEURISTIC_TEXT = "heuristic agreement, no statistical test"
+
+
 def _check_aux_crosscheck(s: dict) -> Optional[dict]:
-    """Ordinary-only vs all-states PMF agreement; None unless an aux analysis wrote ``aux_crosscheck``."""
+    """Ordinary-only vs all-states PMF agreement (a raw-count HEURISTIC); None unless an aux analysis wrote
+    ``aux_crosscheck``. No status ever grades PASS; an unknown status is CAUTION. An integrity failure
+    (``s['aux_integrity_failure']``, e.g. a pooling refusal) takes precedence over everything."""
     name = "Aux ordinary-only crosscheck"
+    integrity = s.get("aux_integrity_failure")
+    if integrity:
+        return {"name": name, "status": FAIL, "detail": f"integrity failure: {integrity}"}
     cc = s.get("aux_crosscheck")
     if not isinstance(cc, dict):
         return None
     status = cc.get("status")
     mx = _num(cc.get("max_abs_diff_kcal"))
-    if status == "fail":
+    if status == "heuristic_fail":
         return {"name": name, "status": FAIL,
-                "detail": f"ordinary-only PMF disagrees with the all-states PMF"
-                          + (f" by {mx:.2f} kcal/mol" if mx is not None else "") + " -- aux bias terms suspect"}
-    if status == "pass":
-        return {"name": name, "status": PASS,
-                "detail": f"max |dF| {mx:.2f} kcal/mol over supported bins" if mx is not None else "agrees"}
+                "detail": "ordinary-only PMF disagrees with the all-states PMF"
+                          + (f" by {mx:.2f} kcal/mol" if mx is not None else "") + " -- aux bias terms suspect"
+                          + " (raw-count heuristic)"}
+    if status == "heuristic_pass":
+        return {"name": name, "status": CAUTION,
+                "detail": AUX_CROSSCHECK_HEURISTIC_TEXT + (f"; max |dF| {mx:.2f} kcal/mol over supported bins"
+                                                           if mx is not None else "")}
     if status == "error":
         return {"name": name, "status": CAUTION, "detail": str(cc.get("reason") or "error")}
-    return {"name": name, "status": NA, "detail": str(cc.get("reason") or "skipped")}
+    if status in ("skipped", "unavailable"):
+        return {"name": name, "status": NA, "detail": str(cc.get("reason") or status)}
+    return {"name": name, "status": CAUTION, "detail": f"unrecognized aux_crosscheck status {status!r}"}
 
 
 def _check_aux_workers(s: dict) -> Optional[dict]:

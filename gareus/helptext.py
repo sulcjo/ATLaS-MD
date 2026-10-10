@@ -2311,7 +2311,7 @@ and, if it passes and adaptive_production/aux_validation.json is valid, admits a
 min(4, --ap-aux-reserve-slots - live workers, free replica-cap slots) lambda = 0 aux
 workers from parents that stay active after the epoch's other actions, never at the last
 numbered epoch (status in epoch_NNN/aux_discovery_report.json: last_epoch, no_slots,
-physical_system_unsupported, insufficient_evidence, keep, broaden, no_worker,
+physical_system_unsupported, insufficient_evidence, keep, broaden, null_uninformative_trapped_lineages, no_worker,
 no_eligible_worker, validation_missing, alignment, ok, refused_by_applier, error).
 Model, partition, settings and admission are frozen in adaptive_production/ (aux_*.json);
 --ap-aux-settings-override replaces the settings. Workers are invisible to respring, R1-R3,

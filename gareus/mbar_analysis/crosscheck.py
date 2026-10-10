@@ -249,15 +249,26 @@ def ladder_crosscheck(d: Any, f_k_global: np.ndarray, bins, kbt_kcal: float,
 # ---------------------------------------------------------------------------------------------
 # Auxiliary states: ordinary-only vs all-states PMF crosscheck (CVaux adaptive, Task 15)
 # ---------------------------------------------------------------------------------------------
-def _target_logw(u: np.ndarray, window: np.ndarray, f: np.ndarray) -> np.ndarray:
-    """Per-row log weight at the unbiased target (u = 0): -logsumexp_k(log N_k + f_k - u_nk)."""
+DEFAULT_LOGW_BLOCK_ROWS = 65536
+AUX_CROSSCHECK_METHOD = "raw_count_heuristic"
+AUX_CROSSCHECK_STATUSES = ("heuristic_pass", "heuristic_fail", "skipped", "unavailable", "error")
+
+
+def _target_logw(u: np.ndarray, window: np.ndarray, f: np.ndarray, *, block_rows: int = DEFAULT_LOGW_BLOCK_ROWS) -> np.ndarray:
+    """Per-row log weight at the unbiased target (u = 0): -logsumexp_k(log N_k + f_k - u_nk). Computed per row
+    block so no full N x K temporary (``a`` / ``where``) is ever built; ``u`` may be a memmap."""
     from scipy.special import logsumexp
-    n_k = np.bincount(window, minlength=u.shape[1]).astype(float)
+    n, k = u.shape
+    n_k = np.bincount(window, minlength=k).astype(float)
     with np.errstate(divide="ignore"):
-        logn = np.log(n_k)
-    a = logn[None, :] + np.asarray(f, float)[None, :] - u
-    a = np.where(np.isfinite(a), a, -np.inf)
-    return -logsumexp(a, axis=1)
+        base = np.log(n_k) + np.asarray(f, float)
+    block = max(1, int(block_rows))
+    out = np.empty(n, dtype=np.float64)
+    for lo in range(0, n, block):
+        a = base[None, :] - np.asarray(u[lo:lo + block], dtype=np.float64)
+        a[~np.isfinite(a)] = -np.inf
+        out[lo:lo + block] = -logsumexp(a, axis=1)
+    return out
 
 
 def _axis_values(d: Any) -> dict:
@@ -277,13 +288,15 @@ def _axis_values(d: Any) -> dict:
 
 
 def aux_ordinary_crosscheck(d: Any, f_k_global: np.ndarray, bins_by_axis: dict, kbt_kcal: float, *,
-                            ordinary_states, tol_kcal: float = DEFAULT_TOL_KCAL) -> dict:
-    """PMF along each axis from all states (global ``f_k_global``) vs from ordinary states only
+                            ordinary_states, tol_kcal: float = DEFAULT_TOL_KCAL,
+                            block_rows: int = DEFAULT_LOGW_BLOCK_ROWS) -> dict:
+    """HEURISTIC (``method: raw_count_heuristic``, no statistical test): PMF along each axis from all states (global ``f_k_global``) vs from ordinary states only
     (``f`` re-solved on that subset with ``solve_rows``), both at the unbiased target. A
     disagreement means the auxiliary states' bias terms are wrong (or aux sampling is
     inconsistent), not noise. ``fail`` when any supported bin differs by more than
     ``max(tol, BIN_NOISE_SAFETY_FACTOR x bin noise)``; axes with fewer than MIN_BINS_FOR_VERDICT
-    supported bins are skipped; all skipped -> overall skipped."""
+    supported bins are skipped; all skipped -> overall skipped. Statuses: heuristic_pass / heuristic_fail /
+    skipped; a pass is only "no bin differs by more than a raw-count noise bound", never evidence of agreement."""
     from gareus.adaptive.mbar_solve import solve_rows
     from .storage import select_matrix
 
@@ -291,11 +304,16 @@ def aux_ordinary_crosscheck(d: Any, f_k_global: np.ndarray, bins_by_axis: dict, 
     window = np.asarray(d.window, dtype=np.int64)
     rows = np.isin(window, ordinary)
     if ordinary.size == 0 or not rows.any():
-        return {"status": "skipped", "reason": "no ordinary-state samples", "axes": {},
-                "tolerance_kcal": tol_kcal}
-    u_all = np.asarray(select_matrix(d.u_nk), dtype=np.float64)
-    logw_all = _target_logw(u_all, window, np.asarray(f_k_global, float))
-    u_ord = u_all[np.ix_(rows, ordinary)]
+        return {"status": "skipped", "method": AUX_CROSSCHECK_METHOD, "reason": "no ordinary-state samples",
+                "axes": {}, "tolerance_kcal": tol_kcal}
+    u_all = select_matrix(d.u_nk)      # never copied whole; _target_logw reads it per row block
+    logw_all = _target_logw(u_all, window, np.asarray(f_k_global, float), block_rows=block_rows)
+    u_ord = np.empty((int(rows.sum()), ordinary.size), dtype=np.float64)   # the one materialised subset
+    ridx = np.flatnonzero(rows)
+    for lo in range(0, ridx.size, max(1, int(block_rows))):
+        sel = ridx[lo:lo + max(1, int(block_rows))]
+        u_ord[lo:lo + sel.size] = np.asarray(u_all[sel], dtype=np.float64)[:, ordinary]
+    del ridx
     remap = {int(s): i for i, s in enumerate(ordinary)}
     win_ord = np.fromiter((remap[int(w)] for w in window[rows]), dtype=np.int64, count=int(rows.sum()))
     f_ord, logw_ord = solve_rows(u_ord, win_ord)
@@ -336,12 +354,12 @@ def aux_ordinary_crosscheck(d: Any, f_k_global: np.ndarray, bins_by_axis: dict, 
         any_verdict = True
         any_fail = any_fail or bool(bad.any())
         worst = max(worst, mx)
-        out[name] = {"status": "fail" if bad.any() else "pass", "max_abs_diff_kcal": mx,
+        out[name] = {"status": "heuristic_fail" if bad.any() else "heuristic_pass", "max_abs_diff_kcal": mx,
                      "n_bins_compared": int(gate.sum()), "n_bins_failing": int(bad.sum()),
                      "edges": edges.tolist(), "pmf_all": Fa.tolist(), "pmf_ordinary": Fo.tolist(),
                      "counts_all": ca.tolist(), "counts_ordinary": co.tolist()}
-    status = "skipped" if not any_verdict else ("fail" if any_fail else "pass")
-    res = {"status": status, "axes": out, "tolerance_kcal": tol_kcal, "tolerance_source": "fixed_default",
+    status = "skipped" if not any_verdict else ("heuristic_fail" if any_fail else "heuristic_pass")
+    res = {"status": status, "method": AUX_CROSSCHECK_METHOD, "axes": out, "tolerance_kcal": tol_kcal, "tolerance_source": "fixed_default",
            "n_ordinary_samples": int(rows.sum())}
     if any_verdict:
         res["max_abs_diff_kcal"] = worst

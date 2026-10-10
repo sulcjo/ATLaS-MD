@@ -170,6 +170,20 @@ def search_z3_sources(ft, sources, bins, train, holdout, s: AuxDiscoverySettings
     return pick_best(allc), allc
 
 
+NULL_UNINFORMATIVE_STATUS = "null_uninformative_trapped_lineages"
+
+
+def labels_constant_within_lineages(labels, lineage) -> bool:
+    """True when every lineage carries a single label: a within-lineage shift then returns the labels
+    unchanged, so the scrambled null equals the real search and cannot discriminate anything."""
+    labels = np.asarray(labels); lineage = np.asarray(lineage)
+    for lg in np.unique(lineage):
+        v = labels[lineage == lg]
+        if v.size and not np.all(v == v[0]):
+            return False
+    return True
+
+
 def z3_null_gate(ft, sources, real_best, bins, train, holdout, s: AuxDiscoverySettings, *,
                  nbins: Optional[int] = None, cond_dims: Optional[Sequence[str]] = None) -> dict:
     """U12 gate: the best real candidate's held-out info gain must exceed the best-of-candidates gain of every one
@@ -179,6 +193,10 @@ def z3_null_gate(ft, sources, real_best, bins, train, holdout, s: AuxDiscoverySe
     if real_best is None:
         return {**rep, "passed": False, "reason": "no_real_candidate", "null_best": [], "null_summary": None,
                 "null_margin": None}
+    if all(labels_constant_within_lineages(lab, ft.lineage) for _, lab, _ in sources):
+        # Non-admission is unchanged (the real candidate can never beat an identical null); the status says why.
+        return {**rep, "passed": False, "status": NULL_UNINFORMATIVE_STATUS, "reason": NULL_UNINFORMATIVE_STATUS,
+                "null_best": [], "null_summary": None, "null_margin": None}
     rng = np.random.default_rng(int(s.partition_seed) + 7919)
     null_best = []
     for _ in range(n_null):
