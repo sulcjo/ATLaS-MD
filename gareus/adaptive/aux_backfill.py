@@ -17,11 +17,39 @@ BACKFILL_FILENAME = "aux_z_backfill.parquet"
 _SHA_KEY = b"aux_model_sha256"
 
 
+CHECKPOINT_MANIFEST = Path("checkpoints") / "production_checkpoint_manifest.json"
+
+
 class BackfillIncomplete(RuntimeError):
-    def __init__(self, n_missing: int, examples: list):
-        super().__init__(f"{n_missing} samples have no trajectory frame (e.g. {examples[:5]})")
+    def __init__(self, n_missing: int, examples: list, reasons: Optional[list] = None):
+        why = f"; {'; '.join(reasons[:5])}" if reasons else ""
+        super().__init__(f"{n_missing} samples have no trajectory frame (e.g. {examples[:5]}){why}")
         self.n_missing = int(n_missing)
         self.examples = examples
+        self.reasons = list(reasons or [])
+
+
+def phase_label(phase_dir, adaptive_dir) -> Optional[str]:
+    """Phase label relative to the campaign (``epoch_001``, ``epoch_001/baseline``, ``final``); None outside it.
+    The key of a backfill entry: a copied or moved campaign keeps its labels, not its absolute paths."""
+    try:
+        return Path(phase_dir).resolve().relative_to(Path(adaptive_dir).resolve()).as_posix()
+    except ValueError:
+        return None
+
+
+def final_production_step(phase_dir: Path) -> Optional[int]:
+    """The phase's last production step on the samples' clock (``absolute_step`` of its checkpoint manifest,
+    which production writes at the end of the loop, together with final_pdbs/); None when not recorded."""
+    import json
+    path = Path(phase_dir) / CHECKPOINT_MANIFEST
+    try:
+        value = json.loads(path.read_text()).get("absolute_step")
+    except (OSError, ValueError, AttributeError):
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return int(value)
 
 
 def check_solute_indices(solute_pdb: Path, model) -> None:
@@ -105,7 +133,10 @@ def write_phase_backfill(phase_dir: Path, model, *, adaptive_dir: Optional[Path]
     """z for every sample of the phase from its XTC frames. The one exception is each replica's LAST sample when
     it has no frame: the phase's step total (from the MD pool) is generally off the frame grid, so production
     logs a final sample at that step with no XTC frame; its configuration is ``final_pdbs/replica_RRR_window_WWW
-    .pdb`` (W = the sample's own window). Any other missing frame, or a missing final PDB, refuses the phase."""
+    .pdb`` (W = the sample's own window), used only when the sample's step is the phase's final production step
+    (checkpoint manifest ``absolute_step``) and after the replica's last XTC frame. Any other missing frame, a
+    missing final PDB, or a final PDB without that step evidence refuses the phase (``BackfillIncomplete.reasons``).
+    With ``adaptive_dir`` the entry carries the campaign-relative ``label`` the admission record is matched on."""
     import pyarrow as pa
     import pyarrow.parquet as pq
     phase_dir = Path(phase_dir)
@@ -115,34 +146,67 @@ def write_phase_backfill(phase_dir: Path, model, *, adaptive_dir: Optional[Path]
     merged = samples.merge(zdf, on=["replica", "step"], how="left")
     missing = merged["aux_z"].isna().to_numpy()
     n_pdb = 0
+    reasons: List[str] = []
     if missing.any():
         last = (loaded["step"].to_numpy() == loaded.groupby("replica")["step"].transform("max").to_numpy())
         top_path = census._find_topology(phase_dir, Path(adaptive_dir) if adaptive_dir else phase_dir.parent)
         z = merged["aux_z"].to_numpy(dtype=np.float64).copy()
+        end_step = final_production_step(phase_dir)
+        xtc_max = zdf.groupby("replica")["step"].max().to_dict() if len(zdf) else {}
         for i in np.flatnonzero(missing & last):
-            zi = _final_pdb_z(phase_dir, int(loaded["replica"].iat[i]), int(loaded["window_id"].iat[i]), model,
-                              top_path)
+            replica, step = int(loaded["replica"].iat[i]), int(loaded["step"].iat[i])
+            why = _final_pdb_evidence(replica, step, end_step, xtc_max.get(replica))
+            if why is not None:
+                reasons.append(why)
+                continue
+            zi = _final_pdb_z(phase_dir, replica, int(loaded["window_id"].iat[i]), model, top_path)
             if zi is not None:
                 z[i] = zi
                 n_pdb += 1
         merged["aux_z"] = z
         missing = merged["aux_z"].isna().to_numpy()
     if missing.any():
-        raise BackfillIncomplete(int(missing.sum()), merged.loc[missing, ["replica", "step"]].head(10).values.tolist())
+        raise BackfillIncomplete(int(missing.sum()), merged.loc[missing, ["replica", "step"]].head(10).values.tolist(),
+                                 reasons)
     out = phase_dir / BACKFILL_FILENAME
     table = pa.Table.from_pandas(merged, preserve_index=False).replace_schema_metadata(
         {_SHA_KEY: model.model_sha256.encode()})
     tmp = out.with_suffix(".parquet.tmp")
     pq.write_table(table, tmp)
     tmp.replace(out)
-    return {"phase": str(phase_dir), "n_samples": int(len(samples)), "n_z": int(merged["aux_z"].notna().sum()),
+    label = phase_label(phase_dir, adaptive_dir) if adaptive_dir is not None else None
+    return {"phase": str(phase_dir), **({"label": label} if label is not None else {}),
+            "n_samples": int(len(samples)), "n_z": int(merged["aux_z"].notna().sum()),
             "n_from_xtc": int(len(samples)) - n_pdb, "n_from_final_pdb": int(n_pdb),
             "model_sha256": model.model_sha256, "sha256": hashlib.sha256(out.read_bytes()).hexdigest()}
 
 
-def read_phase_backfill(phase_dir: Path, model_sha256: str) -> pd.DataFrame:
+def _final_pdb_evidence(replica: int, step: int, end_step: Optional[int], xtc_max: Optional[int]) -> Optional[str]:
+    """None when final_pdbs/ provably holds this sample's configuration, else why not: the sample must be the
+    phase's final production step (checkpoint manifest) and lie after every XTC frame of its replica."""
+    if end_step is None:
+        return (f"replica {replica} step {step}: no checkpoint manifest ({CHECKPOINT_MANIFEST}) records the "
+                "phase's final production step, so final_pdbs/ cannot be tied to the sample")
+    if step != end_step:
+        return (f"replica {replica} step {step} is not the phase's final production step {end_step} "
+                "(checkpoint manifest): final_pdbs/ does not hold it")
+    if xtc_max is not None and step <= int(xtc_max):
+        return f"replica {replica} step {step} is not after its last XTC frame (step {int(xtc_max)})"
+    return None
+
+
+def read_phase_backfill(phase_dir: Path, model_sha256: str, *, expected_sha256: str) -> pd.DataFrame:
+    """The phase's backfill, after checking the sha256 of the bytes parsed against ``expected_sha256`` (the
+    admission record's entry for the phase) and the model the file was computed with."""
+    import pyarrow as pa
     import pyarrow.parquet as pq
-    t = pq.read_table(Path(phase_dir) / BACKFILL_FILENAME)
+    path = Path(phase_dir) / BACKFILL_FILENAME
+    data = path.read_bytes()
+    got = hashlib.sha256(data).hexdigest()
+    if got != str(expected_sha256):
+        raise ValueError(f"{path}: backfill sha256 {got[:12]} != admission record {str(expected_sha256)[:12]} "
+                         "(the file changed after the admission recorded it)")
+    t = pq.read_table(pa.BufferReader(data))
     sha = (t.schema.metadata or {}).get(_SHA_KEY, b"").decode()
     if sha != model_sha256:
         raise ValueError(f"{phase_dir}: backfill model {sha[:12]} != campaign model {model_sha256[:12]}")
@@ -166,6 +230,16 @@ def backfill_all(adaptive_dir: Path, model, *, up_to_epoch: int) -> List[dict]:
         if ep is not None and ep <= int(up_to_epoch):
             out.append(write_phase_backfill(Path(phase_dir), model, adaptive_dir=Path(adaptive_dir)))
     return out
+
+
+def merge_backfill_entries(old: list, new: list) -> list:
+    """The admission record's backfill list after ``new`` entries rewrote their phases' files: every phase
+    matched by label or path, the new entry wins, campaign order of ``new`` kept."""
+    labels = {e.get("label") for e in new if e.get("label") is not None}
+    phases = {str(e.get("phase")) for e in new}
+    kept = [e for e in (old or []) if isinstance(e, dict)
+            and e.get("label") not in labels and str(e.get("phase")) not in phases]
+    return kept + list(new)
 
 
 R_KCAL_MOL_K = 0.0019872041

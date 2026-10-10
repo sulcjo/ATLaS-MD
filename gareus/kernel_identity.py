@@ -248,7 +248,9 @@ def aux_admission_allows_pooling(adaptive_dir) -> "Optional[dict]":
 
     Such a campaign pools its legacy and aux phases (spec 2026-10-09 Section 5): the union builders then
     evaluate the worker restraint from per-sample z instead of refusing. None = no ``aux_admission.json``
-    (every existing refusal stays). A record whose model file does not match raises ``AuxPoolingRefused``.
+    (every existing refusal stays). A record whose model file does not match, or whose post-admission spot
+    check failed or is due but missing (``aux_pooling.require_spot_check``), raises ``AuxPoolingRefused``.
+    Both union paths (driver builder and analyzer loader) call this one function.
     """
     import json
     from pathlib import Path
@@ -262,4 +264,6 @@ def aux_admission_allows_pooling(adaptive_dir) -> "Optional[dict]":
     if model.model_sha256 != rec.get("model_sha256"):
         raise AuxPoolingRefused(f"{ad}: aux_model.json sha {model.model_sha256[:12]} != admission record "
                                 f"{str(rec.get('model_sha256'))[:12]}")
+    from gareus.adaptive.aux_pooling import require_spot_check   # lazy: the no-record path never imports it
+    require_spot_check(ad, rec)
     return rec

@@ -53,6 +53,12 @@ def test_incomplete_backfill_refuses_with_counts(tmp_path):
     p = camp.ad / "epoch_000" / BACKFILL_FILENAME
     t = pq.read_table(p)
     pq.write_table(t.slice(0, t.num_rows - 3), p)
+    import hashlib
+    import json
+    rp = camp.ad / "aux_admission.json"           # the record hashes the truncated file: incompleteness decides
+    rec = json.loads(rp.read_text())
+    rec["backfill"][0]["sha256"] = hashlib.sha256(p.read_bytes()).hexdigest()
+    rp.write_text(json.dumps(rec))
     with pytest.raises(AuxPoolingRefused, match=r"3 rows without aux z"):
         build_union_state_mbar_inputs(camp.ad, camp.registry)
 

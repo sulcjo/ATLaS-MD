@@ -43,7 +43,7 @@ def test_backfill_complete_and_matches_positions(tmp_path):
     ph = make_phase(tmp_path, "epoch_000", {"replica_0.xtc": (0, 0, [300, 3300, 6300])}, {0: 0.0}, lambda s: 0.0)
     m = _model()
     info = write_phase_backfill(ph, m)
-    df = read_phase_backfill(ph, m.model_sha256)
+    df = read_phase_backfill(ph, m.model_sha256, expected_sha256=info["sha256"])
     assert info["n_samples"] == info["n_z"] == 3 and len(df) == 3
     assert np.allclose(df.aux_z, _z_ref(m), atol=1e-6)
 
@@ -68,9 +68,9 @@ def test_missing_frames_refuse(tmp_path):
 
 def test_wrong_model_sha_refused(tmp_path):
     ph = make_phase(tmp_path, "epoch_000", {"replica_0.xtc": (0, 0, [300])}, {0: 0.0}, lambda s: 0.0)
-    write_phase_backfill(ph, _model())
+    info = write_phase_backfill(ph, _model())
     with pytest.raises(ValueError, match="model"):
-        read_phase_backfill(ph, "0" * 64)
+        read_phase_backfill(ph, "0" * 64, expected_sha256=info["sha256"])
 
 
 def test_resume_overlap_later_file_wins(tmp_path):
@@ -89,7 +89,7 @@ def test_resume_step_frame_kept_c10_layout(tmp_path):
                                             "replica_000_resume_from_000269700.xtc": (0, 0, [270000, 270300])},
                     {0: 0.0}, lambda s: 0.0)
     info = write_phase_backfill(ph, _model())
-    df = read_phase_backfill(ph, _model().model_sha256)
+    df = read_phase_backfill(ph, _model().model_sha256, expected_sha256=info["sha256"])
     assert info["n_samples"] == info["n_z"] == 5
     assert sorted(df.step.tolist()) == [269100, 269400, 269700, 270000, 270300]
 
@@ -205,7 +205,7 @@ def test_backfill_and_recorded_check_on_a_gamd_phase(tmp_path):
                     sample_step_offset=10200)
     m = _model()
     info = write_phase_backfill(ph, m)
-    df = read_phase_backfill(ph, m.model_sha256)
+    df = read_phase_backfill(ph, m.model_sha256, expected_sha256=info["sha256"])
     assert info["n_samples"] == info["n_z"] == 3 and sorted(df.step.tolist()) == [10500, 13500, 16500]
     f = ph / "samples" / "seg_000" / "data.parquet"
     s = pd.read_parquet(f); s["aux_z_00"] = _z_ref(m); s.to_parquet(f)
@@ -220,9 +220,18 @@ def _add_end_sample(ph, step, window=0, replica=0):
     pd.concat([s, extra]).to_parquet(f)
 
 
-def _write_final_pdb(ph, replica, window, src=PDB):
+def _write_final_pdb(ph, replica, window, src=PDB, *, final_step=742):
     (ph / "final_pdbs").mkdir(exist_ok=True)
     shutil.copy(src, ph / "final_pdbs" / f"replica_{replica:03d}_window_{window:03d}.pdb")
+    if final_step is not None:          # production's end-of-loop checkpoint: the phase's final production step
+        _write_manifest(ph, final_step)
+
+
+def _write_manifest(ph, absolute_step):
+    import json
+    (ph / "checkpoints").mkdir(exist_ok=True)
+    (ph / "checkpoints" / "production_checkpoint_manifest.json").write_text(json.dumps(
+        {"schema": "gareus_production_checkpoint_v1", "prod_done": int(absolute_step), "absolute_step": int(absolute_step)}))
 
 
 def test_off_grid_end_of_phase_sample_takes_its_final_pdb(tmp_path):
@@ -234,7 +243,7 @@ def test_off_grid_end_of_phase_sample_takes_its_final_pdb(tmp_path):
     _write_final_pdb(ph, 0, 0)
     m = _model()
     info = write_phase_backfill(ph, m)
-    df = read_phase_backfill(ph, m.model_sha256)
+    df = read_phase_backfill(ph, m.model_sha256, expected_sha256=info["sha256"])
     assert info["n_samples"] == info["n_z"] == 3 and info["n_from_xtc"] == 2 and info["n_from_final_pdb"] == 1
     z_pdb = float(np.ravel(z_from_positions(md.load(str(PDB)).xyz[0].astype(np.float64), m))[0])
     assert df.set_index("step").aux_z[742] == pytest.approx(z_pdb, abs=1e-9)
@@ -259,7 +268,7 @@ def test_final_pdb_of_another_window_refused(tmp_path):
 def test_missing_frame_before_the_end_is_never_patched_from_final_pdb(tmp_path):
     ph = make_phase(tmp_path, "epoch_000", {"replica_0.xtc": (0, 0, [300, 900])}, {0: 0.0}, lambda s: 0.0)
     _add_end_sample(ph, 600)                   # mid-phase gap: only the replica's LAST sample may use the PDB
-    _write_final_pdb(ph, 0, 0)
+    _write_final_pdb(ph, 0, 0, final_step=900)
     with pytest.raises(BackfillIncomplete) as e:
         write_phase_backfill(ph, _model())
     assert e.value.examples == [[0, 600]]
@@ -275,3 +284,68 @@ def test_final_pdb_with_wrong_solute_refused(tmp_path):
     _write_final_pdb(ph, 0, 0, src=bad)
     with pytest.raises(ValueError, match="final_pdbs"):
         write_phase_backfill(ph, _model())
+
+
+# Task 10 (F02): a final_pdbs frame is used only with step evidence tying it to the sample
+def test_final_pdb_refused_when_step_is_not_the_phase_final_step(tmp_path):
+    ph = make_phase(tmp_path, "epoch_000", {"replica_0.xtc": (0, 0, [300, 600])}, {0: 0.0}, lambda s: 0.0)
+    _add_end_sample(ph, 742)
+    _write_final_pdb(ph, 0, 0, final_step=1042)    # stale final_pdbs: the phase ended (and wrote them) elsewhere
+    with pytest.raises(BackfillIncomplete, match="final production step 1042") as e:
+        write_phase_backfill(ph, _model())
+    assert e.value.examples == [[0, 742]] and not (ph / BACKFILL_FILENAME).exists()
+
+
+def test_final_pdb_refused_without_a_checkpoint_manifest(tmp_path):
+    ph = make_phase(tmp_path, "epoch_000", {"replica_0.xtc": (0, 0, [300, 600])}, {0: 0.0}, lambda s: 0.0)
+    _add_end_sample(ph, 742)
+    _write_final_pdb(ph, 0, 0, final_step=None)
+    with pytest.raises(BackfillIncomplete, match="checkpoint manifest"):
+        write_phase_backfill(ph, _model())
+
+
+def test_final_pdb_refused_when_step_not_after_the_replica_xtc(tmp_path):
+    # replica 1's XTC runs to 900, but its last sample (742) is earlier: final_pdbs cannot be that configuration
+    ph = make_phase(tmp_path, "epoch_000", {"replica_0.xtc": (0, 0, [300, 600]), "replica_1.xtc": (1, 0, [300, 900])},
+                    {0: 0.0}, lambda s: 0.0)
+    f = ph / "samples" / "seg_000" / "data.parquet"
+    s = pd.read_parquet(f)
+    s = s[~((s.replica == 1) & (s.step == 900))]
+    extra = s[s.replica == 1].iloc[[0]].copy(); extra["step"] = 742
+    pd.concat([s, extra]).to_parquet(f)
+    _write_final_pdb(ph, 1, 0, final_step=742)
+    with pytest.raises(BackfillIncomplete, match="XTC"):
+        write_phase_backfill(ph, _model())
+
+
+def test_backfill_entries_carry_the_phase_label(tmp_path):
+    for n in ("epoch_000", "epoch_001"):
+        make_phase(tmp_path, n, {"replica_0.xtc": (0, 0, [300])}, {0: 0.0}, lambda s: 0.0)
+    ad = tmp_path / "adaptive_production"
+    out = backfill_all(ad, _model(), up_to_epoch=1)
+    assert [b["label"] for b in out] == ["epoch_000", "epoch_001"]
+
+
+def test_readmission_backfill_updates_the_admission_record(tmp_path):
+    import hashlib
+    import json
+    from gareus.adaptive_production import WindowStateRegistry
+    for n in ("epoch_000", "epoch_001", "epoch_002"):
+        make_phase(tmp_path, n, {"replica_0.xtc": (0, 0, [300])}, {0: 0.0}, lambda s: 0.0)
+    ad = tmp_path / "adaptive_production"
+    m = _model()
+    m.write(ad / "aux_model.json")
+    first = backfill_all(ad, m, up_to_epoch=0)                     # the freeze at epoch 0
+    (ad / "aux_admission.json").write_text(json.dumps({
+        "schema": "atlas-aux-admission-v1", "epoch": 0, "model_sha256": m.model_sha256, "backfill": first,
+        "workers": [{"parent_state_id": 0, "aux_center": 1.2, "aux_k_kcal_mol": 2.0, "placement_rank": 0,
+                     "burnin_phase_epoch": 1}]}))
+    reg = WindowStateRegistry()
+    reg.add_state(0.0, 10.0, 0.0, 2.0, gamd_lambda=0.0)
+    out = H._readmit_missing_workers(ad, ad / "epoch_002", 2, reg)  # epochs 1-2 ran without the model
+    assert len(out) == 1
+    adm = json.loads((ad / "aux_admission.json").read_text())
+    by_label = {b["label"]: b["sha256"] for b in adm["backfill"]}
+    assert sorted(by_label) == ["epoch_000", "epoch_001", "epoch_002"]
+    for label, sha in by_label.items():
+        assert sha == hashlib.sha256((ad / label / BACKFILL_FILENAME).read_bytes()).hexdigest(), label

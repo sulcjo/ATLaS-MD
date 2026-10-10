@@ -3935,7 +3935,8 @@ def build_union_state_mbar_inputs(
             _z = _ap.phase_z(
                 source_label, Path(sample_dir), [int(r["_replica"]) for r in _new], [int(r["step"]) for r in _new],
                 str(_aux_rec["model_sha256"]),
-                recorded=[np.nan if v is None else v for v in _recorded] if _has_recorded else None)
+                recorded=[np.nan if v is None else v for v in _recorded] if _has_recorded else None,
+                admission=_aux_rec, adaptive_dir=adaptive_dir)
             for _r, _zv in zip(_new, _z.tolist()):
                 _r["aux_z"] = float(_zv)
 

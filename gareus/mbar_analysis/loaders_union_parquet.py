@@ -601,7 +601,8 @@ def load_parquet_adaptive_union(adaptive_dir: Path, n_threads: int = 0, n_worker
             _recorded = samples.get(_ap.Z_COLUMN)
             _z = _ap.phase_z(_aux_phase_label(epoch_dir, adaptive_dir), epoch_dir, rep[valid], step_epoch,
                              str(_aux_rec['model_sha256']),
-                             recorded=None if _recorded is None else _recorded[valid])
+                             recorded=None if _recorded is None else _recorded[valid],
+                             admission=_aux_rec, adaptive_dir=adaptive_dir)
             all_aux_z.append(np.asarray(_z, dtype=np.float64))
             for _k, _rec in _aux_cols.items():
                 block[:, _k] += beta * _ap.KJ_PER_KCAL * _ap.aux_term_kcal(_z, _rec['aux_center'], _rec['aux_k_kcal_mol'])

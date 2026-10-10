@@ -299,8 +299,12 @@ def _readmit_missing_workers(adaptive_dir: Path, epoch_dir: Path, epoch, registr
             return []
         adm_epoch = int(admission["epoch"])
         if int(epoch) > adm_epoch:     # phases since the admission ran without the model: z by backfill
+            from gareus.adaptive.aux_backfill import merge_backfill_entries
             from gareus.auxiliary_cv.model import AuxModel
             event["backfill"] = _backfill(adaptive_dir, epoch, AuxModel.load(adaptive_dir / MODEL_FILENAME))
+            # the rewritten files' hashes replace the record's (pooling verifies every backfill read against it)
+            _write_json(adaptive_dir / ADMISSION_FILENAME,
+                        {**admission, "backfill": merge_backfill_entries(admission.get("backfill"), event["backfill"])})
         new = [(ACTION, int(w["parent_state_id"]),
                 {"aux_center": float(w["aux_center"]), "aux_k_kcal_mol": float(w["aux_k_kcal_mol"]),
                  "aux_model_sha256": str(admission["model_sha256"]), "burnin_steps": 0},
@@ -466,9 +470,12 @@ def _drop_missing_workers_at_last_epoch(adaptive_dir: Path, epoch_dir: Path, epo
 
 
 def _post_admission_spot_check(adaptive_dir: Path, epoch_dir: Path, epoch, phase_dirs) -> None:
-    """Once, on the first post-admission phase that recorded z: recorded aux_z_00 vs the frame-derived z the
-    backfill uses, judged per worker in kT (``check_backfill_against_recorded``). Recorded in
-    aux_admission.json[``spot_check``] and the epoch report; never raises, never blocks."""
+    """Once, on the first post-admission phase that ran with the admitted model: recorded aux_z_00 vs the
+    frame-derived z the backfill uses, judged per worker in kT (``check_backfill_against_recorded``). Recorded
+    in aux_admission.json[``spot_check``] and the epoch report; pooling requires ``ok`` true once a phase ran
+    with the model (``aux_pooling.require_spot_check``). A check that cannot run there is recorded as a failure
+    (``ok`` false + the error), never left out; phases run without the model (a re-admission's boundary) are
+    not checked and nothing is recorded. Never raises."""
     adaptive_dir = Path(adaptive_dir)
     path = adaptive_dir / ADMISSION_FILENAME
     try:
@@ -478,31 +485,47 @@ def _post_admission_spot_check(adaptive_dir: Path, epoch_dir: Path, epoch, phase
         workers = [(float(w["aux_center"]), float(w["aux_k_kcal_mol"])) for w in admission.get("workers") or []]
         if not workers:
             return
-        from gareus.adaptive.aux_backfill import check_backfill_against_recorded
-        from gareus.auxiliary_cv.model import AuxModel
-        try:
-            temperature = float(json.loads((adaptive_dir / "aux_settings.json").read_text())["settings"]["temperature_k"])
-        except Exception:
-            temperature = float(AuxDiscoverySettings().temperature_k)
-        model = AuxModel.load(adaptive_dir / MODEL_FILENAME)
-        result, errors = None, []
-        for ph in phase_dirs or [epoch_dir]:
-            try:
-                result = check_backfill_against_recorded(Path(ph), model, adaptive_dir=adaptive_dir, workers=workers,
-                                                         temperature_k=temperature)
-                break
-            except Exception as exc:          # e.g. a phase that ran without the model: try the next one
-                errors.append(f"{ph}: {type(exc).__name__}: {exc}")
-        event = {"epoch": int(epoch), **(result or {"status": "not_checked", "errors": errors})}
-        _append_report_event(epoch_dir, epoch, "spot_check", event)
-        if result is not None:
-            admission["spot_check"] = event
-            _write_json(path, admission)
-            if not result["ok"]:
-                print(f"WARNING: aux z spot check: frame-derived z implies a worker energy error of "
-                      f"{result['max_energy_err_kt']:.3g} kT (> {result['tol_kt']} kT) on {result['phase']}")
+        from gareus.adaptive.aux_pooling import phase_runtime_model_shas
+        sha = str(admission.get("model_sha256"))
+        candidates = [Path(ph) for ph in (phase_dirs or [epoch_dir]) if sha in phase_runtime_model_shas(Path(ph))]
+        if not candidates:
+            return
     except Exception as exc:
-        print(f"WARNING: aux z spot check failed: {type(exc).__name__}: {exc}")
+        print(f"WARNING: aux z spot check failed before it could run: {type(exc).__name__}: {exc}")
+        return
+    try:
+        event = {"epoch": int(epoch), **_run_spot_check(adaptive_dir, candidates, workers)}
+    except Exception as exc:              # setup failed (model, settings): a failed check, not a missing one
+        event = {"epoch": int(epoch), "ok": False, "status": "error", "error": f"{type(exc).__name__}: {exc}"}
+    _append_report_event(epoch_dir, epoch, "spot_check", event)
+    try:
+        _write_json(path, {**admission, "spot_check": event})
+    except Exception as exc:              # pooling then refuses as due-but-missing
+        print(f"WARNING: could not record the aux z spot check in {path}: {type(exc).__name__}: {exc}")
+    if not event.get("ok"):
+        what = (f"frame-derived z implies a worker energy error of {event['max_energy_err_kt']:.3g} kT "
+                f"(> {event['tol_kt']} kT) on {event['phase']}" if event.get("max_energy_err_kt") is not None
+                else f"{event.get('error') or event.get('errors')}")
+        print(f"WARNING: aux z spot check failed ({what}): pooling of this campaign is refused")
+
+
+def _run_spot_check(adaptive_dir: Path, candidates, workers) -> dict:
+    """The verdict on the first candidate phase the check runs on; ``ok`` false + every error when none."""
+    from gareus.adaptive.aux_backfill import check_backfill_against_recorded
+    from gareus.auxiliary_cv.model import AuxModel
+    try:
+        temperature = float(json.loads((adaptive_dir / "aux_settings.json").read_text())["settings"]["temperature_k"])
+    except Exception:
+        temperature = float(AuxDiscoverySettings().temperature_k)
+    model = AuxModel.load(adaptive_dir / MODEL_FILENAME)
+    errors = []
+    for ph in candidates:
+        try:
+            return check_backfill_against_recorded(ph, model, adaptive_dir=adaptive_dir, workers=workers,
+                                                   temperature_k=temperature)
+        except Exception as exc:
+            errors.append(f"{ph}: {type(exc).__name__}: {exc}")
+    return {"ok": False, "status": "error", "errors": errors}
 
 
 def inject_aux_phase_args(phase_args, adaptive_dir: Path) -> None:
