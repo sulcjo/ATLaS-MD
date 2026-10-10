@@ -191,6 +191,30 @@ def _loader(camp, **kw):
     return load_parquet_adaptive_union(camp.ad, n_workers=1, **kw)
 
 
+def _driver_selected_keys(camp, monkeypatch):
+    """Run the driver union build and return its (phase, replica, step) selection BEFORE its
+    equilibrated_subsample: the keys of the rows ``union_aux_selection`` kept in the "adaptive union build" call
+    (a spy on the real function; the driver keeps exactly those rows). Also returns the driver meta."""
+    import gareus.adaptive.aux_pooling as ap
+    real = ap.union_aux_selection
+    seen = []
+
+    def spy(phase, replica, step, segment_id, state_id, *a, **kw):
+        out = real(phase, replica, step, segment_id, state_id, *a, **kw)
+        if kw.get("where") == "adaptive union build":
+            keep = np.asarray(out[0], dtype=bool)
+            seen.append([(str(p), int(r), int(t)) for p, r, t, k in
+                         zip(np.asarray(phase), np.asarray(replica), np.asarray(step), keep) if k])
+        return out
+
+    monkeypatch.setattr(ap, "union_aux_selection", spy)
+    meta = _driver(camp)
+    assert len(seen) == 1, "the driver build must call union_aux_selection exactly once"
+    keys = seen[0]
+    assert len(keys) == len(set(keys)), "the driver selection holds a duplicate observation key"
+    return set(keys), meta
+
+
 def _loader_keys(d):
     labels = [Path(p).name for p in d.meta["_epoch_source_run_dirs"]]
     src = np.asarray(d.meta["_epoch_source"])
@@ -238,7 +262,7 @@ def test_old_phases_without_record_are_conservative(tmp_path):
     assert {p["evidence"] for p in d.meta["aux_burnin_exclusions"]["phases"]} == {"no_seeding_record"}
 
 
-def test_driver_and_analyzer_select_identical_observation_keys(tmp_path):
+def test_driver_and_analyzer_select_identical_observation_keys(tmp_path, monkeypatch):
     camp = build_campaign(tmp_path, exchange=True)           # epoch_001 pulled, final continued
     d = _loader(camp)
     # rotating schedule over 3 windows, worker = window 2: replica 2 starts there, replica 1 enters at
@@ -250,7 +274,9 @@ def test_driver_and_analyzer_select_identical_observation_keys(tmp_path):
     assert rec_a["phases"][0]["carriers"] == [{"replica": r, "first_excluded_step": first[r]} for r in (0, 1, 2)]
     # ordinary states lose their carriers' rows too
     assert set(d.meta["aux_burnin_dropped"]) == {"0", "1", "2"}
-    meta = _driver(camp)
+    drv_keys, meta = _driver_selected_keys(camp, monkeypatch)
+    assert drv_keys == _loader_keys(d) == expected               # identical selections, keyed, pre-subsample
+    assert len(_loader_keys_list(d)) == len(expected)            # the analyzer holds each key once
     assert meta["aux_burnin_exclusions"] == rec_a                # same rule, same record
     # the driver subsamples after the selection: every row it kept is a kept key (its CSV has no replica
     # column: (phase, step) is compared), and its burn-in drops count exactly the excluded keys
@@ -384,10 +410,10 @@ def test_duplicates_within_one_segment_still_refuse():
         union_aux_selection(ph, rep, step, seg, np.zeros(3, dtype=np.int64), {}, segment_orders=_ORDER)
 
 
-def test_restarted_phase_both_paths_select_identical_keys(tmp_path):
+def test_restarted_phase_both_paths_select_identical_keys(tmp_path, monkeypatch):
     camp = build_campaign(tmp_path, exchange=True, restart_epoch_001=True)
     d = _loader(camp)
-    meta = _driver(camp)
+    drv_keys, meta = _driver_selected_keys(camp, monkeypatch)
     rec = d.meta["aux_burnin_exclusions"]
     assert rec["superseded"] == [{"phase": "epoch_001", "segment": "seg_001", "superseded_by": "seg_002",
                                   "rows_excluded": 3 * ROWS_PER_WINDOW, "reason": "superseded_by_resume"}]
@@ -395,6 +421,8 @@ def test_restarted_phase_both_paths_select_identical_keys(tmp_path):
     first = {2: 100_010, 1: 100_000 + 10 * (EXCHANGE_PERIOD + 1), 0: 100_000 + 10 * (2 * EXCHANGE_PERIOD + 1)}
     expected = _expected_kept(camp, {"epoch_001": first})
     assert _loader_keys(d) == expected                    # each key once: seg_001's copy superseded
+    assert len(_loader_keys_list(d)) == len(expected)
+    assert drv_keys == _loader_keys(d)                    # the driver's pre-subsample selection is identical
     # the kept epoch_001 rows are seg_002's (its z is the truth the restart wrote)
     z = dict(zip(_loader_keys_list(d), np.asarray(d.aux_z).tolist()))
     assert all(z[k] == pytest.approx(camp.truth[k]) for k in expected if k[0] == "epoch_001")
