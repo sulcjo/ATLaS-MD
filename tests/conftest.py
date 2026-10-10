@@ -172,7 +172,9 @@ def _small_campaign_argv(out: Path, windows_csv: Path, aux: bool, pep_gamd: bool
     if continue_states:
         # continuation reads the parent's restraints from its checkpoint manifest: write one per phase
         argv = argv + ["--ap-continue-states", "--checkpoint-interval", "1000"]
-    return argv + (["--ap-aux-discovery"] if aux else [])
+    # aux discovery requires --ap-continue-states (final fix wave I1); the checkpoint cadence above stays tied to
+    # the explicit continue_states request
+    return argv + (["--ap-aux-discovery", "--ap-continue-states"] if aux else [])
 
 
 class SmallCampaign:
@@ -259,7 +261,8 @@ def small_adaptive_campaign():
     ``gareus.cli.main``: epochs 0-2 + final, 3 windows, 1000 steps per phase, XTC every sample.
 
     ``continue_states=True`` adds --ap-continue-states (the worker is pulled in its first phase only).
-    ``aux=True`` adds --ap-aux-discovery, a passing aux_validation.json and the fixed discovery above.
+    ``aux=True`` adds --ap-aux-discovery (with --ap-continue-states, which it requires), a passing
+    aux_validation.json and the fixed discovery above.
     ``kill_after="registry_save:epoch_001"`` raises CampaignKilled right after the first
     WindowStateRegistry.save whose registry holds an aux worker (epoch 1's post-action save), before the
     post-save applied-actions ledger write; ``kill_after="action_report:epoch_001"`` raises in epoch 1's

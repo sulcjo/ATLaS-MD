@@ -715,7 +715,9 @@ def _add_window_args(p: argparse.ArgumentParser) -> None:
                    help="Discover a torsion-linear auxiliary CV (z3) from this campaign's own frames at each "
                         "numbered-epoch boundary from the end of epoch 1 (never the last) and admit at most "
                         "min(4, --ap-aux-reserve-slots minus live workers, free --max-replicas slots) lambda=0 worker states "
-                        "(spec 2026-10-09-cvaux-adaptive-discovery-design.md). Off by default.")
+                        "(spec 2026-10-09-cvaux-adaptive-discovery-design.md). Requires --ap-continue-states (frozen per "
+                        "campaign in adaptive_production/aux_campaign_options.json): without it every phase re-pulls "
+                        "every worker and the worker burn-in discards their samples. Off by default.")
     p.add_argument("--ap-aux-reserve-slots", type=int, default=4,
                    help="Replica slots of the P1 reserve kept for auxiliary workers (R1/R3 never use them).")
     p.add_argument("--ap-aux-settings-override", action="store_true", default=False,

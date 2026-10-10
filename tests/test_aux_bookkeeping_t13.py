@@ -10,7 +10,7 @@ from test_aux_admission_registry import _add_worker, _registry
 def _args(**kw):
     base = dict(window_mode="adaptive-production", exchange_mode="gibbs-walk", run_mode="gamd",
                 gamd_boost_type="pep-gamd-lower-dual", traj_interval=250, distance_output_interval=250,
-                exchange_interval=500, ap_topups=False, us_auto_drop_bad_windows=False)
+                exchange_interval=500, ap_topups=False, us_auto_drop_bad_windows=False, ap_continue_states=True)
     base.update(kw)
     return argparse.Namespace(**base)
 

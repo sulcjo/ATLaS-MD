@@ -2316,7 +2316,10 @@ no_eligible_worker, validation_missing, alignment, ok, refused_by_applier, error
 Model, partition, settings and admission are frozen in adaptive_production/ (aux_*.json);
 --ap-aux-settings-override replaces the settings. Workers are invisible to respring, R1-R3,
 retirement and respace; the union MBAR pools them only after admission, using recorded z
-(post-admission) or XTC-backfilled z (before). Needs adaptive-production, no --ap-topups,
+(post-admission) or XTC-backfilled z (before). Needs --ap-continue-states (frozen per campaign in
+adaptive_production/aux_campaign_options.json; a job without it is refused at parse and at driver
+start: re-pulling every worker each phase would make the per-carrier burn-in drop every worker row
+and most carriers' ordinary rows), adaptive-production, no --ap-topups,
 unrestricted exchange, a pep-gamd boost, traj_interval == distance_output_interval dividing
 exchange_interval, and no --us-auto-drop-bad-windows. Replay:
 python -m gareus.adaptive.aux_discovery replay <run_dir> --epoch N --out DIR.

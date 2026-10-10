@@ -201,7 +201,7 @@ def test_worker_energy_error_in_kt():
 def test_incompatibilities_shared_by_parse_and_driver():
     from gareus.adaptive.aux_discovery.settings import aux_discovery_incompatibilities
     ok = SimpleNamespace(window_mode="adaptive-production", traj_interval=300, distance_output_interval=300,
-                         exchange_interval=3000, run_mode="cmd", ap_aux_reserve_slots=4)
+                         exchange_interval=3000, run_mode="cmd", ap_aux_reserve_slots=4, ap_continue_states=True)
     assert aux_discovery_incompatibilities(ok) == []
     assert "--ap-topups" in aux_discovery_incompatibilities(ok, topups=True)[0]
     bad = SimpleNamespace(**{**vars(ok), "exchange_mode": "neighbor", "us_auto_drop_bad_windows": True})
@@ -214,7 +214,8 @@ def test_driver_refuses_frozen_aux_policy_with_incompatible_job_options(tmp_path
     ad = tmp_path / "adaptive_production"; ad.mkdir()
     _resolve_decision_settings(ad, AdaptiveDecisionPolicy(aux_discovery=True), override=False)  # frozen: aux on
     args = SimpleNamespace(window_mode="adaptive-production", traj_interval=300, distance_output_interval=300,
-                           exchange_interval=3000, run_mode="cmd", adaptive_production_topups=True)
+                           exchange_interval=3000, run_mode="cmd", adaptive_production_topups=True,
+                           ap_continue_states=True)
     with pytest.raises(RuntimeError, match="frozen decision settings enable aux-CV discovery.*--ap-topups"):
         run_adaptive_production_auto_loop(args, tmp_path, None, None, None, None, None, None)
 

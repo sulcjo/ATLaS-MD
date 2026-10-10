@@ -18,6 +18,11 @@ from typing import Any, Dict, List, Tuple
 
 AUX_SETTINGS_FILENAME = "aux_settings.json"
 AUX_SETTINGS_SCHEMA = "atlas-aux-discovery-settings-v1"
+AUX_CAMPAIGN_OPTIONS_FILENAME = "aux_campaign_options.json"
+AUX_CAMPAIGN_OPTIONS_SCHEMA = "atlas-aux-campaign-options-v1"
+CONTINUE_STATES_REQUIRED = ("--ap-aux-discovery needs --ap-continue-states: without it every phase re-pulls every "
+                            "worker, so the per-carrier worker burn-in drops every worker row and most carriers' "
+                            "ordinary rows in every phase")
 
 
 @dataclass(frozen=True)
@@ -141,12 +146,39 @@ def resolve_aux_settings(adaptive_dir: Path, settings: AuxDiscoverySettings, *,
     return settings, rec
 
 
+def resolve_aux_campaign_options(adaptive_dir: Path, args) -> Dict[str, Any]:
+    """Freeze the job options aux discovery depends on (today ``--ap-continue-states``) in the aux-specific record
+    ``aux_campaign_options.json`` at the campaign's first aux job; every later job must match it. A mismatch or an
+    unreadable record raises (never adopted: a recorded False would re-pull every worker). Kept out of
+    ``DECISION_SETTINGS_FIELDS`` so a non-aux campaign's decision_settings.json is unchanged."""
+    path = Path(adaptive_dir) / AUX_CAMPAIGN_OPTIONS_FILENAME
+    current = {"continue_states": bool(getattr(args, "ap_continue_states", False))}
+    if not path.exists():
+        rec = {"schema": AUX_CAMPAIGN_OPTIONS_SCHEMA, "options": current, "written_unix": time.time()}
+        _atomic_write_json(path, rec)
+        return rec
+    try:
+        rec = json.loads(path.read_text())
+        recorded = rec["options"] if rec.get("schema") == AUX_CAMPAIGN_OPTIONS_SCHEMA else None
+        if not isinstance(recorded, dict) or not isinstance(recorded.get("continue_states"), bool):
+            raise ValueError(f"schema {rec.get('schema')!r} / options {recorded!r}")
+    except Exception as exc:
+        raise RuntimeError(f"{path} is not a valid {AUX_CAMPAIGN_OPTIONS_SCHEMA} record ({exc})") from exc
+    if not recorded["continue_states"] or recorded["continue_states"] != current["continue_states"]:
+        raise RuntimeError(f"{path}: this aux campaign records continue_states={recorded['continue_states']}, this "
+                           f"job has continue_states={current['continue_states']}; aux discovery runs only with "
+                           "--ap-continue-states on every job (a re-pull per phase discards the workers' samples)")
+    return rec
+
+
 def aux_discovery_incompatibilities(args, *, topups: bool = False, reserve_slots=None) -> List[str]:
     """Options aux discovery cannot run with (spec Section 11); [] = compatible. One source for the parse-time
     refusal (``gareus.cli``) and the driver-start re-check against a campaign's frozen policy (fix wave I4).
     ``topups``: the effective top-up switch (frozen policy or this job's flag). ``reserve_slots``: the campaign's
     frozen ``aux_reserve_slots`` on a resume (overrides this job's flag)."""
     bad = []
+    if not bool(getattr(args, "ap_continue_states", False)):
+        bad.append(CONTINUE_STATES_REQUIRED)
     window_mode = str(getattr(args, "window_mode", "") or "")
     if window_mode and window_mode != "adaptive-production":
         bad.append("--ap-aux-discovery needs --window-mode adaptive-production")

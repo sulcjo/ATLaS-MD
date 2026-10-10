@@ -8888,7 +8888,8 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
     if bool(getattr(policy, "aux_discovery", False)):
         # Final fix wave I4: the frozen policy can turn aux discovery on for a job whose own flags never passed
         # the parse-time checks (a resume omitting --ap-aux-discovery); re-check them against the frozen policy.
-        from .adaptive.aux_discovery.settings import aux_discovery_incompatibilities  # noqa: PLC0415
+        from .adaptive.aux_discovery.settings import (aux_discovery_incompatibilities,  # noqa: PLC0415
+                                                      resolve_aux_campaign_options)
         _aux_bad = aux_discovery_incompatibilities(
             args, topups=bool(getattr(policy, "topups_enabled", False))
             or _arg_bool(args, "adaptive_production_topups", False),
@@ -8897,6 +8898,8 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
             raise RuntimeError("this campaign's frozen decision settings enable aux-CV discovery "
                                f"({adaptive_dir / 'decision_settings.json'}), but this job's options are "
                                "incompatible with it: " + "; ".join(_aux_bad))
+        # Final fix wave I1: --ap-continue-states frozen in the aux-specific record (not decision_settings.json).
+        resolve_aux_campaign_options(adaptive_dir, args)
         _require_valid_aux_validation(adaptive_dir, args)
     max_epochs = max(1, _arg_int(args, "adaptive_production_epochs", 3))
     # Epoch 0 also bootstraps the tICA model and (when enabled) the shared GaMD

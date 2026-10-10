@@ -55,7 +55,7 @@ def _base(tmp_path):
 
 
 def test_cli_accepts_valid_aux_discovery(tmp_path):
-    args = _parse(_base(tmp_path) + ["--ap-aux-discovery"])
+    args = _parse(_base(tmp_path) + ["--ap-aux-discovery", "--ap-continue-states"])
     assert args.adaptive_production_aux_discovery is True
     assert args.adaptive_production_aux_reserve_slots == 4
     assert args.adaptive_production_aux_settings_override is False
