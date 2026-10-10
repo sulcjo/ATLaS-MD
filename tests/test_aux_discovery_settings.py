@@ -63,14 +63,16 @@ def test_cli_accepts_valid_aux_discovery(tmp_path):
     assert policy_from_args(args).aux_discovery is True
 
 
-def test_cli_refuses_aux_discovery_with_topups(tmp_path):
+def test_cli_refuses_aux_discovery_with_topups(tmp_path, capsys):
     with pytest.raises(SystemExit):
-        _parse(_base(tmp_path) + ["--ap-aux-discovery", "--ap-topups"])
+        _parse(_base(tmp_path) + ["--ap-aux-discovery", "--ap-continue-states", "--ap-topups"])
+    assert "--ap-topups" in capsys.readouterr().err
 
 
-def test_cli_refuses_unaligned_intervals(tmp_path):
+def test_cli_refuses_unaligned_intervals(tmp_path, capsys):
     with pytest.raises(SystemExit):
-        _parse(_base(tmp_path) + ["--ap-aux-discovery", "--distance-output-interval", "300"])
+        _parse(_base(tmp_path) + ["--ap-aux-discovery", "--ap-continue-states", "--distance-output-interval", "300"])
+    assert "traj_interval == distance_output_interval" in capsys.readouterr().err
 
 
 def test_explicit_aux_model_with_adaptive_production_points_to_flag(tmp_path, capsys):
