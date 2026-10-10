@@ -206,7 +206,11 @@ def budget_for_epoch(registry: Any, policy: Any, actions: Sequence[Tuple], reser
     net, rung = _main_action_states(ctl, actions)
     cap = int(getattr(policy, "max_replicas_budget", 0) or 0)
     n_active = len(registry.active_states()) + net
-    first = reserve_allowances(cap, n_active, reserve, n_rungs=n_rungs,
+    from gareus.adaptive_production import is_auxiliary_state  # noqa: PLC0415
+    _workers = sum(1 for s in registry.active_states() if is_auxiliary_state(s))
+    _aux_hold = (max(0, int(getattr(policy, "aux_reserve_slots", 0)) - _workers)
+                 if getattr(policy, "aux_discovery", False) else 0)
+    first = reserve_allowances(cap, n_active, reserve, n_rungs=n_rungs, aux_slots=_aux_hold,
                                resolution_share=float(settings.refine_budget_fraction))
     record = {"states_requested": rung, "limit": first.add_rung_slots, "refused": False}
     if first.governed and rung > int(first.add_rung_slots or 0):
@@ -214,7 +218,7 @@ def budget_for_epoch(registry: Any, policy: Any, actions: Sequence[Tuple], reser
         record.update(refused=True, reason="add_rung_reserve_share",
                       detail=f"add_rung needs {rung} states > 1/3 of {first.free_slots} free slots")
         rung = 0
-    allowance = reserve_allowances(cap, n_active, reserve, n_rungs=n_rungs, add_rung_taken=rung,
+    allowance = reserve_allowances(cap, n_active, reserve, n_rungs=n_rungs, add_rung_taken=rung, aux_slots=_aux_hold,
                                    resolution_share=float(settings.refine_budget_fraction))
     return allowance, list(actions), record, n_rungs
 

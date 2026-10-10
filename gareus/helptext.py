@@ -2304,6 +2304,29 @@ seeds from the old one's frames. Report: epoch_NNN/cv2_respring_report.json
 --ap-cv2-resolution also on, the 3.7 table carries the
 counts and the row grades unresolved under-compressed windows CAUTION.
 
+Aux-CV discovery (--ap-aux-discovery, off by default; --ap-aux-reserve-slots 4).
+At the end of each numbered epoch N >= 1 the driver trains a z3 CVaux on epochs < N, scores
+it on holdout epoch N (one contacts+H-bond partition; z3 must beat a scrambled-label null)
+and, if it passes and adaptive_production/aux_validation.json is valid, admits at most
+min(4, --ap-aux-reserve-slots - live workers, free replica-cap slots) lambda = 0 aux
+workers from parents that stay active after the epoch's other actions, never at the last
+numbered epoch (status in epoch_NNN/aux_discovery_report.json: last_epoch, no_slots,
+physical_system_unsupported, insufficient_evidence, keep, broaden, null_uninformative_trapped_lineages, no_worker,
+no_eligible_worker, validation_missing, alignment, ok, refused_by_applier, error).
+Model, partition, settings and admission are frozen in adaptive_production/ (aux_*.json);
+--ap-aux-settings-override replaces the settings.
+--ap-aux-validation off (default required; frozen per campaign in aux_campaign_options.json) skips the
+aux_validation.json gate at the driver start and at admission, takes the k3 cap from aux_settings
+k3_max_unvalidated and records validation: off in the admission record and discovery report. Workers are invisible to respring, R1-R3,
+retirement and respace; the union MBAR pools them only after admission, using recorded z
+(post-admission) or XTC-backfilled z (before). Needs --ap-continue-states (frozen per campaign in
+adaptive_production/aux_campaign_options.json; a job without it is refused at parse and at driver
+start: re-pulling every worker each phase would make the per-carrier burn-in drop every worker row
+and most carriers' ordinary rows), adaptive-production, no --ap-topups,
+unrestricted exchange, a pep-gamd boost, traj_interval == distance_output_interval dividing
+exchange_interval, and no --us-auto-drop-bad-windows. Replay:
+python -m gareus.adaptive.aux_discovery replay <run_dir> --epoch N --out DIR.
+
 Reporting (spec 3.7). One table per phase from files that already exist:
     python -m gareus.adaptive.cv2_resolution_summary RUNS/<run>/adaptive_production [--out DIR]
 writes cv2_resolution_summary.json (cv2_resolution_summary_v3) + _states.csv/_edges.csv

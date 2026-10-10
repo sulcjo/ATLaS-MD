@@ -114,13 +114,14 @@ def settings_from(policy: Any, args: Any, plan: Optional[Mapping[str, Any]] = No
 
 def state_rows(registry: Any, diagnostics: Mapping[str, Any]) -> Tuple[List[Dict[str, Any]], int]:
     """(representative-rung views of every active state, number of centres)."""
-    from gareus.adaptive_production import AdaptiveDecisionPolicy, _centre_group_key  # noqa: PLC0415
+    from gareus.adaptive_production import (AdaptiveDecisionPolicy, _centre_group_key,  # noqa: PLC0415
+                                            ordinary_active_states)
     from gareus.adaptive.cv2_resolution import representative_ids, state_views  # noqa: PLC0415
     views = state_views(registry, diagnostics)
     rows = {int(r.get("state_id")): r for r in diagnostics.get("states", []) or []}
     policy = AdaptiveDecisionPolicy()
     groups: Dict[Tuple, List[int]] = {}
-    for s in registry.active_states():
+    for s in ordinary_active_states(registry):
         groups.setdefault(_centre_group_key(s, policy), []).append(int(s.state_id))
     out = []
     for sid in representative_ids(views):

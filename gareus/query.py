@@ -173,10 +173,12 @@ def segment_eligibility(run_dir) -> dict:
     """Per-segment sample eligibility from ``windows/<segment>.json`` (spec F04).
 
     Returns ``{segment_id: {"eligibility": ..., "reason": ...}}`` for every segment in
-    ``segments.json``; segments without a window snapshot are ``unknown`` when the run's
-    latest snapshot says residual, else ``not_applicable``.
+    ``segments.json``; segments without a window snapshot are ``aux_unpersisted`` in an auxiliary
+    run (Stage C ruling H2), else ``unknown`` when the run's latest snapshot says residual, else
+    ``not_applicable``. The samples manifest is read only for auxiliary snapshots and for
+    snapshot-less segments (raw JSON, never validated; ruling B5).
     """
-    from .kernel_identity import ELIGIBLE_NOT_APPLICABLE, ELIGIBLE_UNKNOWN, classify_segment_kernel
+    from . import kernel_identity as _ki
 
     run_dir = Path(run_dir)
     seg_json = run_dir / "segments.json"
@@ -185,19 +187,37 @@ def segment_eligibility(run_dir) -> dict:
     segs = json.loads(seg_json.read_text(encoding="utf-8"))
     out = {}
     latest_residual = False
+    snapshots: dict = {}
     for seg in segs:
         p = run_dir / "windows" / f"{seg['segment_id']}.json"
         if p.exists():
-            latest_residual = str((json.loads(p.read_text(encoding="utf-8")) or {}).get("cv2_type")) == "residual-torsion-pc"
+            snapshots[str(seg["segment_id"])] = json.loads(p.read_text(encoding="utf-8"))
+            latest_residual = str((snapshots[str(seg["segment_id"])] or {}).get("cv2_type")) == "residual-torsion-pc"
+    run_is_aux = None
+
+    def _run_is_aux() -> bool:
+        nonlocal run_is_aux
+        if run_is_aux is None:
+            manifest = read_json_file(run_dir / "run_manifest.json", {}) or {}
+            run_is_aux = (any(_ki.is_aux_kernel_record((s or {}).get("kernel_identity")) for s in snapshots.values())
+                          or (isinstance(manifest, dict) and _ki.is_aux_kernel_record(manifest.get("method_settings"))))
+        return run_is_aux
+
     for seg in segs:
         seg_id = str(seg["segment_id"])
-        p = run_dir / "windows" / f"{seg_id}.json"
-        if p.exists():
-            status, reason = classify_segment_kernel(json.loads(p.read_text(encoding="utf-8")))
+        if seg_id in snapshots:
+            snap = snapshots[seg_id] or {}
+            payload = (_ki.raw_sample_payload_schema(run_dir, seg_id)
+                       if _ki.is_aux_kernel_record(snap.get("kernel_identity")) else None)
+            status, reason = _ki.classify_segment_kernel(snap, sample_payload_schema=payload)
+        elif _run_is_aux() or ((_ki.raw_sample_payload_schema(run_dir, seg_id) or {}).get("schema")
+                               in _ki.AUX_SAMPLES_PAYLOAD_SCHEMAS):
+            status, reason = (_ki.ELIGIBLE_AUX_UNPERSISTED,
+                              "auxiliary run segment without a window snapshot: its state table is unknown (repair the run)")
         elif latest_residual:
-            status, reason = ELIGIBLE_UNKNOWN, "no window snapshot for a residual-CV run"
+            status, reason = _ki.ELIGIBLE_UNKNOWN, "no window snapshot for a residual-CV run"
         else:
-            status, reason = ELIGIBLE_NOT_APPLICABLE, "no window snapshot; not a residual-CV run"
+            status, reason = _ki.ELIGIBLE_NOT_APPLICABLE, "no window snapshot; not a residual-CV run"
         out[seg_id] = {"eligibility": status, "reason": reason}
     return out
 
@@ -384,15 +404,17 @@ def reconstruct_bias_matrix(
     v_dih: Optional[np.ndarray] = None,
     envelope=None,
     meta: Optional[dict] = None,
+    aux_z=None,
 ) -> np.ndarray:
     """Strict reduced umbrella-plus-ladder bias; missing required coordinates raise.
 
     k1/k2 stay in kcal/mol per squared CV unit. beta stays in mol/kJ.
     The existing ladder helper remains the only boost implementation.
+    aux_z (model sha -> z per sample) is passed through for active auxiliary states.
     """
     from .correctness.bias import reconstruct_bias_matrix as _strict_bias
     return _strict_bias(cv_A, cv2, windows, beta,
-                        v_pep=v_pep, v_dih=v_dih, envelope=envelope, meta=meta)
+                        v_pep=v_pep, v_dih=v_dih, envelope=envelope, meta=meta, aux_z=aux_z)
 
 
 def export_analysis_arrays_npz(
@@ -411,6 +433,10 @@ def export_analysis_arrays_npz(
     beta     : 1/(kB*T) in mol/kJ
     out_path : destination path (default: run_dir/analysis_arrays.npz)
     """
+    from .kernel_identity import refuse_aux_run, refuse_aux_snapshots
+    refuse_aux_snapshots(Path(run_dir), where="legacy analysis_arrays.npz export", depth=0)
+    # Final fix wave M3: manifest + samples payload evidence too (pure JSON; a legacy run passes unchanged).
+    refuse_aux_run(Path(run_dir), where="legacy analysis_arrays.npz export")
     samples = load_samples(run_dir)
     if not samples or "cv1" not in samples:
         raise ValueError(f"No Parquet sample data found in {run_dir}/samples/")

@@ -15,6 +15,15 @@ from ._io import IntegrityError, atomic_bytes, digest, json_bytes, json_loads
 from .bias import finite_number, normalize_windows
 
 STATE_SCHEMA = "atlas-fixed-state-v1"
+STATE_SCHEMA_V2 = "atlas-fixed-state-v2"
+STATE_ROLES = frozenset({"ordinary", "auxiliary", "sham"})
+_V1_WINDOW_FIELDS = {"window_id", "center1", "k1", "center2", "k2", "gamd_lambda"}
+_V2_WINDOW_FIELDS = _V1_WINDOW_FIELDS | {"aux_model_sha256", "aux_center", "aux_k", "instance"}
+_INSTANCE_FIELDS = {"state_instance_id", "state_role", "spawn_parent_state_id",
+                    "spawn_source_observation", "matched_additional_slot_id"}
+_OBSERVATION_FIELDS = {"run", "segment", "carrier", "state", "checkpoint", "step"}
+_SHARED_FIELDS = ("physical_system_sha256", "ensemble", "temperature_k", "pressure_bar",
+                  "fixed_box_vectors_nm", "cv1", "cv2", "boost", "energy_unit")
 
 
 @dataclass(frozen=True)
@@ -57,13 +66,133 @@ def _canonical_cv(raw: Mapping[str, Any] | None, label: str) -> dict | None:
     return cv
 
 
+def _canonical_aux_models(raw: Any) -> dict[str, dict]:
+    from ..auxiliary_cv.model import AuxModel   # lazy: avoids a cv_selection import cycle
+    if not isinstance(raw, dict):
+        raise IntegrityError("aux_models must map model_sha256 -> embedded model payload")
+    if len(raw) > 1:
+        raise IntegrityError("More than one auxiliary model per state definition is Stage F "
+                             "(spec Section 16); MVP supports one")
+    out = {}
+    for key, payload in raw.items():
+        model = AuxModel.from_mapping(payload)
+        if key != model.model_sha256:
+            raise IntegrityError(f"aux_models key {key} does not match the model's digest {model.model_sha256}")
+        out[key] = model.identity_mapping()     # identity body + sha only: no label/provenance
+    return out
+
+
+def _nonempty_str(value: Any) -> bool:
+    return isinstance(value, str) and bool(value)
+
+
+def _nonnegative_int(value: Any) -> bool:
+    return not isinstance(value, bool) and isinstance(value, int) and value >= 0
+
+
+def _canonical_instance(raw: Any, state_id: int) -> dict:
+    if not isinstance(raw, dict) or set(raw) != _INSTANCE_FIELDS:
+        raise IntegrityError(f"Window {state_id} instance needs exactly {sorted(_INSTANCE_FIELDS)}")
+    if raw["state_role"] not in STATE_ROLES:
+        raise IntegrityError(f"Window {state_id} instance.state_role must be one of {sorted(STATE_ROLES)}")
+    if not _nonempty_str(raw["state_instance_id"]):
+        raise IntegrityError(f"Window {state_id} instance.state_instance_id must be a nonempty string")
+    parent = raw["spawn_parent_state_id"]
+    if parent is not None and not _nonempty_str(parent):
+        raise IntegrityError(f"Window {state_id} instance.spawn_parent_state_id must be null or the "
+                             "parent's state_instance_id (string)")
+    obs = raw["spawn_source_observation"]
+    if obs is not None:
+        if not isinstance(obs, dict) or set(obs) != _OBSERVATION_FIELDS:
+            raise IntegrityError(f"Window {state_id} instance.spawn_source_observation must be null or "
+                                 f"exactly {sorted(_OBSERVATION_FIELDS)}")
+        bad = [k for k in ("run", "segment", "checkpoint") if not _nonempty_str(obs[k])]
+        bad += [k for k in ("carrier", "state", "step") if not _nonnegative_int(obs[k])]
+        if bad:
+            raise IntegrityError(f"Window {state_id} instance.spawn_source_observation has invalid {bad} "
+                                 "(run/segment/checkpoint: nonempty string; carrier/state/step: integer >= 0)")
+    slot = raw["matched_additional_slot_id"]
+    if slot is not None and not _nonempty_str(slot):
+        raise IntegrityError(f"Window {state_id} instance.matched_additional_slot_id must be null or a nonempty string")
+    return json_loads(json_bytes(raw))
+
+
+def _check_instances(windows: list[dict]) -> None:
+    """v2 slot table: every row has instance metadata, ids are unique, roles match the energy,
+    parents exist, W/B slots pair consistently."""
+    missing = [row["window_id"] for row in windows if "instance" not in row]
+    if missing:
+        raise IntegrityError(f"v2 state tables need instance metadata on every row; missing on windows {missing}")
+    ids = [row["instance"]["state_instance_id"] for row in windows]
+    if len(set(ids)) != len(ids):
+        raise IntegrityError(f"duplicate state_instance_id in state table: {sorted(ids)}")
+    known = set(ids)
+    for row in windows:
+        inst, k = row["instance"], row["aux_k"]
+        if inst["state_role"] == "auxiliary" and k <= 0:
+            raise IntegrityError(f"Window {row['window_id']}: state_role auxiliary requires aux_k > 0")
+        if inst["state_role"] in ("ordinary", "sham") and k != 0:
+            raise IntegrityError(f"Window {row['window_id']}: state_role {inst['state_role']} requires aux_k == 0")
+        parent = inst["spawn_parent_state_id"]
+        if parent is not None and parent == inst["state_instance_id"]:
+            raise IntegrityError(f"Window {row['window_id']}: state is its own parent "
+                                 f"(spawn_parent_state_id == state_instance_id {parent!r})")
+        if parent is not None and parent not in known:
+            raise IntegrityError(f"Window {row['window_id']}: spawn_parent_state_id {parent!r} is not a "
+                                 "state_instance_id in this table")
+    _check_slot_pairing(windows)
+
+
+_BASELINE_FIELDS = ("center1", "k1", "center2", "k2", "gamd_lambda")
+
+
+def _check_slot_pairing(windows: list[dict]) -> None:
+    """W/B matched-slot rules that one table can check (spec 5, 11.1).
+
+    Ordinary rows carry no slot. Within one table a slot id names at most one auxiliary and at
+    most one sham; when both are present (e.g. a combined analysis table) the sham's baseline
+    restraints and lambda must equal its auxiliary partner's. Pairing ACROSS arm tables (W has
+    the auxiliary, B the sham) is checked by the Stage D preregistration validator.
+    """
+    by_slot: dict[str, dict[str, dict]] = {}
+    for row in windows:
+        inst = row["instance"]
+        slot = inst["matched_additional_slot_id"]
+        if slot is None:
+            continue
+        role = inst["state_role"]
+        if role == "ordinary":
+            raise IntegrityError(f"Window {row['window_id']}: an ordinary state cannot carry "
+                                 f"matched_additional_slot_id {slot!r}")
+        roles = by_slot.setdefault(slot, {})
+        if role in roles:
+            raise IntegrityError(f"matched_additional_slot_id {slot!r} names more than one {role} state "
+                                 f"(windows {roles[role]['window_id']} and {row['window_id']})")
+        roles[role] = row
+    for slot, roles in by_slot.items():
+        if "auxiliary" in roles and "sham" in roles:
+            aux, sham = roles["auxiliary"], roles["sham"]
+            differ = [f for f in _BASELINE_FIELDS if aux[f] != sham[f]]
+            if differ:
+                raise IntegrityError(f"matched_additional_slot_id {slot!r}: sham window {sham['window_id']} "
+                                     f"baseline {differ} differs from auxiliary window {aux['window_id']}")
+
+
 def canonical_state_definition(raw: Mapping[str, Any]) -> dict[str, Any]:
     data = json_loads(json_bytes(dict(raw)))
-    required = {"schema", "physical_system_sha256", "ensemble", "temperature_k",
-                "pressure_bar", "fixed_box_vectors_nm", "cv1", "cv2",
-                "boost", "energy_unit", "windows"}
-    if set(data) != required or data.get("schema") != STATE_SCHEMA:
-        raise IntegrityError(f"State definition requires exact schema {STATE_SCHEMA}; missing/extra fields")
+    schema = data.get("schema")
+    base_required = {"schema", "physical_system_sha256", "ensemble", "temperature_k",
+                     "pressure_bar", "fixed_box_vectors_nm", "cv1", "cv2",
+                     "boost", "energy_unit", "windows"}
+    if schema == STATE_SCHEMA:
+        required, allowed_window = base_required, _V1_WINDOW_FIELDS
+    elif schema == STATE_SCHEMA_V2:
+        required, allowed_window = base_required | {"aux_models"}, _V2_WINDOW_FIELDS
+    else:
+        raise IntegrityError(f"State definition requires schema {STATE_SCHEMA} or {STATE_SCHEMA_V2}")
+    if set(data) != required:
+        raise IntegrityError(f"State definition requires exact schema {schema}; missing/extra fields")
+    aux_models = _canonical_aux_models(data["aux_models"]) if schema == STATE_SCHEMA_V2 else None
     _hash_string(data["physical_system_sha256"], "physical_system_sha256")
     data["temperature_k"] = finite_number(data["temperature_k"], "temperature_k", positive=True)
     ensemble = data["ensemble"]
@@ -94,15 +223,29 @@ def canonical_state_definition(raw: Mapping[str, Any]) -> dict[str, Any]:
         if isinstance(state_id, bool) or not isinstance(state_id, int) or state_id < 0 or state_id in seen:
             raise IntegrityError(f"Missing/invalid/duplicate window_id: {state_id!r}")
         seen.add(state_id)
-        if set(row) - {"window_id", "center1", "k1", "center2", "k2", "gamd_lambda"}:
+        if set(row) - allowed_window:
             raise IntegrityError(f"Window {state_id} has unknown physics fields; normalize explicitly")
         if energy_unit == "kJ/mol":
             row["k1"] /= 4.184
             row["k2"] /= 4.184
+        if schema == STATE_SCHEMA_V2:
+            if "aux_k" not in row:
+                raise IntegrityError(f"Window {state_id}: v2 requires explicit aux_k (inactive is 0)")
+            if energy_unit == "kJ/mol":
+                row["aux_k"] /= 4.184
+            if row["aux_k"] > 0 and row["aux_model_sha256"] not in aux_models:
+                raise IntegrityError(f"Window {state_id} names an unknown auxiliary model "
+                                     f"{row['aux_model_sha256']}")
+            if "instance" in row:
+                row["instance"] = _canonical_instance(row["instance"], state_id)
         if row["k1"] > 0 and data["cv1"] is None:
             raise IntegrityError(f"Window {state_id} needs a frozen CV1 definition")
         if row["k2"] > 0 and data["cv2"] is None:
             raise IntegrityError(f"Window {state_id} needs a frozen CV2 definition")
+    if schema == STATE_SCHEMA_V2:
+        _check_instances(windows)
+    if aux_models is not None:
+        data["aux_models"] = aux_models
     data["energy_unit"] = "kcal/mol"
     data["windows"] = sorted(windows, key=lambda row: row["window_id"])
     if any(row["gamd_lambda"] > 0 for row in windows) and not isinstance(data["boost"], dict):
@@ -124,14 +267,38 @@ def make_state_definition(
     ensemble: str, temperature_k: float, cv1: Mapping | None, cv2: Mapping | None,
     pressure_bar: float | None = None, fixed_box_vectors_nm=None,
     boost: Mapping | None = None, energy_unit: str = "kcal/mol",
+    aux_models: Mapping | None = None,
 ) -> dict[str, Any]:
-    return canonical_state_definition({
+    d = {
         "schema": STATE_SCHEMA, "physical_system_sha256": physical_system_sha256,
         "ensemble": ensemble, "temperature_k": temperature_k,
         "pressure_bar": pressure_bar, "fixed_box_vectors_nm": fixed_box_vectors_nm,
         "cv1": cv1, "cv2": cv2, "boost": boost,
         "energy_unit": energy_unit, "windows": list(windows),
-    })
+    }
+    if aux_models is not None:
+        d["schema"] = STATE_SCHEMA_V2
+        d["aux_models"] = dict(aux_models)
+    return canonical_state_definition(d)
+
+
+def hamiltonian_sha256(definition: Mapping[str, Any], window_id: int) -> str:
+    """Identity of one state's potential and ensemble, excluding slot id and spawn provenance."""
+    if isinstance(window_id, bool) or not isinstance(window_id, int):
+        raise IntegrityError(f"window_id must be an integer, got {window_id!r}")
+    state = canonical_state_definition(definition)
+    rows = [row for row in state["windows"] if row["window_id"] == window_id]
+    if len(rows) != 1:
+        raise IntegrityError(f"No window {window_id} in this state definition")
+    physics = {key: value for key, value in rows[0].items() if key not in ("window_id", "instance")}
+    if physics.get("aux_k", 0.0) == 0:
+        # An inactive auxiliary term is no term: hash like the same v1 physics.
+        for key in ("aux_model_sha256", "aux_center", "aux_k"):
+            physics.pop(key, None)
+    # An active term is identified by aux_model_sha256 (the model's content hash) inside `physics`;
+    # labels/provenance never enter.
+    shared = {key: state[key] for key in _SHARED_FIELDS}
+    return digest(json_bytes({"shared": shared, "window": physics}))
 
 
 def state_definition_hash(definition: Mapping[str, Any]) -> str:

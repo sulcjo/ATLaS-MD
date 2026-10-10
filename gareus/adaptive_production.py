@@ -212,6 +212,59 @@ class WindowState:
         return cls(**{k: v for k, v in data.items() if k in keep})
 
 
+AUX_METADATA_KEY = "aux"
+
+
+def aux_params(state) -> Optional[Dict[str, Any]]:
+    meta = getattr(state, "metadata", None) or {}
+    rec = meta.get(AUX_METADATA_KEY)
+    return rec if isinstance(rec, dict) and rec.get("role") == "auxiliary" else None
+
+
+def is_auxiliary_state(state) -> bool:
+    """The ONE predicate every consumer uses to tell an auxiliary worker from an ordinary state."""
+    return aux_params(state) is not None
+
+
+def ordinary_active_states(registry) -> List["WindowState"]:
+    """Active states that are not auxiliary workers (what every non-aux consumer iterates)."""
+    return [s for s in registry.active_states() if not is_auxiliary_state(s)]
+
+
+def _tag_auxiliary_rows(payload: Dict[str, Any], registry) -> None:
+    """Mark worker rows in a diagnostics payload; adds nothing when the registry has no worker."""
+    ids = {int(s.state_id) for s in registry.all_states() if is_auxiliary_state(s)}
+    if not ids:
+        return
+    for row in payload.get("states", []) or []:
+        if isinstance(row, dict) and int(row.get("state_id", -1)) in ids:
+            row["auxiliary"] = True
+
+
+def registry_has_aux(registry) -> bool:
+    return any(is_auxiliary_state(s) for s in registry.all_states())
+
+
+def aux_csv_cells(state, active_ids) -> Dict[str, str]:
+    rec = aux_params(state)
+    sid = f"s{int(state.state_id)}"
+    if rec is None:
+        return {"aux_center": "", "aux_k_kcal_mol": "0.0", "aux_model_sha256": "",
+                "state_instance_id": sid, "state_role": "ordinary", "spawn_parent_state_id": "",
+                "matched_additional_slot_id": "", "spawn_source_observation_json": ""}
+    parent = rec.get("spawn_parent_state_id")
+    parent_cell = f"s{int(parent)}" if parent is not None and int(parent) in active_ids else ""
+    return {"aux_center": repr(float(rec["aux_center"])), "aux_k_kcal_mol": repr(float(rec["aux_k_kcal_mol"])),
+            "aux_model_sha256": str(rec["aux_model_sha256"]), "state_instance_id": sid,
+            "state_role": "auxiliary", "spawn_parent_state_id": parent_cell,
+            "matched_additional_slot_id": "", "spawn_source_observation_json": ""}
+
+
+def _aux_csv_fieldnames(fieldnames):
+    from gareus.windows import AUX_CSV_COLUMNS, INSTANCE_CSV_COLUMNS
+    return list(fieldnames) + list(AUX_CSV_COLUMNS) + list(INSTANCE_CSV_COLUMNS)
+
+
 @dataclass
 class LifecycleEvent:
     """Auditable registry event."""
@@ -556,6 +609,8 @@ class AdaptiveDecisionPolicy:
     respring_tolerance: float = 0.05
     respring_max_fraction: float = 0.25
     respring_k2_rtol: float = 0.10
+    aux_discovery: bool = False
+    aux_reserve_slots: int = 4
 
     def __post_init__(self) -> None:
         for name, allowed in (("refine_transition_count", REFINE_TRANSITION_COUNTS),
@@ -566,6 +621,8 @@ class AdaptiveDecisionPolicy:
         from .adaptive.cv2_respring import validate_knobs  # noqa: PLC0415
         validate_knobs(self.respring_min_neff, self.respring_tolerance, self.respring_max_fraction,
                        self.respring_k2_rtol)
+        if int(self.aux_reserve_slots) < 0:
+            raise ValueError(f"aux_reserve_slots must be >= 0, got {self.aux_reserve_slots}")
 
 
 # Mirror gareus.adaptive.cv2_resolution.TRANSITION_COUNTS / R3_MODES / COVERAGE_COUNTS (not
@@ -596,6 +653,7 @@ DECISION_SETTINGS_FIELDS = (
     "refine_budget_fraction", "refine_protect_epochs", "refine_min_sigma",
     "refine_transition_count", "refine_r3_mode", "coverage_count", "coverage_bootstrap",
     "cv2_respring", "respring_min_neff", "respring_tolerance", "respring_max_fraction", "respring_k2_rtol",
+    "aux_discovery", "aux_reserve_slots",
     "cv2_bridge_sets",
 )
 DECISION_SETTINGS_FILENAME = "decision_settings.json"
@@ -700,7 +758,7 @@ class WindowStateRegistry:
         return int(self._next_state_id)
 
     def rung_lambdas(self) -> List[float]:
-        """Sorted distinct ``gamd_lambda`` over ACTIVE states.
+        """Sorted distinct ``gamd_lambda`` over ACTIVE ordinary states (auxiliary workers excluded).
 
         This is the λ-ladder as it currently stands.  ``[0.0]`` (or ``[]`` for
         an empty registry) means the ladder is inactive, and every rung-aware
@@ -708,6 +766,8 @@ class WindowStateRegistry:
         """
         seen: List[float] = []
         for state in self.active_states():
+            if is_auxiliary_state(state):
+                continue
             lam = float(state.gamd_lambda or 0.0)
             if not any(abs(lam - v) <= 1.0e-9 for v in seen):
                 seen.append(lam)
@@ -744,6 +804,8 @@ class WindowStateRegistry:
         lam = float(gamd_lambda or 0.0)
         want = _restraint_pattern(primary_k, secondary_k, secondary)
         for state in self.all_states():
+            if is_auxiliary_state(state):
+                continue
             if abs(float(state.gamd_lambda or 0.0) - lam) > 1.0e-9:
                 continue
             have = _restraint_pattern(state.primary_k, state.secondary_k, state.secondary_center)
@@ -884,6 +946,11 @@ class WindowStateRegistry:
             if has_secondary and state.secondary_center is None:
                 raise RuntimeError("active registry mixes 1D and 2D states; cannot write one explicit 2D table")
             rows.append(row)
+        if registry_has_aux(self):
+            active_ids = {int(s.state_id) for s in active}
+            fieldnames = _aux_csv_fieldnames(fieldnames)
+            for row, state in zip(rows, active):
+                row.update(aux_csv_cells(state, active_ids))
         with path.open("w", newline="") as handle:
             writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
             writer.writeheader()
@@ -1231,12 +1298,22 @@ def write_seed_bank_from_run_dirs(
     return payload
 
 
+def _seed_source_restriction(target) -> Optional[int]:
+    meta = getattr(target, "metadata", None) or {}
+    aux = meta.get(AUX_METADATA_KEY)
+    if isinstance(aux, dict) and aux.get("spawn_parent_state_id") is not None:
+        return int(aux["spawn_parent_state_id"])
+    res = meta.get("cv2_resolution")
+    if isinstance(res, dict) and res.get("seed_source_state_id") is not None:
+        return int(res["seed_source_state_id"])
+    return None
+
+
 def _seed_rows_for_target(rows: List[Dict[str, Any]], target: WindowState) -> List[Dict[str, Any]]:
     """The bank rows a target may start from: all of them, except for a state created by a
     spec 3.3 resolution action, which starts from its parent's frames (the nearest to its own
     centre) whenever the bank holds any."""
-    meta = (target.metadata or {}).get("cv2_resolution") or {}
-    parent = meta.get("seed_source_state_id")
+    parent = _seed_source_restriction(target)
     if parent is None:
         return rows
     own = [r for r in rows if str(r.get("source_state_id", "")).strip() not in ("", "None")
@@ -1793,6 +1870,9 @@ def _read_sample_dicts(run_dir: Path) -> List[Dict[str, Any]]:
                     "v_dih_kj_mol": _blank_if_nonfinite(_value_at(data, "v_dih_kj_mol", i, "")),
                     "gamd_lambda": _blank_if_nonfinite(_value_at(data, "gamd_lambda", i, "")),
                 }
+                if "aux_z_00" in data:
+                    # post-admission aux phase: the runtime z of the sample (exact; union pooling reads it)
+                    row["aux_z_00"] = _blank_if_nonfinite(_value_at(data, "aux_z_00", i, ""))
                 rows.append(row)
             return rows
     return _read_csv_dicts(run_dir / "samples.csv")
@@ -2400,8 +2480,16 @@ _HAMILTONIAN_FIELDS = ("primary_center", "primary_k", "secondary_center", "secon
                        "gamd_lambda", "gamd_sigma0p", "gamd_sigma0d")
 
 
+def _aux_identity(state) -> Tuple[Any, ...]:
+    rec = aux_params(state)
+    if rec is None:
+        return (None, 0.0, None)
+    return (float(rec["aux_center"]), float(rec["aux_k_kcal_mol"]), str(rec["aux_model_sha256"]))
+
+
 def _hamiltonian_snapshot(registry: "WindowStateRegistry") -> Dict[int, Tuple[Any, ...]]:
-    return {int(s.state_id): tuple(getattr(s, f) for f in _HAMILTONIAN_FIELDS) for s in registry.all_states()}
+    return {int(s.state_id): tuple(getattr(s, f) for f in _HAMILTONIAN_FIELDS) + _aux_identity(s)
+            for s in registry.all_states()}
 
 
 def _same_parameter(a: Any, b: Any) -> bool:
@@ -2425,7 +2513,8 @@ def _assert_hamiltonians_unchanged(before: Dict[int, Tuple[Any, ...]], registry:
         raise RuntimeError(f"apply_actions removed state_id(s) {missing} from the registry; retired states "
                            "must stay (they carry samples into the union MBAR)")
     changed = [sid for sid, ham in before.items()
-               if not all(_same_parameter(a, getattr(now[sid], f)) for a, f in zip(ham, _HAMILTONIAN_FIELDS))]
+               if not all(_same_parameter(a, b) for a, b in
+                          zip(ham, tuple(getattr(now[sid], f) for f in _HAMILTONIAN_FIELDS) + _aux_identity(now[sid])))]
     if changed:
         raise RuntimeError(f"apply_actions changed the Hamiltonian of existing state_id(s) {changed}; "
                            "a centre/k/lambda change must create a new state_id")
@@ -2502,7 +2591,7 @@ def build_geometry_edges(
     ladder inactive the grouping is skipped entirely and the result is
     byte-for-byte what it always was.
     """
-    active = registry.active_states()
+    active = ordinary_active_states(registry)
     if len(active) <= 1:
         return []
     policy = policy or AdaptiveDecisionPolicy()
@@ -2604,7 +2693,7 @@ def _non_neighbor_redundant_pairs(
     still distinct real states, so its edges look fine, while its true
     duplicate sits several rungs away and is never compared.
     """
-    active_ids = sorted(registry.active_state_ids())
+    active_ids = sorted(int(x.state_id) for x in ordinary_active_states(registry))
     if len(active_ids) < 2:
         return []
     existing_pairs = {tuple(sorted((int(a), int(b)))) for a, b, _et, _nd in geometry_edges}
@@ -2768,6 +2857,7 @@ def collect_epoch_diagnostics(
         "non_neighbor_redundancies": non_neighbor_redundancies,
         "policy": _json_ready(asdict(policy)),
     }
+    _tag_auxiliary_rows(payload, registry)
     attach_paired_cv(payload, paired, epoch_dir / "adaptive_epoch_diagnostics.json")
     if edge_metric:
         attach_edge_metric(payload, policy, epoch_dir)  # spec 3.1; no-op under the marginal metric
@@ -3052,7 +3142,7 @@ def _propose_tica_coverage_actions(
     umbrella_state_ids_arr = np.asarray(umbrella_state_ids) if umbrella_state_ids is not None else None
     replica_ids_arr = np.asarray(replica_ids) if replica_ids is not None else None
     steps_arr = np.asarray(steps) if steps is not None else None
-    active = [s for s in registry.active_states()
+    active = [s for s in ordinary_active_states(registry)
               if s.secondary_center is not None and (s.secondary_k or 0.0) > 0.0]
     finite = np.isfinite(primary) & np.isfinite(secondary)
     if not active or not np.any(finite):
@@ -3752,6 +3842,14 @@ def build_union_state_mbar_inputs(
     arrays remain the registry snapshot.
     """
     adaptive_dir = Path(adaptive_dir)
+    # CVaux Stage C (C9): the union bias omits the auxiliary term; refuse aux phases here and in every pilot dir.
+    from .kernel_identity import aux_admission_allows_pooling, refuse_aux_snapshots
+    # A campaign whose driver admitted aux workers pools them (per-sample z, aux term); otherwise refuse as before.
+    _aux_rec = aux_admission_allows_pooling(adaptive_dir)
+    if _aux_rec is None:
+        refuse_aux_snapshots(adaptive_dir, where="adaptive union build")
+    for _pilot in (pilot_dirs or []):
+        refuse_aux_snapshots(Path(_pilot), where=f"adaptive union build (pilot dir {_pilot})")
     out_prefix = adaptive_dir / output_prefix
     states = [s for s in registry.all_states() if bool(s.usable_for_mbar)]
     if not states:
@@ -3768,13 +3866,34 @@ def build_union_state_mbar_inputs(
 
     from .mbar_analysis.bias import _epoch_bias_param_vectors, _parse_epoch_window_map_native_params
 
+    _aux_workers: Dict[int, Dict[str, Any]] = {}
+    if _aux_rec is not None:
+        from .adaptive import aux_pooling as _ap  # noqa: PLC0415
+        from .kernel_identity import AuxPoolingRefused  # noqa: PLC0415
+        _aux_workers = _ap.worker_table((int(s.state_id), s.metadata) for s in states)
+        _ap.require_admitted_workers(_aux_rec, _ap.worker_table((int(s.state_id), s.metadata)
+                                                                for s in registry.all_states()),
+                                     "adaptive union build", pooled=_aux_workers)
+        for _sid, _rec in _aux_workers.items():
+            if str(_rec.get("aux_model_sha256")) != str(_aux_rec.get("model_sha256")):
+                raise AuxPoolingRefused(f"worker state {_sid} names aux model {str(_rec.get('aux_model_sha256'))[:12]}, "
+                                        f"admission record {str(_aux_rec.get('model_sha256'))[:12]}")
+
     sample_rows: List[Dict[str, Any]] = []
+    _burnin_workers: Dict[str, Any] = {}
+    _burnin_evidence: Dict[str, str] = {}
+    _segment_orders: Dict[str, Dict[str, int]] = {}
+    if _aux_workers:
+        from .adaptive.aux_seeding_record import read_burnin_workers  # noqa: PLC0415
     # Per source: (primary_center, primary_k, secondary_center, secondary_k) vectors
     # over the union states, native where that source's own map records them.
     source_params: List[Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = []
     for source_label, sample_dir in _epoch_sample_sources(
         adaptive_dir, include_epochs=include_epochs, pilot_dirs=pilot_dirs, tica_cv_version=tica_cv_version
     ):
+        if _aux_rec is not None:
+            # Admitted campaign: a model-run segment the eligibility rule would drop (aux_unpersisted) refuses.
+            _ap.require_persisted_model_segments(Path(sample_dir), str(_aux_rec["model_sha256"]), source_label)
         rows = _read_sample_dicts(sample_dir)
         if not rows:
             continue
@@ -3783,6 +3902,7 @@ def build_union_state_mbar_inputs(
         source_index = len(source_params)
         source_params.append(_epoch_bias_param_vectors(
             native, state_ids.tolist(), primary_centers, primary_k, secondary_centers, secondary_k))
+        _source_first_row = len(sample_rows)
         for row in rows:
             w = _float_or_none(row.get("window"))
             cv = _float_or_none(row.get("cv_A", row.get("primary_cv_value")))
@@ -3809,7 +3929,30 @@ def build_union_state_mbar_inputs(
                 "v_dih_kj_mol": "" if v_dih is None else float(v_dih),
                 "usable_for_mbar": int(source_label.startswith("final") or include_epochs),
                 "_source_index": source_index,
+                **({"_replica": _float_or_none(row.get("replica")), "_z_recorded": _float_or_none(row.get("aux_z_00")),
+                    "_segment": str(row.get("segment_id") or ""),
+                    "_z_has_column": "aux_z_00" in row}
+                   if _aux_workers else {}),
             })
+        if _aux_workers and len(sample_rows) > _source_first_row:
+            _new = sample_rows[_source_first_row:]
+            _recorded = [r["_z_recorded"] for r in _new]
+            _has_recorded = any(r["_z_has_column"] for r in _new)
+            _bad = [r for r in _new if r["_replica"] is None or r["step"] == ""]
+            if _bad:
+                raise AuxPoolingRefused(f"{source_label}: {len(_bad)} rows without aux z (no replica/step to join on)")
+            _z = _ap.phase_z(
+                source_label, Path(sample_dir), [int(r["_replica"]) for r in _new], [int(r["step"]) for r in _new],
+                str(_aux_rec["model_sha256"]),
+                recorded=[np.nan if v is None else v for v in _recorded] if _has_recorded else None,
+                admission=_aux_rec, adaptive_dir=adaptive_dir)
+            for _r, _zv in zip(_new, _z.tolist()):
+                _r["aux_z"] = float(_zv)
+        if _aux_workers:
+            # F01: this phase's US-pulled workers, from its seeding record (no record = every worker).
+            _burnin_workers[source_label], _burnin_evidence[source_label] = read_burnin_workers(
+                Path(sample_dir), _aux_workers, where=source_label)
+            _segment_orders[source_label] = _ap.segment_order(Path(sample_dir))
 
     if not sample_rows:
         raise RuntimeError(f"no usable sample rows found under {adaptive_dir}")
@@ -3819,6 +3962,24 @@ def build_union_state_mbar_inputs(
     # equilibrated_subsample, then rebuild sample_rows from kept indices.
     # All downstream numpy arrays are derived from sample_rows so alignment is
     # preserved automatically.
+    _burnin_dropped: Dict[str, int] = {}
+    _burnin_record = None
+    if _aux_workers:
+        # Resume supersession (a restarted segment replaces the whole earlier one), then F01 worker burn-in:
+        # per carrier, inside each phase whose seeding record says a worker was US-pulled there
+        # (aux_pooling.union_aux_selection, the analyzer loader's rule too); burnin_phase_epoch never filters.
+        _bk, _burnin_record, _ = _ap.union_aux_selection(
+            np.asarray([r["source"] for r in sample_rows], dtype=object),
+            np.asarray([r["_replica"] for r in sample_rows], dtype=np.float64),
+            np.asarray([r["step"] for r in sample_rows], dtype=np.int64),
+            np.asarray([r["_segment"] for r in sample_rows], dtype=object),
+            np.asarray([r["sampled_state_id"] for r in sample_rows], dtype=np.int64),
+            _burnin_workers, segment_orders=_segment_orders, evidence=_burnin_evidence,
+            where="adaptive union build")
+        _burnin_dropped = _ap.burnin_dropped_by_state(_burnin_record)
+        sample_rows = [r for r, k in zip(sample_rows, _bk.tolist()) if k]
+        if not sample_rows:
+            raise RuntimeError(f"no usable sample rows found under {adaptive_dir} (all were worker burn-in)")
     from .mbar_subsample import equilibrated_subsample as _es  # noqa: PLC0415
     _state_to_indices: Dict[int, List[int]] = {}
     for _gi, _row in enumerate(sample_rows):
@@ -3838,6 +3999,12 @@ def build_union_state_mbar_inputs(
         _subsample_counts[str(_sid)] = {"raw": _raw, "t0": _t0, "kept": _kept, "g": _g,
                                         "status": str(_res.status)}
     sample_rows = [sample_rows[i] for i in sorted(_kept_global)]
+    for _sid, _n in _burnin_dropped.items():
+        _subsample_counts.setdefault(str(_sid), {"raw": 0, "t0": 0, "kept": 0, "g": 1.0, "status": "all_burnin"})
+        _subsample_counts[str(_sid)]["burnin_dropped"] = int(_n)
+    for _sid in _aux_workers:
+        if str(_sid) in _subsample_counts:
+            _subsample_counts[str(_sid)].setdefault("burnin_dropped", 0)
     if size_guard is not None:
         size_guard(len(sample_rows), len(states))
 
@@ -3863,6 +4030,15 @@ def build_union_state_mbar_inputs(
         rows_src = np.flatnonzero(source_of_row == src)
         umbrella_bias_kcal[rows_src] = _union_umbrella_bias_kcal(
             cv_values[rows_src], secondary_values[rows_src], *source_params[int(src)])
+    aux_z_values = None
+    if _aux_workers:
+        # Worker restraint 0.5 k (z - c)^2 (kcal/mol) for every sample under every worker state; added before
+        # the kJ conversion and the ladder boost (workers are lambda = 0).
+        aux_z_values = np.asarray([float(r["aux_z"]) for r in sample_rows], dtype=np.float64)
+        for _j, _st in enumerate(states):
+            _rec = _aux_workers.get(int(_st.state_id))
+            if _rec is not None:
+                umbrella_bias_kcal[:, _j] += _ap.aux_term_kcal(aux_z_values, _rec["aux_center"], _rec["aux_k_kcal_mol"])
     umbrella_bias_kj = 4.184 * umbrella_bias_kcal
 
     # λ-ladder boost term: added by the one shared helper every MBAR
@@ -3927,6 +4103,11 @@ def build_union_state_mbar_inputs(
         state_lambdas=state_lambdas,
         v_pep_kj_mol=v_pep_values,
         v_dih_kj_mol=v_dih_values,
+        **({"aux_z": aux_z_values,
+            "aux_center": np.asarray([float(_aux_workers[int(s.state_id)]["aux_center"]) if int(s.state_id) in _aux_workers
+                                      else np.nan for s in states], dtype=np.float64),
+            "aux_k": np.asarray([float(_aux_workers[int(s.state_id)]["aux_k_kcal_mol"]) if int(s.state_id) in _aux_workers
+                                 else 0.0 for s in states], dtype=np.float64)} if _aux_workers else {}),
     )
     meta = {
         "schema_version": "adaptive_union_mbar_inputs_v1",
@@ -3944,6 +4125,10 @@ def build_union_state_mbar_inputs(
         "subsample_counts_per_state": _subsample_counts,
     }
     meta.update(_ladder_meta)
+    if _aux_workers:
+        meta["aux_burnin_exclusions"] = _burnin_record
+        meta["aux_model_sha256"] = str(_aux_rec["model_sha256"])
+        meta["aux_state_ids"] = sorted(_aux_workers)
     json_path = out_prefix.with_suffix(".json")
     write_json(json_path, _json_ready(meta))
     return meta
@@ -4416,6 +4601,7 @@ def collect_final_combined_diagnostics(
         "edges": [e.to_dict() for e in edge_rows],
         "policy": _json_ready(asdict(policy)),
     }
+    _tag_auxiliary_rows(payload, registry)
     attach_paired_cv(payload, paired, adaptive_dir / "adaptive_final_combined_diagnostics.json")
     attach_edge_metric(payload, policy, adaptive_dir)  # spec 3.1; no-op under the marginal metric
     write_json(adaptive_dir / "adaptive_final_combined_diagnostics.json", payload)
@@ -5360,7 +5546,7 @@ def propose_actions_from_diagnostics(
             interloper = si if off_i else sj
             state_max_overlap[interloper] = max(state_max_overlap.get(interloper, 0.0), float(ov))
         retire_candidates: List[int] = []
-        for state in registry.active_states():
+        for state in ordinary_active_states(registry):
             sid = int(state.state_id)
             diag = state_rows.get(sid, {})
             if sid in graph_critical or sid in bad_touching:
@@ -5416,7 +5602,7 @@ def propose_actions_from_diagnostics(
 
     # 3. Explicitly record extensions for states that are obviously undersampled.
     action_keys = {(a[0], a[1]) for a in actions if len(a) > 1}
-    for state in registry.active_states():
+    for state in ordinary_active_states(registry):
         sid = int(state.state_id)
         if ("retire", sid) in action_keys:
             continue
@@ -5427,7 +5613,7 @@ def propose_actions_from_diagnostics(
 
 
 def _graph_articulation_states(registry: WindowStateRegistry) -> set[int]:
-    active_ids = registry.active_state_ids()
+    active_ids = [int(x.state_id) for x in ordinary_active_states(registry)]
     if len(active_ids) <= 2:
         return set(active_ids)
     edges = [(a, b) for a, b, _t, _d in build_geometry_edges(registry)]
@@ -5457,8 +5643,8 @@ def _graph_articulation_states(registry: WindowStateRegistry) -> set[int]:
 
 
 def active_graph_connected(registry: WindowStateRegistry) -> bool:
-    """Return True if the active-state geometry graph is connected."""
-    active_ids = registry.active_state_ids()
+    """Return True if the ordinary (non-worker) active-state geometry graph is connected."""
+    active_ids = [int(x.state_id) for x in ordinary_active_states(registry)]
     if len(active_ids) <= 1:
         return True
     adj = {sid: set() for sid in active_ids}
@@ -5526,6 +5712,11 @@ def write_state_subset_window_csv(
         "created_epoch", "source", "reason", "usable_for_mbar", "burnin_steps",
         "gamd_lambda",
     ]
+    if registry_has_aux(registry):
+        active_ids = {int(s.state_id) for s in states}
+        fieldnames = _aux_csv_fieldnames(fieldnames)
+        for row, state in zip(rows, states):
+            row.update(aux_csv_cells(state, active_ids))
     with path.open("w", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
@@ -6691,6 +6882,7 @@ def collect_segmented_epoch_diagnostics(epoch_dir: Path, registry: WindowStateRe
         "active_graph_connected": active_graph_connected(registry),
         "policy": _json_ready(asdict(policy)),
     }
+    _tag_auxiliary_rows(payload, registry)
     attach_paired_cv(payload, paired, epoch_dir / "adaptive_epoch_diagnostics.json")
     attach_edge_metric(payload, policy, epoch_dir)  # spec 3.1; no-op under the marginal metric
     write_json(epoch_dir / "adaptive_epoch_diagnostics.json", payload)
@@ -7377,6 +7569,8 @@ def run_scheduled_adaptive_epoch(
         seg_args.gamd_production_steps = int(steps)
         seg_args.window_mode = "adaptive"
         seg_args.windows_2d_csv = str(windows_csv)
+        from .adaptive.aux_admission_io import inject_aux_phase_args  # noqa: PLC0415
+        inject_aux_phase_args(seg_args, epoch_dir.parent)
         seg_args.adaptive_feedback_enabled = False
         seg_args.adaptive_feedback_pilot = False
         seg_args.adaptive_feedback_final_production = False
@@ -7740,7 +7934,7 @@ class AdaptiveProductionController:
         policy = AdaptiveDecisionPolicy()
         lam = float(lambda_new)
         groups: Dict[Tuple[int, Optional[int]], List[WindowState]] = {}
-        for state in self.registry.active_states():
+        for state in ordinary_active_states(self.registry):
             groups.setdefault(_centre_group_key(state, policy), []).append(state)
         created: List[WindowState] = []
         for _key, members in sorted(groups.items(), key=lambda kv: _sortable_centre_key(kv[0])):
@@ -7766,7 +7960,7 @@ class AdaptiveProductionController:
         their own Hamiltonian; nothing about any other state changes.
         """
         retired: List[int] = []
-        for state in list(self.registry.active_states()):
+        for state in list(ordinary_active_states(self.registry)):
             if abs(float(state.gamd_lambda or 0.0) - float(lam)) > 1.0e-9:
                 continue
             if bool((state.metadata or {}).get("mandatory")):
@@ -7786,7 +7980,7 @@ class AdaptiveProductionController:
     def _centre_members(self, state: WindowState) -> List[WindowState]:
         """Every ACTIVE state at ``state``'s umbrella centre (all rungs), via the centre key."""
         key = _centre_group_key(state, self.policy)
-        members = [s for s in self.registry.active_states() if _centre_group_key(s, self.policy) == key]
+        members = [s for s in ordinary_active_states(self.registry) if _centre_group_key(s, self.policy) == key]
         return sorted(members, key=lambda s: (float(s.gamd_lambda or 0.0), int(s.state_id)))
 
     def _refuse(self, index: int, kind: str, reason: str, detail: str, **extra: Any) -> None:
@@ -7960,8 +8154,8 @@ class AdaptiveProductionController:
         if not drop and not add:
             return None, ("no_change", "no rung to drop or add after filtering", {})
         policy = AdaptiveDecisionPolicy()
-        centres = {_centre_group_key(s, policy) for s in self.registry.active_states()}
-        n_drop = sum(1 for s in self.registry.active_states()
+        centres = {_centre_group_key(s, policy) for s in ordinary_active_states(self.registry)}
+        n_drop = sum(1 for s in ordinary_active_states(self.registry)
                      if any(abs(float(s.gamd_lambda or 0.0) - x) <= 1.0e-9 for x in drop)
                      and not bool((s.metadata or {}).get("mandatory")))
         refusal = self._budget_refusal("respace_ladder", len(centres) * len(add) - n_drop)
@@ -8003,11 +8197,13 @@ class AdaptiveProductionController:
         if kind == "respring":
             parent = self.registry.get_state(int(action[1]))
             return per_centre - (len(self._centre_members(parent)) if parent is not None and parent.active else 0)
+        if kind == "admit_aux":
+            return 1
         if kind == "add_rung":
             lam = float(action[1])
             policy = AdaptiveDecisionPolicy()
             groups: Dict[Tuple, List[WindowState]] = {}
-            for state in self.registry.active_states():
+            for state in ordinary_active_states(self.registry):
                 groups.setdefault(_centre_group_key(state, policy), []).append(state)
             return sum(1 for members in groups.values()
                        if not any(abs(float(s.gamd_lambda or 0.0) - lam) <= 1.0e-9 for s in members))
@@ -8053,6 +8249,11 @@ class AdaptiveProductionController:
             plan, added = {}, self._states_added_by(action)
         elif kind == "respace_ladder":
             return self._validate_respace_ladder(action[1], action[2])
+        elif kind == "admit_aux":
+            aux_plan, refusal = self._validate_admit_aux(action)
+            if refusal is not None:
+                return None, refusal
+            plan, added = aux_plan, 1
         else:
             raise ValueError(f"unknown adaptive-production action {kind!r}")
         budget = self._budget_refusal(kind, added)
@@ -8060,6 +8261,58 @@ class AdaptiveProductionController:
             detail = budget.pop("detail")
             return None, ("max_replicas_budget", detail, budget)
         return {"plan": plan}, None
+
+    def _validate_admit_aux(self, action: Tuple) -> Tuple[Optional[Dict[str, Any]], Optional[Tuple]]:
+        """Validate one ``admit_aux`` action; mutates nothing.
+
+        Actions are validated one at a time against the live registry (each earlier accepted
+        action already executed), so worker count, duplicates and the model sha are read from
+        the registry itself; no pending bookkeeping exists to double count."""
+        _, parent_id, params = action[0], action[1], action[2]
+        parent = self.registry.get_state(int(parent_id))  # None for an unknown id
+        if parent is None:
+            return None, ("unknown_state", f"parent {parent_id} not in registry", {})
+        if not parent.active:
+            return None, ("inactive", f"parent {parent_id} is retired", {})
+        if is_auxiliary_state(parent):
+            return None, ("aux_parent_is_aux", f"parent {parent_id} is itself a worker", {})
+        if abs(float(parent.gamd_lambda or 0.0)) > 1.0e-12:
+            return None, ("aux_parent_not_lambda0", f"parent lambda {parent.gamd_lambda} is not 0", {})
+        sha = str(params["aux_model_sha256"])
+        workers = [s for s in self.registry.all_states() if is_auxiliary_state(s)]
+        shas = {str(aux_params(s)["aux_model_sha256"]) for s in workers}
+        if shas and shas != {sha}:
+            return None, ("aux_model_mismatch", f"campaign model {sorted(shas)} vs {sha}", {})
+        key = (int(parent_id), round(float(params["aux_center"]), 6), round(float(params["aux_k_kcal_mol"]), 6))
+        for s in workers:
+            if not s.active:
+                continue
+            a = aux_params(s)
+            if (int(a["spawn_parent_state_id"]), round(float(a["aux_center"]), 6),
+                    round(float(a["aux_k_kcal_mol"]), 6)) == key:
+                return None, ("aux_duplicate", f"worker {key} already present", {})
+        n_workers = sum(1 for s in workers if s.active)
+        slots = int(getattr(self.policy, "aux_reserve_slots", 0))
+        if n_workers + 1 > slots:
+            return None, ("aux_budget", f"{n_workers} workers + 1 > aux slice {slots}",
+                          {"n_workers": n_workers, "aux_reserve_slots": slots})
+        return {"parent": parent, "params": dict(params)}, None
+
+    def _execute_admit_aux(self, epoch: int, action: Tuple, plan: Dict[str, Any]) -> None:
+        parent, params = plan["parent"], plan["params"]
+        provenance = dict(action[4].get("aux") or {}) if len(action) > 4 and action[4] else {}
+        core = {"role": "auxiliary", "aux_center": float(params["aux_center"]),
+                "aux_k_kcal_mol": float(params["aux_k_kcal_mol"]),
+                "aux_model_sha256": str(params["aux_model_sha256"]),
+                "state_instance_id": None, "spawn_parent_state_id": int(parent.state_id),
+                "admitted_epoch": int(epoch)}
+        meta = {AUX_METADATA_KEY: {**provenance, **core}}  # core keys last: provenance never overrides
+        self.registry.add_state(parent.primary_center, parent.primary_k, parent.secondary_center,
+                                parent.secondary_k, gamd_sigma0p=parent.gamd_sigma0p,
+                                gamd_sigma0d=parent.gamd_sigma0d, gamd_lambda=0.0,
+                                parent_state_id=int(parent.state_id), epoch=int(epoch),
+                                source="adaptive_production_aux", reason=str(action[3]),
+                                burnin_steps=int(params.get("burnin_steps", 0)), metadata=meta)
 
     def _execute_action(self, epoch: int, action: Tuple, plan: Dict[str, Any]) -> None:
         """Apply one validated action from its plan."""
@@ -8084,6 +8337,8 @@ class AdaptiveProductionController:
             else:
                 self._add_centre_on_every_rung(epoch, child["params"], parent=parent, source="tica_coverage",
                                                reason=reason, metadata=dict(action[4]))
+        elif kind == "admit_aux":
+            self._execute_admit_aux(epoch, action, plan["plan"])
         elif kind == "add_rung":
             _, lambda_new, reason = action
             self._add_rung_at_every_centre(epoch, float(lambda_new), str(reason))
@@ -8284,6 +8539,8 @@ def policy_from_args(args: Any) -> AdaptiveDecisionPolicy:
         respring_tolerance=_arg_float(args, "adaptive_production_respring_tolerance", 0.05),
         respring_max_fraction=_arg_float(args, "adaptive_production_respring_max_fraction", 0.25),
         respring_k2_rtol=_arg_float(args, "adaptive_production_respring_k2_rtol", 0.10),
+        aux_discovery=_arg_bool(args, "adaptive_production_aux_discovery", False),
+        aux_reserve_slots=_arg_int(args, "adaptive_production_aux_reserve_slots", 4),
     )
 
 
@@ -8585,6 +8842,21 @@ def continuation_parent_dirs(adaptive_dir, epoch_dir, segment_name: str, *, enab
     return [str(p) for p in prior_phase_parent_dirs(adaptive_dir, Path(epoch_dir) / "x")]
 
 
+def _require_valid_aux_validation(adaptive_dir: Path, args) -> None:
+    """F03: driver-start check of ``aux_validation.json`` with the admission hook's typed validator, so a
+    malformed record fails before MD. Missing, failed-check and timestep-mismatch records are left to admission."""
+    from .adaptive.aux_discovery.validation import check_validation_record  # noqa: PLC0415
+    path = Path(adaptive_dir) / "aux_validation.json"
+    if not path.exists():
+        return
+    val = check_validation_record(path, timestep_fs=float(args.timestep_fs))
+    # A clean failed check or a timestep mismatch is a non-admission (the hook refuses, campaign continues
+    # without workers); only a malformed record raises.
+    if not val.ok and not (val.reason == "validation_timestep_mismatch"
+                           or val.reason.startswith("validation_failed:")):
+        raise RuntimeError(f"{path} is not a valid aux validation record: {val.reason}")
+
+
 def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, forcefield, topology, equil_state, progress=None) -> Dict[str, Any]:
     """Run adaptive production by calling the existing GAREUS worker per epoch.
 
@@ -8613,6 +8885,23 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
     # connectivity, top-up partners), so every phase runs with the campaign's frozen value,
     # whatever this job's --layout-neighbour-rule says (phase args are copies of args).
     args.layout_neighbour_rule = str(policy.layout_neighbour_rule)
+    if bool(getattr(policy, "aux_discovery", False)):
+        # Final fix wave I4: the frozen policy can turn aux discovery on for a job whose own flags never passed
+        # the parse-time checks (a resume omitting --ap-aux-discovery); re-check them against the frozen policy.
+        from .adaptive.aux_discovery.settings import (aux_discovery_incompatibilities,  # noqa: PLC0415
+                                                      resolve_aux_campaign_options)
+        _aux_bad = aux_discovery_incompatibilities(
+            args, topups=bool(getattr(policy, "topups_enabled", False))
+            or _arg_bool(args, "adaptive_production_topups", False),
+            reserve_slots=int(policy.aux_reserve_slots))
+        if _aux_bad:
+            raise RuntimeError("this campaign's frozen decision settings enable aux-CV discovery "
+                               f"({adaptive_dir / 'decision_settings.json'}), but this job's options are "
+                               "incompatible with it: " + "; ".join(_aux_bad))
+        # Final fix wave I1: --ap-continue-states frozen in the aux-specific record (not decision_settings.json).
+        resolve_aux_campaign_options(adaptive_dir, args)
+        if str(getattr(args, "ap_aux_validation", None) or "required") != "off":
+            _require_valid_aux_validation(adaptive_dir, args)
     max_epochs = max(1, _arg_int(args, "adaptive_production_epochs", 3))
     # Epoch 0 also bootstraps the tICA model and (when enabled) the shared GaMD
     # envelope recalibration -- both need only a short look at real sampling, not
@@ -8943,6 +9232,8 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
                 print(f"    Adaptive-production epoch {epoch + 1}/{max_epochs}: checkpoint manifest found; resuming from {epoch_dir}")
             if current_windows_csv is not None:
                 epoch_args.windows_2d_csv = str(current_windows_csv)
+                from .adaptive.aux_admission_io import inject_aux_phase_args  # noqa: PLC0415
+                inject_aux_phase_args(epoch_args, adaptive_dir)
             if bool(policy.propagate_seed_bank) and current_seed_bank is not None and Path(current_seed_bank).exists():
                 epoch_args.seed_conformers_dir = Path(current_seed_bank)
             # Adaptive-production epochs are real sampling, so inherit
@@ -9107,6 +9398,16 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
                     phase_dirs=([Path(s.get("dir")) for s in scheduled_summary.get("segments", []) if s.get("dir")]
                                 if scheduled_summary is not None else [epoch_dir]),
                     gate=_coupling_gate)
+            if bool(policy.aux_discovery):
+                # Adaptive auxiliary-CV discovery (off by default): after every other proposer; writes
+                # epoch_NNN/aux_discovery_report.json and, on success, the frozen aux_* files. Never raises.
+                from .adaptive.aux_admission_io import run_epoch_aux_discovery  # noqa: PLC0415
+                actions = run_epoch_aux_discovery(
+                    adaptive_dir=adaptive_dir, epoch_dir=epoch_dir, epoch=epoch, registry=registry,
+                    diagnostics=diagnostics, actions=actions, policy=policy, args=args, out_dir=out_dir,
+                    phase_dirs=([Path(s.get("dir")) for s in scheduled_summary.get("segments", []) if s.get("dir")]
+                                if scheduled_summary is not None else [epoch_dir]),
+                    gate=_coupling_gate, max_epochs=max_epochs)
         action_report = None
         if _arg_bool(args, "adaptive_production_write_action_reports", True):
             try:
@@ -9172,12 +9473,22 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
                 # Spec 3.7: the epoch's CV2-resolution table beside the report(s). Never raises.
                 from .adaptive.cv2_resolution_summary import write_epoch_summary  # noqa: PLC0415
                 write_epoch_summary(epoch_dir, diagnostics)
-        registry_paths = registry.save(adaptive_dir)
+            if bool(policy.aux_discovery):
+                from .adaptive import aux_admission_io as _aux_io  # noqa: PLC0415
+                # Final fix wave C1: aux_admission.json lists exactly the registry's workers before the save.
+                _aux_io.annotate_report_with_refusals(adaptive_dir, epoch_dir, actions, _refused_actions,
+                                                      registry=registry)
         if _post_action_registry is not None:
             # A recovered epoch's ``actions`` are the ledger's applied list; carry its refusals
             # over as they are (their index points into the original proposal list).
             _refused_actions = [{k: v for k, v in r.items() if k != "index"}
                                 for r in (_ledger.get("refused") or [])]
+        # The ledger is written BEFORE the save as well, with the digest the save will produce: a job
+        # killed right after the save (before the post-save write) still finds a matching ledger.
+        # Killed before the save, the digest does not match the old registry and the ledger is stale.
+        _record_applied_actions(epoch_dir, epoch, actions, registry_path, refused=_refused_actions,
+                                registry_digest=_registry_json_digest(registry))
+        registry_paths = registry.save(adaptive_dir)
         _record_applied_actions(epoch_dir, epoch, actions, registry_path, refused=_refused_actions)
         _reassign_seeds_after_actions(current_seed_bank, registry)
         if float(policy.slow_mode_reseed_fraction or 0.0) > 0.0:
@@ -9601,6 +9912,8 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
             final_args.gamd_production_steps = int(actual_final_steps)
             final_args.window_mode = "adaptive"
             final_args.windows_2d_csv = str(final_windows_csv)
+            from .adaptive.aux_admission_io import inject_aux_phase_args  # noqa: PLC0415
+            inject_aux_phase_args(final_args, adaptive_dir)
             final_args.adaptive_feedback_enabled = False
             final_args.adaptive_feedback_pilot = False
             final_args.adaptive_feedback_final_production = False
@@ -9715,6 +10028,8 @@ def run_adaptive_production_auto_loop(args, out_dir: Path, openmm, app, unit, fo
         ext_args.gamd_production_steps = int(actual_ext_steps)
         ext_args.window_mode = "adaptive"
         ext_args.windows_2d_csv = str(final_windows_csv)
+        from .adaptive.aux_admission_io import inject_aux_phase_args  # noqa: PLC0415
+        inject_aux_phase_args(ext_args, adaptive_dir)
         ext_args.adaptive_feedback_enabled = False
         ext_args.adaptive_feedback_pilot = False
         ext_args.adaptive_feedback_final_production = False
@@ -9994,8 +10309,16 @@ def _require_phase_within_replica_cap(args, n_states: int, phase_dir: Path, labe
         f"{phase_dir}")
 
 
+def _registry_json_digest(registry: "WindowStateRegistry") -> str:
+    """sha256 of the bytes ``registry.save_json`` writes (``write_json``: indent 2, sorted keys)."""
+    from .io import _NumpyEncoder
+    text = json.dumps(registry.to_dict(), indent=2, sort_keys=True, cls=_NumpyEncoder)
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
 def _record_applied_actions(epoch_dir: Path, epoch: int, actions: Sequence[Tuple], registry_path: Path,
-                            refused: Optional[Sequence[Dict[str, Any]]] = None) -> Path:
+                            refused: Optional[Sequence[Dict[str, Any]]] = None,
+                            registry_digest: Optional[str] = None) -> Path:
     """Atomically record that ``actions`` were applied and saved as ``registry_path``.
 
     Written right after ``registry.save``: a resume that finds this file with a matching
@@ -10010,7 +10333,8 @@ def _record_applied_actions(epoch_dir: Path, epoch: int, actions: Sequence[Tuple
                "actions": _jsonable_action([a for i, a in enumerate(actions) if i not in skip]),
                "refused": [{**r, "proposal": _jsonable_action(list(actions)[int(r["index"])])}
                            if "index" in r else dict(r) for r in refused],
-               "registry_digest": _file_sha256(registry_path), "written_unix": time.time()}
+               "registry_digest": registry_digest if registry_digest is not None else _file_sha256(registry_path),
+               "written_unix": time.time()}
     tmp = path.with_name(path.name + f".tmp{os.getpid()}")
     tmp.write_text(json.dumps(payload, sort_keys=True))
     os.replace(tmp, path)
@@ -10206,7 +10530,8 @@ def _action_to_dict(action: Tuple) -> Dict[str, Any]:
 
 def _adaptive_production_converged(actions: Sequence[Tuple], diagnostics: Dict[str, Any], policy: AdaptiveDecisionPolicy) -> bool:
     # Any proposed insertion or resolution blocks convergence (spec P2: split/refine too).
-    if any(str(a[0]) in ("add", "split", "refine", "insert") for a in actions):
+    # An aux admission (fix wave I2) blocks it too: the workers need at least one more numbered epoch.
+    if any(str(a[0]) in ("add", "split", "refine", "insert", "admit_aux") for a in actions):
         return False
     weak_edges = [edge for edge in diagnostics.get("edges", []) if _edge_is_measured_weak(edge, policy)]
     return len(weak_edges) == 0
@@ -10377,6 +10702,11 @@ def evaluate_adaptive_convergence_gate(
 
     if extend_like and not bool(policy.convergence_allow_extend_actions):
         continue_reasons.append(f"{len(extend_like)} extend action(s) proposed")
+
+    aux_admits = [a for a in action_rows if a.get("action") == "admit_aux"]
+    if aux_admits:
+        # Fix wave I2: newly admitted aux workers need the next numbered epoch (their burn-in phase).
+        continue_reasons.append(f"{len(aux_admits)} aux worker admission(s) proposed")
 
     if bool(getattr(policy, "cv2_resolution", False)):
         # Spec 3.3: R1-R3 work still pending (proposed, or refused for want of reserve/budget).

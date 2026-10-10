@@ -309,7 +309,8 @@ def _method_settings(args: Any) -> dict[str, Any]:
         # path (global-constraints.md's binding anchor -- these are ab initio, no native
         # reference of any kind is recorded here or anywhere else in this stage).
         "swarm_stage", "swarm_seed_ns", "swarm_replicates_per_cell", "swarm_budget_ns",
-        "swarm_bins", "swarm_equil_ps", "swarm_output_interval_ps", "swarm_seed_frame_interval_ps",
+        "swarm_bins", "swarm_max_members", "swarm_contact_pca_cutoff_a", "swarm_contact_pca_min_sep",
+        "swarm_equil_ps", "swarm_output_interval_ps", "swarm_seed_frame_interval_ps",
         "swarm_graft_minimize_iters", "swarm_member_workers", "swarm_member_range", "swarm_round", "swarm_seed_source",
         "swarm_production_seed_csv", "swarm_n_windows", "swarm_overlap_sigma", "swarm_target_beta_sigma",
         "swarm_min_rungs", "swarm_max_rungs", "swarm_lambda_max", "swarm_ess_floor", "swarm_seeds_per_window",
@@ -342,8 +343,14 @@ def _method_settings(args: Any) -> dict[str, Any]:
         settings["cv2_component"] = {"error": f"{type(exc).__name__}: {exc}"}
     # Numerical-kernel identity of this segment (spec F01/F04): which CV evaluator and
     # which exchange-energy assembly produced its samples. A resume compares these.
-    from .kernel_identity import EXCHANGE_ENERGY_VERSION, RESIDUAL_EVALUATOR_VERSION
-    settings["exchange_energy_version"] = EXCHANGE_ENERGY_VERSION
+    from .kernel_identity import RESIDUAL_EVALUATOR_VERSION, exchange_energy_version_for_args
+    settings["exchange_energy_version"] = exchange_energy_version_for_args(args)
+    if getattr(args, "aux_cv_model", None):
+        from .auxiliary_cv.model import AuxModel
+        settings["aux_cv_model_sha256"] = AuxModel.load(args.aux_cv_model).model_sha256
+        # GaMD envelope recon/calibration ran with the auxiliary restraint off (k = 0), so arms that
+        # differ only in auxiliary strength calibrate identical envelopes (spec 3, 11.2).
+        settings["aux_envelope_calibration"] = "aux_inactive"
     settings["cv_evaluator_version"] = (RESIDUAL_EVALUATOR_VERSION
                                         if str(getattr(args, "secondary_cv", "") or "") in ("residual-torsion-pc", "residual-pc")
                                         else None)

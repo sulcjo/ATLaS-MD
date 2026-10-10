@@ -52,6 +52,12 @@ from .system_setup import (
     write_state_pdb,
 )
 
+#: Auxiliary-CV columns of the explicit window CSV (spec 2026-10-07 auxiliary CV, Section 5).
+#: Defined here, not in gareus.auxiliary_cv, so the legacy loader never imports that package.
+AUX_CSV_COLUMNS = ("aux_center", "aux_k_kcal_mol", "aux_model_sha256")
+INSTANCE_CSV_COLUMNS = ("state_instance_id", "state_role", "spawn_parent_state_id",
+                        "matched_additional_slot_id", "spawn_source_observation_json")
+
 # Gas constant R in kcal/mol/K. Was hardcoded as this same literal independently
 # three times in this file (adaptive_force_constants_kcal_a2,
 # contact_adaptive_force_constants_kcal, and the 2D window-grid builder).
@@ -197,6 +203,8 @@ def set_window(
     window_index: int,
     secondary_centers: Optional[Iterable[float]] = None,
     secondary_ks_kj: Optional[Iterable[float]] = None,
+    *,
+    aux_state: Any = None,
 ) -> None:
     """Assign OpenMM global parameters for the given replica ``window_index``.
 
@@ -205,12 +213,25 @@ def set_window(
     dimensionless contact units and kJ/mol/CV² for contact CVs).  If
     ``secondary_centers`` and ``secondary_ks_kj`` are provided, those values
     are also assigned on the current context for the optional secondary CV.
+    When ``aux_state`` (an ``AuxRuntime``) is given, the window's complete
+    auxiliary-CV target is set too (k = 0 resets an ordinary window).
     """
     # centres_nm/ks_kj_nm2 are historical names.  In nonlocal‑contact mode they
     # hold dimensionless contact centres and kJ/mol/CV², respectively.
     # Convert iterables to lists so indices can be taken multiple times.
     centers_list = list(centers_nm)
     k_list = list(ks_kj_nm2)
+    aux_values = None
+    if aux_state is not None:
+        # Validate the aux target BEFORE the first setParameter so a bad value cannot leave
+        # the Context half-updated.
+        from .auxiliary_cv.force import aux_parameter_values
+        w = int(window_index)
+        try:
+            aux_values = aux_parameter_values(center=aux_state.table.centers[w],
+                                              k_kcal=aux_state.table.k_kcal[w])
+        except Exception as exc:
+            raise type(exc)(f"set_window: invalid aux parameters for window index {w}: {exc}") from exc
     context.setParameter("r0", float(centers_list[int(window_index)]))
     context.setParameter("k", float(k_list[int(window_index)]))
     if secondary_centers is not None and secondary_ks_kj is not None:
@@ -222,6 +243,12 @@ def set_window(
         except Exception:
             # The system may not contain the optional secondary CV force.
             pass
+    if aux_state is not None:
+        # Auxiliary-CV state (spec 3.3): set the COMPLETE target every time, including the reset
+        # to zero when the window is ordinary. No try/except: a Context built without the
+        # auxiliary capability while a runtime is configured is a fatal inconsistency.
+        context.setParameter(aux_state.info.global_k, aux_values[0])
+        context.setParameter(aux_state.info.global_c, aux_values[1])
 
 
 
@@ -1278,6 +1305,10 @@ def load_explicit_2d_window_csv(args, path: Path) -> tuple[np.ndarray, list[floa
     any_secondary = False
     all_secondary = True
     type_counts: dict[str, int] = {}
+    _aux_cols = AUX_CSV_COLUMNS + INSTANCE_CSV_COLUMNS
+    aux_rows: list[dict] = []
+    any_aux = False
+    all_aux = True
 
     _run_mode = primary_cv_mode(args)
     _mode_column = str(getattr(args, "explicit_2d_primary_cv_mode_column", "primary_cv_mode") or "primary_cv_mode")
@@ -1387,6 +1418,11 @@ def load_explicit_2d_window_csv(args, path: Path) -> tuple[np.ndarray, list[floa
         if not (0.0 <= lam <= 1.0):
             raise ValueError(f"--windows-2d-csv row {offset}: gamd_lambda={lam} must lie in [0, 1]")
         gamd_lambdas.append(lam)
+        _aux_cells = {c: ("" if row.get(c) is None else str(row.get(c)).strip()) for c in _aux_cols}
+        _has_aux = any(_aux_cells.values())
+        any_aux = any_aux or _has_aux
+        all_aux = all_aux and _has_aux
+        aux_rows.append(_aux_cells)
         primary_mode = primary_cv_mode(args) if hasattr(args, "primary_cv") else "distance"
         normalized_rows.append({
             "window": int(idx),
@@ -1402,11 +1438,20 @@ def load_explicit_2d_window_csv(args, path: Path) -> tuple[np.ndarray, list[floa
             "source_row": int(offset),
             "gamd_lambda": float(lam),
         })
+        if _has_aux:
+            normalized_rows[-1].update({c: v for c, v in _aux_cells.items() if v})
 
     if any_secondary and not all_secondary:
         raise ValueError("--windows-2d-csv mixes rows with and without secondary_cv_center; provide secondary columns for every row or none.")
     if any_secondary and not secondary_cv_enabled(args):
         raise ValueError("--windows-2d-csv contains secondary-CV centers, but --secondary-cv is 'none'. Re-run with e.g. --secondary-cv alpha-coil-beta/acb/rama-map/alpha/beta/custom.")
+    if any_aux and not all_aux:
+        raise ValueError("--windows-2d-csv mixes rows with and without auxiliary-CV columns; "
+                         "aux_k_kcal_mol must be stated on every row (0 = ordinary or sham state)")
+    if any_aux and not getattr(args, "aux_cv_model", None):
+        raise ValueError("--windows-2d-csv carries auxiliary-CV columns but no --aux-cv-model was given")
+    if getattr(args, "aux_cv_model", None) and not any_aux:
+        raise ValueError("--aux-cv-model needs aux_k_kcal_mol (and aux_center for active rows) in --windows-2d-csv")
 
     centers_arr = np.asarray(centers_a, dtype=float)
     primary_unique = _rounded_unique_sorted(centers_a, ndigits=4)
@@ -1452,6 +1497,8 @@ def load_explicit_2d_window_csv(args, path: Path) -> tuple[np.ndarray, list[floa
         "gamd_lambdas": [float(x) for x in gamd_lambdas],
         "duplicate_center_pairs": int(duplicate_count),
     }
+    if any_aux:
+        window_metadata["aux_rows"] = aux_rows
     sec_arr = np.asarray(secondary_centers, dtype=float) if any_secondary else None
     sec_k = [float(x) for x in secondary_k_list] if any_secondary else None
     # Companion layout plan (spec F05): which windows are mandatory exploration states. Read

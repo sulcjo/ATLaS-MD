@@ -299,6 +299,14 @@ def _per_regime_bias_block(cv_epoch, step_epoch, beta, pc_e, pk_e, sc_e, sk_e,
     return block, coverage
 
 
+def _aux_phase_label(phase_dir, adaptive_dir) -> str:
+    """Phase label relative to the campaign (``epoch_001``, ``epoch_001/baseline``, ``final``)."""
+    try:
+        return Path(phase_dir).resolve().relative_to(Path(adaptive_dir).resolve()).as_posix()
+    except ValueError:
+        return Path(phase_dir).name
+
+
 @cleanup_on_error
 def load_parquet_adaptive_union(adaptive_dir: Path, n_threads: int = 0, n_workers: int = 4,
                                 epoch_ids: Optional[set[int]] = None,
@@ -315,6 +323,11 @@ def load_parquet_adaptive_union(adaptive_dir: Path, n_threads: int = 0, n_worker
     low_memory: use one epoch worker at a time instead of retaining all worker
         results; callers should prefer the resolved union NPZ when available.
     """
+    from gareus.kernel_identity import aux_admission_allows_pooling, refuse_aux_snapshots
+    # A campaign whose driver admitted aux workers pools them (per-sample z, aux term); otherwise refuse as before.
+    _aux_rec = aux_admission_allows_pooling(Path(adaptive_dir))
+    if _aux_rec is None:
+        refuse_aux_snapshots(Path(adaptive_dir), where="adaptive union loader")
     try:
         from gareus.query import load_samples  # noqa: F401 – used in _load_epoch_task
     except ImportError as exc:
@@ -377,10 +390,46 @@ def load_parquet_adaptive_union(adaptive_dir: Path, n_threads: int = 0, n_worker
     if not epoch_dirs:
         selected = f' for requested epoch(s) {sorted(epoch_ids)}' if epoch_ids is not None else ''
         raise FileNotFoundError(f'No epoch Parquet data found in {adaptive_dir}{selected}')
+    # Final fix wave M3: every phase directory whose samples are read is checked with run_has_aux (run
+    # manifest, snapshots, samples payload; pure JSON) on top of the depth-2 snapshot scan above.
+    from gareus.kernel_identity import refuse_aux_run
+    if _aux_rec is None:
+        for _ed, _ in epoch_dirs:
+            refuse_aux_run(Path(_ed), where="adaptive union loader")
+    # Admitted aux workers {column k: aux params}, read from the live registry (the CSV carries no metadata).
+    _aux_cols: dict = {}
+    if _aux_rec is not None:
+        from gareus.adaptive import aux_pooling as _ap
+        from gareus.adaptive_production import WindowStateRegistry
+        from gareus.kernel_identity import AuxPoolingRefused
+        if (_aux_rec.get('workers') or []) and not (Path(adaptive_dir) / 'state_registry.json').exists():
+            raise AuxPoolingRefused(f'{adaptive_dir}: aux_admission.json lists workers but state_registry.json is missing')
+        _aux_reg = WindowStateRegistry.load(adaptive_dir)
+        _aux_by_sid = _ap.worker_table((int(st.state_id), st.metadata) for st in _aux_reg.all_states())
+        for _sid, _rec in _aux_by_sid.items():
+            if _sid in state_id_to_k:
+                if str(_rec.get('aux_model_sha256')) != str(_aux_rec.get('model_sha256')):
+                    from gareus.kernel_identity import AuxPoolingRefused
+                    raise AuxPoolingRefused(f'worker state {_sid} names aux model {str(_rec.get("aux_model_sha256"))[:12]}, '
+                                            f'admission record {str(_aux_rec.get("model_sha256"))[:12]}')
+                _aux_cols[state_id_to_k[_sid]] = _rec
+        _ap.require_admitted_workers(_aux_rec, _aux_by_sid, 'adaptive union loader',
+                                     pooled={int(state_ids[k]): r for k, r in _aux_cols.items()})
+    if _aux_rec is not None:
+        # Admitted campaign: a model-run segment the eligibility rule would drop (aux_unpersisted) refuses.
+        from gareus.adaptive import aux_pooling as _ap
+        for _ed, _ in epoch_dirs:
+            _ap.require_persisted_model_segments(Path(_ed), str(_aux_rec['model_sha256']),
+                                                 _aux_phase_label(_ed, adaptive_dir))
 
     all_cv = []; all_cv2 = []; all_window = []; all_step = []
     all_replica = []; all_boost = []; all_boost_dih = []; all_potential = []; all_epoch_src = []
     all_v_pep = []; all_v_dih = []
+    all_aux_z = []
+    _burn_phases = []
+    if _aux_cols:
+        from gareus.adaptive.aux_seeding_record import read_burnin_workers
+        _aux_worker_ids = sorted(int(state_ids[k]) for k in _aux_cols)
     all_gamd_lambda_sample = []
     all_unk_blocks = []
     u_nk_block_paths: list[np.memmap] = []
@@ -458,6 +507,9 @@ def load_parquet_adaptive_union(adaptive_dir: Path, n_threads: int = 0, n_worker
         valid = remapped >= 0
         if not np.any(valid):
             continue
+        # F01 worker burn-in rows: every mapped row of the phase BEFORE the analysis stride, so a strided-out
+        # first visit still counts (selected after the loop, as the driver selects after reading every phase).
+        _burn_vidx = np.flatnonzero(valid) if _aux_cols else None
         if low_memory and (analysis_stride > 1 or analysis_stride_offset > 0):
             valid_idx = np.flatnonzero(valid)
             stride_keep = analysis_stride_keep_mask(
@@ -556,6 +608,27 @@ def load_parquet_adaptive_union(adaptive_dir: Path, n_threads: int = 0, n_worker
         if block is None:
             block = _reconstruct_union_bias_block(cv_epoch, cv2_epoch, beta, pc_e, pk_e, sc_e, sk_e,
                                                   low_memory=low_memory, directory=adaptive_dir)
+        if _aux_cols:
+            # Worker restraint 0.5 k (z - c)^2 (kcal/mol -> kJ -> reduced) for every sample of the phase under
+            # every worker column, added before the ladder boost (workers are lambda = 0).
+            _recorded = samples.get(_ap.Z_COLUMN)
+            _z = _ap.phase_z(_aux_phase_label(epoch_dir, adaptive_dir), epoch_dir, rep[valid], step_epoch,
+                             str(_aux_rec['model_sha256']),
+                             recorded=None if _recorded is None else _recorded[valid],
+                             admission=_aux_rec, adaptive_dir=adaptive_dir)
+            all_aux_z.append(np.asarray(_z, dtype=np.float64))
+            # this phase's US-pulled workers (seeding record), read right after its z as the driver does
+            _label = _aux_phase_label(epoch_dir, adaptive_dir)
+            _bw, _bev = read_burnin_workers(epoch_dir, _aux_worker_ids, where=_label)
+            _burn_phases.append((_label, _bw, _bev,
+                                 samples['replica'][_burn_vidx] if 'replica' in samples else None,
+                                 samples['step'][_burn_vidx], remapped[_burn_vidx], valid[_burn_vidx],
+                                 samples['segment_id'][_burn_vidx] if 'segment_id' in samples else None,
+                                 _ap.segment_order(epoch_dir)))
+            for _k, _rec in _aux_cols.items():
+                block[:, _k] += beta * _ap.KJ_PER_KCAL * _ap.aux_term_kcal(_z, _rec['aux_center'], _rec['aux_k_kcal_mol'])
+            if hasattr(block, 'flush'):
+                block.flush()
         if low_memory:
             u_nk_block_paths.append(block)
         else:
@@ -580,6 +653,7 @@ def load_parquet_adaptive_union(adaptive_dir: Path, n_threads: int = 0, n_worker
     boost_dih = np.concatenate(all_boost_dih); del all_boost_dih
     v_pep   = np.concatenate(all_v_pep); del all_v_pep
     v_dih   = np.concatenate(all_v_dih); del all_v_dih
+    aux_z = np.concatenate(all_aux_z) if _aux_cols else None
     gamd_lambda_sample = np.concatenate(all_gamd_lambda_sample); del all_gamd_lambda_sample
     pot_arr = np.concatenate(all_potential); del all_potential
     potential = pot_arr if np.any(np.isfinite(pot_arr)) else None
@@ -615,15 +689,43 @@ def load_parquet_adaptive_union(adaptive_dir: Path, n_threads: int = 0, n_worker
 
     # Drop per-state burnin frames: for each sample, compare its epoch-local step
     # against the burnin threshold for the state it was collected in.
+    keep = None
     if np.any(burnin_by_k > 0):
         keep = step >= burnin_by_k[window]
         n_dropped = int((~keep).sum())
         if n_dropped > 0:
             print(f'    [burnin filter] dropped {n_dropped}/{len(cv)} samples ({100*n_dropped/len(cv):.1f}%) from pre-equilibration steps')
+    _aux_burnin: dict = {}
+    _aux_burnin_record = None
+    if _aux_cols:
+        # Resume supersession + worker burn-in (F01, aux_pooling.union_aux_selection = the driver's rule): per phase
+        # on its pre-stride rows, then restricted to the rows the stride kept (phase order = row order).
+        _keeps, _recs, _not_sup = [], [], []
+        for _label, _bw, _bev, _rep_b, _step_b, _sid_b, _stride_kept, _seg_b, _order_b in _burn_phases:
+            _bk, _brec, _bns = _ap.union_aux_selection(np.full(_step_b.size, _label, dtype=object), _rep_b, _step_b,
+                                                 _seg_b, _sid_b, {_label: _bw}, segment_orders={_label: _order_b},
+                                                 evidence={_label: _bev}, where='adaptive union loader')
+            _keeps.append(_bk[_stride_kept]); _recs.append(_brec); _not_sup.append(_bns[_stride_kept])
+        _aux_keep = np.concatenate(_keeps) if _keeps else np.ones(len(cv), dtype=bool)
+        _aux_not_sup = np.concatenate(_not_sup) if _not_sup else np.ones(len(cv), dtype=bool)
+        _aux_burnin_record = _ap.merge_burnin_records(_recs)
+        if low_memory and (analysis_stride > 1 or analysis_stride_offset > 0):
+            # the stride already removed rows: count what this pool actually loses (carriers unchanged)
+            _labels = np.asarray([_aux_phase_label(Path(d), adaptive_dir) for d in epoch_source_dirs], dtype=object)
+            _reasons = {e['phase']: e['reason'] for e in _aux_burnin_record['phases']}
+            _aux_burnin_record['records'] = _ap.exclusion_records(
+                _labels[epoch_src], replica, np.asarray(state_ids, dtype=np.int64)[window.astype(np.int64)],
+                _aux_not_sup & ~_aux_keep, _reasons)
+            _aux_burnin_record['analysis_stride_applied_before_count'] = True
+        _aux_burnin = _ap.burnin_dropped_by_state(_aux_burnin_record)
+        keep = _aux_keep if keep is None else (keep & _aux_keep)
+    if keep is not None:
         cv = cv[keep]; cv2 = cv2[keep]; window = window[keep]
         step = step[keep]; replica = replica[keep]; boost = boost[keep]
         boost_dih = boost_dih[keep]
         v_pep = v_pep[keep]; v_dih = v_dih[keep]
+        if aux_z is not None:
+            aux_z = aux_z[keep]
         epoch_src = epoch_src[keep]
         pot_arr = pot_arr[keep]
         potential = pot_arr if np.any(np.isfinite(pot_arr)) else None
@@ -707,6 +809,18 @@ def load_parquet_adaptive_union(adaptive_dir: Path, n_threads: int = 0, n_worker
         meta_out['analysis_stride_offset'] = int(analysis_stride_offset)
         meta_out['analysis_stride_applied_in_loader'] = True
     meta_out.update(_ladder_meta)
+    if _aux_cols:
+        meta_out['aux_states'] = sorted(int(k) for k in _aux_cols)
+        meta_out['aux_model_sha256'] = str(_aux_rec['model_sha256'])
+        # The Stage D audit flag (pmf.aux_diagnostics_unavailable): ladder crosscheck / ladder_overlap / overlap
+        # grades report unavailable and the banner is capped at CAUTION (final fix wave I1).
+        meta_out['aux_models'] = [str(_aux_rec['model_sha256'])]
+        meta_out['aux_burnin_dropped'] = dict(_aux_burnin)
+        meta_out['aux_burnin_exclusions'] = _aux_burnin_record
+        meta_out['aux_parent_state'] = {int(k): state_id_to_k.get(int(rec['spawn_parent_state_id']))
+                                        if rec.get('spawn_parent_state_id') is not None else None
+                                        for k, rec in _aux_cols.items()}
+        meta_out['aux_forecast_O'] = {int(k): ((rec.get('forecast') or {}).get('O')) for k, rec in _aux_cols.items()}
 
     _boost_dih_arg = boost_dih if np.any(np.isfinite(boost_dih)) else None
     result = clean(Data(
@@ -717,7 +831,7 @@ def load_parquet_adaptive_union(adaptive_dir: Path, n_threads: int = 0, n_worker
         beta=beta, temp=temp, boost_kj=boost, potential_kj=potential,
         source=str(registry_csv), meta=meta_out,
         boost_dih_kj=_boost_dih_arg,
-        v_pep_kj=v_pep, v_dih_kj=v_dih, state_lambdas=state_lambdas,
+        v_pep_kj=v_pep, v_dih_kj=v_dih, state_lambdas=state_lambdas, aux_z=aux_z,
     ))
     if memory_reporter is not None:
         memory_reporter.record('after_loader_clean')

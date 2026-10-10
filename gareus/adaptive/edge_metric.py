@@ -525,6 +525,8 @@ def resolve_temperature_k(run_dir: Path, max_depth: int = 2) -> Optional[float]:
 def _state_nodes(payload: Mapping[str, Any]) -> Dict[int, Dict[str, Any]]:
     out: Dict[int, Dict[str, Any]] = {}
     for row in payload.get("states", []) or []:
+        if row.get("auxiliary"):
+            continue
         pc = row.get("paired_cv") or {}
         rec = pc.get("restraint")
         if not rec:

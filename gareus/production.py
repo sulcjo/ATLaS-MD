@@ -117,8 +117,9 @@ from .replica_admission import advance_replicas, effective_limits, make_dispatch
 from .phase_timers import PhaseTimers, aggregate_npt_timings
 from .provenance import (record_replica_admission, initialize_run_manifest, ensure_run_manifest_initialized, update_run_manifest,
                          finalize_run_manifest, pair_model_sha256)
-from .kernel_identity import (EXCHANGE_ENERGY_VERSION, FAST_SCALAR_MODES, LEGACY_TWO_TERM_MODES,
-                              RESIDUAL_EVALUATOR_VERSION, kernel_identity_for_run)
+from .kernel_identity import (FAST_SCALAR_MODES, LEGACY_TWO_TERM_MODES,
+                              RESIDUAL_EVALUATOR_VERSION, exchange_energy_version_for_args,
+                              is_aux_kernel_record, kernel_identity_for_run)
 
 logger = logging.getLogger(__name__)
 
@@ -683,10 +684,11 @@ def verify_kernel_identity_on_resume(args, out_dir, secondary_cv_metadata: Optio
                   flush=True)
     recorded_ex = method.get("exchange_energy_version")
     recorded_ev = method.get("cv_evaluator_version")
-    if recorded_ex is not None and str(recorded_ex) != EXCHANGE_ENERGY_VERSION:
+    expected_ex = exchange_energy_version_for_args(args)
+    if recorded_ex is not None and str(recorded_ex) != expected_ex:
         raise RuntimeError(
-            f"resume refused: this campaign's samples were exchanged with {recorded_ex!r}; the current code "
-            f"implements {EXCHANGE_ENERGY_VERSION!r}. A changed kernel starts a new segment from these "
+            f"resume refused: this campaign's samples were exchanged with {recorded_ex!r}; this job "
+            f"implements {expected_ex!r}. A changed kernel starts a new segment from these "
             "coordinates with fresh equilibration; it never appends to the old one (spec F04).")
     if mode == "residual-torsion-pc":
         if recorded_ev is None and "exchange_energy_version" not in method:
@@ -697,6 +699,41 @@ def verify_kernel_identity_on_resume(args, out_dir, secondary_cv_metadata: Optio
             raise RuntimeError(
                 f"resume refused: recorded cv_evaluator_version {recorded_ev!r} != current "
                 f"{RESIDUAL_EVALUATOR_VERSION!r} (spec F04).")
+
+
+def refuse_resume_of_aux_campaign(out_dir, args=None) -> None:
+    """Every --resume continues the auxiliary capability its campaign recorded (spec 2026-10-07, D6; Stage C B1).
+
+    Snapshot-based on purpose: a Context checkpoint of an aux system loads SILENTLY into a Context without
+    the aux force (verified 2026-10-08), and the run manifest's method_settings are rebuilt from the
+    CURRENT args every job. Refused: an auxiliary campaign resumed without --aux-cv-model or with another
+    model, and a non-auxiliary campaign resumed with one. Nothing recorded (no kernel-identity snapshot):
+    no-op; the checkpoint binding (aux_table_from_checkpoint / verify_aux_resume) and pooling cover it.
+    Legacy campaigns resumed without a model pass silently. Also called by cli.main() before the run
+    manifest is (re)initialized, so a refused job never stamps auxiliary keys into a legacy manifest.
+    """
+    recorded = _latest_segment_kernel_identity(out_dir)
+    if recorded is None:
+        return
+    model_path = getattr(args, "aux_cv_model", None) if args is not None else None
+    if is_aux_kernel_record(recorded):
+        recorded_sha = str(recorded.get("aux_model_sha256") or "")
+        if not model_path:
+            raise RuntimeError(
+                "resume/extend refused: this campaign ran auxiliary-CV states "
+                f"(model {recorded_sha[:12]}); resume it with the same --aux-cv-model, or start a new run "
+                "directory. Without it every auxiliary slot would continue as an ordinary state.")
+        from .auxiliary_cv.model import AuxModel
+        sha = AuxModel.load(model_path).model_sha256
+        if sha != recorded_sha:
+            raise RuntimeError(
+                f"resume/extend refused: --aux-cv-model {sha[:12]} is not this campaign's auxiliary model "
+                f"{recorded_sha[:12]}; a model change starts a new phase (spec Section 6).")
+        return
+    if model_path:
+        raise RuntimeError(
+            "resume/extend refused: --aux-cv-model given, but this campaign's newest segment ran without "
+            "auxiliary-CV states; an auxiliary capability change starts a new run directory.")
 
 
 def _restore_secondary_cv_args_from_metadata(args, secondary_cv_metadata: dict, out_dir: Optional[Path] = None) -> None:
@@ -1189,6 +1226,90 @@ def _gibbs_mh_acceptance_probability(
     return float(math.exp(log_alpha))
 
 
+#: The pre-F09 Gibbs proposal: weights clipped to +-745 and exponentiated, MH on rounded probabilities
+#: (a reverse q that underflows to 0 rejects the move). Legacy gibbs-walk runs keep it byte-identically.
+GIBBS_PROPOSAL_ALGORITHM_LEGACY = "gibbs_softmax_clipped_v1"
+#: Log-space softmax proposal + log-space MH (repair finding F09); used only when an auxiliary CV is active.
+GIBBS_PROPOSAL_ALGORITHM_V2 = "gibbs_softmax_log_v2"
+
+
+def _gibbs_log_proposal_distribution_v2(
+    beta: float,
+    bias_matrix_kj: np.ndarray,
+    replica_index: int,
+    current_window: int,
+    replica_of_window: np.ndarray,
+) -> dict[str, np.ndarray]:
+    """``gibbs_softmax_log_v2`` heat-bath proposal: ``log q = -beta*delta - logsumexp(-beta*delta)``.
+
+    No clipping and no candidate masking: every reduced energy the proposal reads (the held
+    windows x their holders block of ``beta * bias``) must be finite, else ``ValueError`` naming the
+    window, replica and value. ``probabilities`` = exp(log q) is only for the sampler API.
+    """
+    rep = int(replica_index)
+    wi = int(current_window)
+    beta_val = float(beta)
+    if not math.isfinite(beta_val):
+        raise ValueError(f"{GIBBS_PROPOSAL_ALGORITHM_V2}: non-finite beta {beta_val!r}")
+    holders = np.asarray(replica_of_window, dtype=np.int64)
+    all_windows = np.arange(holders.size, dtype=np.int32)
+    valid_mask = holders >= 0
+    valid_windows = all_windows[valid_mask]
+    target_reps = holders[valid_mask]
+    if valid_windows.size <= 0:
+        empty = np.asarray([], dtype=np.float64)
+        return {"windows": np.asarray([], dtype=np.int32), "target_replicas": np.asarray([], dtype=np.int64),
+                "deltas_kj": empty, "log_probabilities": empty, "probabilities": empty}
+    bias = np.asarray(bias_matrix_kj, dtype=np.float64)
+    block = beta_val * bias[np.ix_(valid_windows, target_reps)]
+    bad = np.argwhere(~np.isfinite(block))
+    if bad.size:
+        w, r = int(valid_windows[bad[0, 0]]), int(target_reps[bad[0, 1]])
+        raise ValueError(f"{GIBBS_PROPOSAL_ALGORITHM_V2}: non-finite reduced energy beta*bias[window {w}, "
+                         f"replica {r}] = {float(beta_val * bias[w, r])!r} ({bad.shape[0]} non-finite entries "
+                         f"in the held block; proposing replica {rep} at window {wi})")
+    old_e = bias[wi, rep] + bias[valid_windows, target_reps]
+    new_e = bias[valid_windows, rep] + bias[wi, target_reps]
+    delta = np.asarray(new_e - old_e, dtype=np.float64)
+    stay_idx = np.where(valid_windows == wi)[0]
+    if stay_idx.size:
+        delta[int(stay_idx[0])] = 0.0
+    log_w = -beta_val * delta
+    if not np.all(np.isfinite(log_w)):
+        raise ValueError(f"{GIBBS_PROPOSAL_ALGORITHM_V2}: non-finite -beta*delta for replica {rep} at window "
+                         f"{wi} (energy differences overflow)")
+    m = float(np.max(log_w))
+    log_q = log_w - (m + math.log(float(np.sum(np.exp(log_w - m)))))
+    return {
+        "windows": valid_windows.astype(np.int32, copy=False),
+        "target_replicas": target_reps.astype(np.int64, copy=False),
+        "deltas_kj": delta,
+        "log_probabilities": log_q,
+        "probabilities": np.exp(log_q),
+    }
+
+
+def _gibbs_log_mh_acceptance_v2(delta_kj: float, beta: float, log_q_forward: float, log_q_reverse: float) -> float:
+    """``log alpha = min(0, -beta*dU + log q_rev - log q_fwd)``; every input must be finite."""
+    vals = (float(delta_kj), float(beta), float(log_q_forward), float(log_q_reverse))
+    if not all(math.isfinite(v) for v in vals):
+        raise ValueError(f"{GIBBS_PROPOSAL_ALGORITHM_V2}: non-finite MH input (delta, beta, log_q_fwd, "
+                         f"log_q_rev) = {vals!r}")
+    delta, beta_val, lqf, lqr = vals
+    return min(0.0, -beta_val * delta + lqr - lqf)
+
+
+def gibbs_log_accept_decision(log_p_accept: float, uniform: float) -> bool:
+    """One uniform ``u`` in [0, 1) decides: accept iff ``log(u) < log_p_accept``; ``u == 0`` accepts."""
+    u = float(uniform)
+    lpa = float(log_p_accept)
+    if not (math.isfinite(u) and 0.0 <= u < 1.0) or math.isnan(lpa):
+        raise ValueError(f"{GIBBS_PROPOSAL_ALGORITHM_V2}: bad accept inputs (uniform {u!r}, log_p_accept {lpa!r})")
+    if u == 0.0:
+        return True
+    return math.log(u) < lpa
+
+
 def _exchange_probability(delta_kj: float, beta: float) -> float:
     """Metropolis probability for a proposed umbrella-window swap.
 
@@ -1257,6 +1378,7 @@ def apply_window_swap(
     *,
     p_override: Optional[float] = None,
     force_accept: bool = False,
+    log_p_accept: Optional[float] = None,
 ) -> "Optional[SwapOutcome]":
     """Decide and apply one umbrella-window swap; the pure core of the REUS move.
 
@@ -1280,6 +1402,9 @@ def apply_window_swap(
     than an rng handle so that the kernel is deterministic under test, and so
     the caller can preserve production's short-circuit: ``force_accept`` must
     not consume a random number, or every downstream RNG stream shifts.
+
+    ``log_p_accept`` (aux gibbs-walk only, ``gibbs_softmax_log_v2``) replaces the linear ``uniform < pacc``
+    test by :func:`gibbs_log_accept_decision` on the same single uniform; ``pacc`` is then exp(log_p_accept).
     """
     pair = swap_candidate_replicas(replica_of_window, wi, wj)
     if pair is None:
@@ -1291,12 +1416,19 @@ def apply_window_swap(
     old_e = float(bias_matrix_kj[wi, i] + bias_matrix_kj[wj, j])
     new_e = float(bias_matrix_kj[wj, i] + bias_matrix_kj[wi, j])
     delta = float(new_e - old_e)
-    pacc = float(p_override) if p_override is not None else _exchange_probability(delta, beta)
-    pacc = max(0.0, min(1.0, pacc)) if math.isfinite(pacc) else 0.0
-    if force_accept:
-        accepted = True
+    if log_p_accept is not None:
+        # gibbs_softmax_log_v2 (aux runs): the decision is made in log space on the one drawn uniform.
+        if force_accept or uniform is None:
+            raise ValueError("log_p_accept needs a drawn uniform and no force_accept")
+        pacc = math.exp(min(0.0, float(log_p_accept)))
+        accepted = gibbs_log_accept_decision(float(log_p_accept), float(uniform))
     else:
-        accepted = bool(float(uniform) < pacc) if uniform is not None else False
+        pacc = float(p_override) if p_override is not None else _exchange_probability(delta, beta)
+        pacc = max(0.0, min(1.0, pacc)) if math.isfinite(pacc) else 0.0
+        if force_accept:
+            accepted = True
+        else:
+            accepted = bool(float(uniform) < pacc) if uniform is not None else False
     if accepted:
         assignments[i], assignments[j] = assignments[j], assignments[i]
         replica_of_window[int(assignments[i])] = int(i)
@@ -1319,6 +1451,11 @@ class GibbsProposal(NamedTuple):
     pacc: float
     stayed: bool          # the proposal selected the current window
     no_candidates: bool   # every candidate was NaN-masked out
+    # gibbs_softmax_log_v2 only (authoritative logs; NaN on the legacy algorithm and where not applicable):
+    log_q_forward: float = float("nan")
+    log_q_reverse: float = float("nan")
+    log_p_accept: float = float("nan")
+    proposal_algorithm: str = GIBBS_PROPOSAL_ALGORITHM_LEGACY
 
 
 def gibbs_propose_one_replica(
@@ -1391,6 +1528,54 @@ def gibbs_propose_one_replica(
     return GibbsProposal(
         wi, wj, float(deltas[choice_index]), q_forward, q_reverse, float(pacc), False, False
     )
+
+
+def gibbs_propose_one_replica_v2(
+    bias_matrix_kj,
+    beta: float,
+    assignments,
+    replica_of_window,
+    replica_index: int,
+    choose,
+) -> "GibbsProposal":
+    """``gibbs_softmax_log_v2`` twin of :func:`gibbs_propose_one_replica` (auxiliary runs only, F09).
+
+    Same steps and the same single ``choose`` draw; log-probabilities are kept through selection, the
+    reverse proposal (against the hypothetical post-swap holder table) and MH, so a reverse q whose
+    exponential underflows still gives the correct finite acceptance. ``pacc`` = exp(log_p_accept) is
+    informational; the swap decision is :func:`gibbs_log_accept_decision` on ``log_p_accept``.
+    """
+    v2 = GIBBS_PROPOSAL_ALGORITHM_V2
+    nan = float("nan")
+    rep = int(replica_index)
+    wi = int(assignments[rep])
+    proposal = _gibbs_log_proposal_distribution_v2(float(beta), bias_matrix_kj, rep, wi, replica_of_window)
+    valid_windows = proposal["windows"]
+    if valid_windows.size <= 0:
+        return GibbsProposal(wi, wi, 0.0, 0.0, 0.0, 0.0, False, True, nan, nan, nan, v2)
+    choice_index = int(choose(int(valid_windows.size), proposal["probabilities"]))
+    wj = int(valid_windows[choice_index])
+    log_q_forward = float(proposal["log_probabilities"][choice_index])
+    q_forward = math.exp(log_q_forward)
+    if wj == wi:
+        return GibbsProposal(wi, wi, 0.0, q_forward, 0.0, 0.0, True, False, log_q_forward, nan, nan, v2)
+    holders_after = np.asarray(replica_of_window).astype(np.int64, copy=True)
+    holders_after[wi] = int(holders_after[wj])
+    holders_after[wj] = rep
+    reverse = _gibbs_log_proposal_distribution_v2(float(beta), bias_matrix_kj, rep, wj, holders_after)
+    rev_idx = np.where(reverse["windows"] == wi)[0]
+    if not rev_idx.size:
+        raise ValueError(f"{v2}: window {wi} missing from the reverse proposal of replica {rep} at window {wj}")
+    log_q_reverse = float(reverse["log_probabilities"][int(rev_idx[0])])
+    delta = float(proposal["deltas_kj"][choice_index])
+    log_p_accept = _gibbs_log_mh_acceptance_v2(delta, float(beta), log_q_forward, log_q_reverse)
+    return GibbsProposal(wi, wj, delta, q_forward, math.exp(log_q_reverse), math.exp(log_p_accept), False, False,
+                         log_q_forward, log_q_reverse, log_p_accept, v2)
+
+
+def select_gibbs_proposer(*, aux_active: bool):
+    """The gibbs-walk proposer: log-space v2 with an auxiliary CV active, else the unchanged legacy one."""
+    return gibbs_propose_one_replica_v2 if aux_active else gibbs_propose_one_replica
 
 
 
@@ -2206,8 +2391,8 @@ def _production_barostat_description(args) -> str:
     return "OpenMM MonteCarloBarostat"
 
 
-def assemble_bias_matrices(distance_bias_kcal, ss_bias_kcal, boost_bias_kj):
-    """Combine the umbrella components and the Pep-GaMD boost into one (kcal, kj) pair.
+def assemble_bias_matrices(distance_bias_kcal, ss_bias_kcal, boost_bias_kj, aux_bias_kcal=None):
+    """Combine the umbrella components, optional auxiliary-CV bias and the Pep-GaMD boost.
 
     Both unit matrices carry the SAME quantity -- umbrella + boost -- so the
     invariant ``bias_kj == 4.184 * bias_kcal`` holds regardless of whether the
@@ -2216,12 +2401,23 @@ def assemble_bias_matrices(distance_bias_kcal, ss_bias_kcal, boost_bias_kj):
     Pulled out to module level so both assembly sites in ``run_gareus`` (the
     log/sample path and ``_current_exchange_arrays``) share one definition and
     so it is directly testable without a live OpenMM Context.
+
+    ``aux_bias_kcal`` (kcal/mol, [state, replica]) is the auxiliary-CV restraint of every state;
+    None keeps the exact pre-auxiliary arithmetic, so the off path stays byte-identical.
     """
     distance_bias_kcal = np.asarray(distance_bias_kcal, dtype=np.float64)
     ss_bias_kcal = np.asarray(ss_bias_kcal, dtype=np.float64)
     boost_bias_kj = np.asarray(boost_bias_kj, dtype=np.float64)
     boost_bias_kcal = boost_bias_kj / 4.184
-    bias_kcal = distance_bias_kcal + ss_bias_kcal + boost_bias_kcal
+    if aux_bias_kcal is None:
+        bias_kcal = distance_bias_kcal + ss_bias_kcal + boost_bias_kcal
+    else:
+        aux_bias_kcal = np.asarray(aux_bias_kcal, dtype=np.float64)
+        if aux_bias_kcal.shape != distance_bias_kcal.shape:
+            from .correctness._io import IntegrityError
+            raise IntegrityError(f"auxiliary bias matrix shape {aux_bias_kcal.shape} != umbrella bias "
+                                 f"shape {distance_bias_kcal.shape} ([state, replica])")
+        bias_kcal = (distance_bias_kcal + ss_bias_kcal + aux_bias_kcal + boost_bias_kcal)
     bias_kj = 4.184 * bias_kcal
     return bias_kcal, bias_kj
 
@@ -2349,6 +2545,23 @@ def make_gamd_integrator(system, args, unit, seed_offset: int = 0):
     except Exception:
         pass
     return integrator, result
+
+def _aux_window_order_key(centers_a, k_list, secondary_centers, secondary_k_list, n) -> tuple:
+    """(center1, k1[, center2, k2]) per window, in order: the identity an auxiliary state table is
+    bound to when loaded, re-checked when the runtime is resolved (auxiliary-CV runs only).
+    NaN / None placeholders map to None, so two keys built from the same table compare equal."""
+    def _num(value):
+        if value is None:
+            return None
+        value = float(value)
+        return None if value != value else value
+
+    has_secondary = secondary_centers is not None and secondary_k_list is not None
+    return tuple(
+        (_num(centers_a[w]), _num(k_list[w]))
+        + ((_num(secondary_centers[w]), _num(secondary_k_list[w])) if has_secondary else ())
+        for w in range(int(n)))
+
 
 def snapshot_window_rows(centers_a, k_list, secondary_centers, secondary_k_list,
                          gamd_lambdas=None, n=None) -> list[dict]:
@@ -4984,17 +5197,36 @@ def write_exchange_tuning_report(out_dir: Path, args, exchange_stats: dict, cent
     (out_dir / "exchange_tuning_report.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
     return payload
 
+AUX_LEGACY_NPZ_SKIP_REASON = (
+    "auxiliary run: the legacy analysis_arrays.npz export is refused for auxiliary states (it cannot carry "
+    "A_s); pool with mbar_analysis.loaders.load_parquet or the strict fixed-state exporter instead")
+
+
+def _final_report_validations(out_dir: Path, args, effective_target_overlap: float, target_overlap: float):
+    """(mbar readiness, legacy 1-D MBAR validation, GaMD reweighting diagnostics) for final_report.
+
+    All three read analysis_arrays.npz. On an auxiliary run that export is refused (and the refusal
+    swallowed), so the three are recorded as ``skipped`` with the reason instead of reporting a
+    missing NPZ as an error (Task 13 carry-over 4). The legacy branch is unchanged.
+    """
+    if getattr(args, "_aux_runtime", None) is not None:
+        skipped = {"status": "skipped", "reason": AUX_LEGACY_NPZ_SKIP_REASON}
+        return dict(skipped), dict(skipped), dict(skipped)
+    mbar = validate_analysis_metadata_readiness(out_dir, target_overlap=effective_target_overlap)
+    # Keep the historical validator output too for simple 1D sanity checks, but
+    # treat the sparse-aware readiness report above as the source of truth.
+    legacy_mbar = validate_us_mbar_inputs(out_dir, float(getattr(args, "temperature_k", 300.0) or 300.0), target_overlap=target_overlap)
+    gamd = compute_gamd_reweighting_diagnostics(out_dir, float(getattr(args, "temperature_k", 300.0) or 300.0))
+    return mbar, legacy_mbar, gamd
+
+
 def write_final_run_report(out_dir: Path, args, centers_a, k_list, exchange_stats: dict) -> dict:
     """Write final_report.md plus machine-readable validation diagnostics."""
     out_dir = Path(out_dir)
     target_overlap = float(getattr(args, "adaptive_feedback_target_overlap", 0.30) or 0.30)
     aggr = _adaptive_window_aggressiveness_settings(args)
     effective_target_overlap = max(0.04, min(0.95, target_overlap * float(aggr.get("target_overlap_factor", 1.0))))
-    mbar = validate_analysis_metadata_readiness(out_dir, target_overlap=effective_target_overlap)
-    # Keep the historical validator output too for simple 1D sanity checks, but
-    # treat the sparse-aware readiness report above as the source of truth.
-    legacy_mbar = validate_us_mbar_inputs(out_dir, float(getattr(args, "temperature_k", 300.0) or 300.0), target_overlap=target_overlap)
-    gamd = compute_gamd_reweighting_diagnostics(out_dir, float(getattr(args, "temperature_k", 300.0) or 300.0))
+    mbar, legacy_mbar, gamd = _final_report_validations(out_dir, args, effective_target_overlap, target_overlap)
     pull_quality_path = out_dir / "us_starting_structures" / "us_starting_structure_quality.json"
     pull_quality = None
     if pull_quality_path.exists():
@@ -5068,6 +5300,8 @@ def write_final_run_report(out_dir: Path, args, centers_a, k_list, exchange_stat
     lines.append("## MBAR/US input validation")
     lines.append("")
     lines.append(f"Status: **{status_word(mbar)}**")
+    if getattr(args, "_aux_runtime", None) is not None and mbar.get("reason"):
+        lines.append(f"Reason: {mbar['reason']}")          # final fix wave M5: aux runs say why (SKIPPED)
     lines.append(f"Samples: **{int(mbar.get('n_samples', 0) or 0)}**")
     if mbar.get("sample_counts_by_window"):
         counts = ", ".join(str(x) for x in mbar.get("sample_counts_by_window", []))
@@ -5089,6 +5323,8 @@ def write_final_run_report(out_dir: Path, args, centers_a, k_list, exchange_stat
     lines.append("## GaMD boost/reweighting diagnostics")
     lines.append("")
     lines.append(f"Status: **{status_word(gamd)}**")
+    if getattr(args, "_aux_runtime", None) is not None and gamd.get("reason"):
+        lines.append(f"Reason: {gamd['reason']}")
     if gamd.get("n_finite", 0):
         lines.append(f"Finite boost samples: **{int(gamd.get('n_finite', 0))} / {int(gamd.get('n_total', 0))}**")
         lines.append(f"Boost mean ± sd: **{float(gamd.get('boost_mean_kcal_mol', float('nan'))):.3f} ± {float(gamd.get('boost_sd_kcal_mol', float('nan'))):.3f} kcal/mol**")
@@ -5220,7 +5456,7 @@ def save_production_checkpoint(out_dir: Path, sims: list, assignments: list[int]
                                primary_cv_metadata=None, openmm_version: Optional[str] = None,
                                platform_name: Optional[str] = None,
                                drivers: Optional[list] = None, pool=None, npt_runtime: Optional[NptRunContext] = None,
-                               keep_generations: int = 0) -> None:
+                               keep_generations: int = 0, aux_block: Optional[dict] = None) -> None:
     """Write restart checkpoints for all production replicas.
 
     The OpenMM binary checkpoint is platform/version specific but it is the most
@@ -5327,6 +5563,8 @@ def save_production_checkpoint(out_dir: Path, sims: list, assignments: list[int]
         manifest["secondary_cv_centers"] = [float(x) for x in secondary_cv_centers]
     if secondary_cv_k_kcal_list is not None:
         manifest["secondary_cv_k_kcal_mol"] = [float(x) for x in secondary_cv_k_kcal_list]
+    if aux_block is not None:
+        manifest["aux"] = aux_block
     from .correctness.checkpoint_store import publish_generation
     publish_generation(out_dir, replica_payloads, manifest, keep_generations=int(keep_generations or 0))
 
@@ -5486,7 +5724,7 @@ def load_production_checkpoint(out_dir: Path, sims: list, centers_nm, ks_kj_nm2,
                                state_lambdas=None, k0max_by_channel: Optional[dict] = None,
                                drivers: Optional[list] = None, pool=None,
                                npt_runtime: Optional[NptRunContext] = None,
-                               args=None) -> Optional[dict]:
+                               args=None, aux_pre_apply=None) -> Optional[dict]:
     """Load a production checkpoint manifest and all replica checkpoints if available.
 
     state_lambdas/k0max_by_channel need not both be given: k0max_by_channel is None
@@ -5586,10 +5824,15 @@ def load_production_checkpoint(out_dir: Path, sims: list, centers_nm, ks_kj_nm2,
     assignments = [int(x) for x in manifest.get("assignments", list(range(len(sims))))]
     if len(assignments) != len(sims):
         raise RuntimeError("Checkpoint assignment count does not match replica count")
+    if aux_pre_apply is not None:
+        # Parameters as restored by loadCheckpoint, before any re-apply. The callable reads each
+        # replica's Context on that replica's own worker (pool.submit affinity) when a pool exists.
+        aux_pre_apply(manifest, assignments)       # parameters as restored by loadCheckpoint
 
     def _apply_assignment(r: int):
         sim = sims[r]
-        set_window(sim.context, centers_nm, ks_kj_nm2, int(assignments[r]), secondary_centers, secondary_ks_kj)
+        set_window(sim.context, centers_nm, ks_kj_nm2, int(assignments[r]), secondary_centers, secondary_ks_kj,
+                   aux_state=None if args is None else getattr(args, "_aux_runtime", None))
         # The GaMD-integrator-globals restore above is best-effort (see the
         # comments above): when it is incomplete, k0_Total/k0_Dihedral are still
         # whatever _build_context_i set from this replica's BUILD-time index, not
@@ -5760,7 +6003,10 @@ def run_production_probe(args, out_dir: Path, sims: list, assignments: list[int]
         for r, sim in enumerate(sims):
             _run(r, sim.context.loadCheckpoint, saved[r])
         for r, sim in enumerate(sims):
-            _run(r, set_window, sim.context, centers_nm, ks_kj_nm2, int(assignments[r]))
+            # loadCheckpoint just restored the aux globals, but the complete target is re-applied
+            # like every other window application.
+            _run(r, set_window, sim.context, centers_nm, ks_kj_nm2, int(assignments[r]),
+                 aux_state=getattr(args, "_aux_runtime", None))
         # Roll the volume controllers back to their pre-probe state so the
         # probe consumed neither schedule nor random stream.
         if drivers is not None and npt_runtime is not None and npt_runtime.needs_controller:
@@ -5888,7 +6134,13 @@ def run_multiwindow_gamd_recon(
             sim_i.context.setVelocities(vel)
         else:
             sim_i.context.setVelocitiesToTemperature(args.temperature_k * unit.kelvin, args.seed + 4021 + i)
-        set_window(sim_i.context, centers_nm, ks_kj_nm2, i, secondary_cv_centers, secondary_cv_ks_kj)
+        # The envelope is calibrated with the auxiliary restraint OFF (D7).
+        set_window(sim_i.context, centers_nm, ks_kj_nm2, i, secondary_cv_centers, secondary_cv_ks_kj,
+                   aux_state=None)
+        _aux_runtime = getattr(args, "_aux_runtime", None)
+        if _aux_runtime is not None:
+            from .auxiliary_cv.runtime import deactivate_aux_parameters
+            deactivate_aux_parameters(sim_i.context, _aux_runtime)
         sims.append(sim_i)
         systems.append(system_i)
         integrators.append(step_integrator)
@@ -6125,7 +6377,13 @@ def apply_joint_envelope_gamd_calibration(
             _check_sim.context.setPeriodicBoxVectors(*_check_box)
         _check_sim.context.setPositions(equil_state.getPositions())
         _check_sim.context.setVelocitiesToTemperature(args.temperature_k * unit.kelvin, args.seed + 909)
-        set_window(_check_sim.context, centers_nm, ks_kj_nm2, 0, secondary_cv_centers, secondary_cv_ks_kj)
+        # Same policy as the recon: the envelope check runs with the auxiliary restraint OFF (D7).
+        set_window(_check_sim.context, centers_nm, ks_kj_nm2, 0, secondary_cv_centers, secondary_cv_ks_kj,
+                   aux_state=None)
+        _aux_runtime = getattr(args, "_aux_runtime", None)
+        if _aux_runtime is not None:
+            from .auxiliary_cv.runtime import deactivate_aux_parameters
+            deactivate_aux_parameters(_check_sim.context, _aux_runtime)
         _check_controller = None
         if npt_runtime is not None and npt_runtime.needs_controller:
             _check_controller = npt_runtime.initialize_controller(
@@ -6426,6 +6684,18 @@ def reconcile_resume_secondary_cv_metadata(
     return meta
 
 
+def _aux_pull_ramp(args, aux_table, subset=None):
+    """aux_ramp argument for the US pull: None without an aux runtime; ``subset`` maps to pulled windows."""
+    runtime = getattr(args, "_aux_runtime", None)
+    if runtime is None or aux_table is None:
+        return None
+    from .seeding import AUX_PULL_RAMP_STAGES
+    idx = range(aux_table.n) if subset is None else [int(w) for w in subset]
+    return {"info": runtime.info, "runtime": runtime,
+            "centers": [None if aux_table.centers[w] is None else float(aux_table.centers[w]) for w in idx],
+            "k_kcal": [float(aux_table.k_kcal[w]) for w in idx], "stages": AUX_PULL_RAMP_STAGES}
+
+
 def _release_run_lock_best_effort(out_dir: Path) -> None:
     """Best-effort removal of this process's own ``.gareus_run.lock``.
 
@@ -6510,6 +6780,24 @@ def _seed_topup_windows_from_parent_states(
         f"in {[str(p) for p in parent_dirs]} (no pull)"
     )
     return window_start_positions, window_start_velocities, window_start_boxes, seed_by_window
+
+
+def _write_aux_seeding_record(out_dir, aux_table, branch, pulled_windows, continued_state_windows,
+                              pdb_seeded_windows, fallback) -> None:
+    """``<out_dir>/aux_seeding_record.json``: per aux worker window (aux k > 0), pulled or continued (F01)."""
+    from .adaptive.aux_seeding_record import seeding_record_payload, write_seeding_record
+    workers = [w for w in range(aux_table.n) if float(aux_table.k_kcal[w]) > 0.0]
+    source = {}
+    for w in workers:
+        if branch == "topup":
+            source[w] = "topup_state_export"
+        elif w in pdb_seeded_windows:
+            source[w] = "final_pdb"
+        elif w in continued_state_windows or branch == "extension":
+            source[w] = "state_export"
+    write_seeding_record(out_dir, seeding_record_payload(
+        worker_windows=workers, state_of_window=state_id_of_window_from_epoch_map(out_dir),
+        pulled_windows=pulled_windows, continued_source=source, branch=branch, fallback=fallback))
 
 
 def remap_subset_window_indices(pull_dir: Path, missing) -> None:
@@ -6771,8 +7059,12 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
         pass
     resume_manifest = read_json_file(checkpoint_manifest_path(out_dir), None) if bool(getattr(args, "resume", False)) else None
     fast_resume = isinstance(resume_manifest, dict) and bool(resume_manifest.get("replica_checkpoint_files"))
+    _aux_table = None
+    _aux_window_key = None
 
     if fast_resume:
+        # Every resume (also --extend): auxiliary capability mismatch refused (B1); legacy no-op.
+        refuse_resume_of_aux_campaign(out_dir, args)
         resume_def = load_resume_run_definition(out_dir, topology, args, manifest=resume_manifest)
         cv_atom1 = int(resume_def["cv_atom1"])
         cv_atom2 = int(resume_def["cv_atom2"])
@@ -6803,6 +7095,19 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
             _restore_secondary_cv_args_from_metadata(args, secondary_cv_metadata, out_dir=out_dir)
             verify_kernel_identity_on_resume(args, out_dir, secondary_cv_metadata)
         window_metadata = dict(resume_def.get("window_metadata", {}))
+        if getattr(args, "aux_cv_model", None):
+            # Stage C (B2): the frozen auxiliary table comes from the checkpoint, never from today's CSV.
+            from .auxiliary_cv.checkpoint import aux_table_from_checkpoint
+            from .auxiliary_cv.model import AuxModel
+            from .auxiliary_cv.runtime import refuse_aux_population_change
+            _aux_table = aux_table_from_checkpoint(resume_manifest, model=AuxModel.load(args.aux_cv_model))
+            refuse_aux_population_change(_aux_table.n, len(centers_a), cause="checkpoint resume")
+            _aux_window_key = _aux_window_order_key(centers_a, k_list, secondary_cv_centers,
+                                                    secondary_cv_k_kcal_list, len(centers_a))
+            # Carry-over 9: the checkpoint's table must pair row by row with the windows resumed here
+            # (the later definition/applied-key check compares resume_def with itself).
+            from .auxiliary_cv.checkpoint import check_checkpoint_rows_align
+            check_checkpoint_rows_align(resume_manifest, _aux_window_key)
         shared_gamd_globals_all = dict(resume_def.get("shared_gamd_globals_all", {}) or {})
         shared_gamd_globals_interesting = dict(resume_def.get("shared_gamd_globals_interesting", {}) or {})
         calib_steps = int(resume_def.get("calib_steps", 0) or 0)
@@ -6810,6 +7115,12 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
         shared_gamd_context_checkpoint = None
         print(f"[resume] Production checkpoint manifest found; skipping window generation, US pulling, and shared GaMD setup.")
     else:
+        if bool(getattr(args, "resume", False)):
+            refuse_resume_of_aux_campaign(out_dir, args)       # non-fast --resume (no checkpoint): B1/H3
+            if getattr(args, "aux_cv_model", None):
+                # Task 13 minor 7: no checkpoint, but committed auxiliary rows -> refuse before anything runs.
+                from .auxiliary_cv.runtime_io import refuse_aux_resume_without_checkpoint
+                refuse_aux_resume_without_checkpoint(out_dir)
         if equil_state is None:
             raise RuntimeError("No equilibrated state is available; cannot start ATLaS-MD production without a production checkpoint or saved 03_npt_equilibrated_state.xml.")
         cv_atom1, cv_atom2, distance_cv_label = choose_cv_atoms(topology, args)
@@ -6827,6 +7138,17 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                 centers_a, k_list, secondary_cv_centers, secondary_cv_k_kcal_list,
                 secondary_cv_metadata, window_metadata,
             )
+            if getattr(args, "aux_cv_model", None):
+                from .auxiliary_cv.runtime import refuse_aux_population_change
+                refuse_aux_population_change(_n_windows_before_reachability_filter, len(centers_a),
+                                             cause="seed-reachability filter")
+                from .auxiliary_cv.state_table import load_aux_state_table
+                _aux_table = load_aux_state_table(args.aux_cv_model, (window_metadata or {}).get("aux_rows") or [])
+                refuse_aux_population_change(_aux_table.n, len(centers_a), cause="seed-reachability filter")
+                # Window order the table was loaded in (Task-6 alignment): re-checked where the runtime
+                # is resolved, so no later reordering can pair a state with another window's aux term.
+                _aux_window_key = _aux_window_order_key(centers_a, k_list, secondary_cv_centers,
+                                                        secondary_cv_k_kcal_list, len(centers_a))
             # The filter just renumbered every window-indexed array around its
             # survivors, which invalidates the epoch_window_map.csv the adaptive
             # driver wrote into this phase directory before the sub-run started.
@@ -6846,7 +7168,8 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                 with (out_dir / "explicit_2d_window_table_loaded.csv").open("w", newline="") as handle:
                     norm_rows = window_metadata.get("normalized_rows", []) if isinstance(window_metadata, dict) else []
                     if norm_rows:
-                        writer = csv.DictWriter(handle, fieldnames=list(norm_rows[0].keys()), extrasaction="ignore")
+                        _fields = list(dict.fromkeys(k for row in norm_rows for k in row.keys()))
+                        writer = csv.DictWriter(handle, fieldnames=_fields, extrasaction="ignore")
                         writer.writeheader()
                         writer.writerows(norm_rows)
                 write_json(out_dir / "explicit_2d_window_table_loaded.json", _json_ready(window_metadata))
@@ -6922,6 +7245,9 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
         print(f"WARNING [production] --max-replicas {_max_replicas}: the checkpoint holds "
               f"{len(centers_a)} windows; resuming with the checkpointed window set, not truncating")
     elif _max_replicas > 0 and len(centers_a) > _max_replicas:
+        if _aux_table is not None:
+            from .auxiliary_cv.runtime import refuse_aux_population_change
+            refuse_aux_population_change(len(centers_a), _max_replicas, cause="--max-replicas")
         print(f"[production] --max-replicas {_max_replicas}: truncating {len(centers_a)} windows to {_max_replicas}")
         centers_a = centers_a[:_max_replicas]
         k_list = k_list[:_max_replicas]
@@ -7042,9 +7368,31 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
         barostat_frequency=production_barostat_frequency,
     )
     prepare_pep_gamd_args(args, topology)
+    _aux_physical_sha = None
+    if getattr(args, "aux_cv_model", None):
+        # Carry-over 7: the bare physical System, before any umbrella/aux force, the Pep-GaMD partition
+        # (PME pinned from the box) and the integrator; barostats are excluded inside the hash.
+        from .auxiliary_cv.runtime_definition import physical_system_sha256
+        _aux_physical_sha = physical_system_sha256(openmm, base_system)
     secondary_cv_force_info = add_umbrella_cv_forces(
         openmm, base_system, topology, primary_cv_def, args,
         secondary_enabled=bool((secondary_cv_metadata or {}).get("enabled")))
+    args._aux_runtime = None
+    if getattr(args, "aux_cv_model", None):
+        if _aux_table is None:
+            raise RuntimeError("--aux-cv-model set but no auxiliary state table was loaded")
+        from .auxiliary_cv.features import check_feature_atoms
+        from .auxiliary_cv.runtime import add_aux_cv_force
+        from .auxiliary_cv.runtime_definition import solvated_start_topology_identities
+        # Carry-over 8: both topology identities (Stage B canonical, Stage C whole) from ONE source, the
+        # solvated start PDB, on the fresh path and on every resume.
+        _aux_topology_sha, _aux_whole_topology_sha = solvated_start_topology_identities(out_dir, _aux_table.model)
+        check_feature_atoms(_aux_table.model, topology, topology_sha256=_aux_topology_sha)
+        args._aux_runtime = add_aux_cv_force(openmm, base_system, _aux_table, args,
+                                             topology_sha256=_aux_topology_sha)
+        print(f"    Auxiliary-CV restraint: model {args._aux_runtime.info.model_sha256[:12]}, force group "
+              f"{args._aux_runtime.info.force_group}, {sum(k > 0 for k in _aux_table.k_kcal)} active of "
+              f"{_aux_table.n} states; topology {_aux_topology_sha[:12]}")
     if secondary_cv_force_info.get("enabled"):
         secondary_cv_metadata.update(secondary_cv_force_info)
         print(
@@ -7122,6 +7470,8 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
         # --ap-continue-states: existing states continue from their newest earlier end
         # state; only states new to this phase (no parent end state) are pulled.
         _continue_seeds = None
+        # F01 seeding evidence (aux runs only): which windows this phase starts by a US pull.
+        _seed_fallback = None
         if (_topup_phase_info.get("continue_parent_dirs") and not is_topup_segment
                 and not bool(_topup_phase_info.get("is_extension"))):
             try:
@@ -7133,6 +7483,7 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
             except SeedMismatchError as exc:
                 print(f"WARNING: {out_dir}: parent end states rejected ({exc}); pulling every window instead")
                 _continue_seeds = None
+                _seed_fallback = "seed_mismatch"
         if bool(_topup_phase_info.get("is_extension")) and not is_topup_segment:
             try:
                 _extension_seeds = _seed_extension_windows_from_parent_ends(
@@ -7146,6 +7497,7 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                 # pulling fresh uses no parent data at all, so it is the safe fallback.
                 print(f"WARNING: extension {out_dir}: parent end states rejected ({exc}); pulling every window instead")
                 _extension_seeds = None
+                _seed_fallback = "seed_mismatch"
 
         if _continue_seeds is not None:
             (_cont_pos, _cont_vel, window_start_boxes, topup_seed_by_window,
@@ -7154,6 +7506,10 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                 starting_structure_system = create_system(app, unit, forcefield, topology, args, include_barostat=False)
                 add_umbrella_cv_forces(openmm, starting_structure_system, topology, primary_cv_def, args,
                                        secondary_enabled=bool((secondary_cv_metadata or {}).get("enabled")))
+                if args._aux_runtime is not None:
+                    from .auxiliary_cv.runtime import add_aux_cv_force
+                    add_aux_cv_force(openmm, starting_structure_system, _aux_table, args,
+                                     force_group=args._aux_runtime.info.force_group)
                 _sub = (lambda seq: None if seq is None else [seq[w] for w in _cont_missing])
                 write_json(Path(out_dir) / "us_starting_structures_subset.json", {
                     "note": "--ap-continue-states: only these windows were pulled; files in "
@@ -7167,6 +7523,7 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                     secondary_cv_centers=_sub(secondary_cv_centers), secondary_cv_ks_kj=_sub(secondary_cv_ks_kj),
                     secondary_cv_metadata=secondary_cv_metadata, allow_slow_mode_reseed=False,
                     total_windows=nrep,
+                    aux_ramp=_aux_pull_ramp(args, _aux_table, _cont_missing),
                 )
                 remap_subset_window_indices(Path(out_dir) / "us_starting_structures", _cont_missing)
                 window_start_positions, window_start_velocities, dropped_window_indices = merge_partial_pull(
@@ -7175,10 +7532,12 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
             else:
                 window_start_positions, window_start_velocities = _cont_pos, _cont_vel
                 dropped_window_indices = []
+            _seed_branch, _pulled_windows = "continue_states", set(_cont_missing)
         elif _extension_seeds is not None:
             (window_start_positions, window_start_velocities, window_start_boxes,
              topup_seed_by_window, pdb_seeded_windows) = _extension_seeds
             dropped_window_indices = []
+            _seed_branch, _pulled_windows = "extension", set()
         elif is_topup_segment:
             # Effective top-ups (spec 4.4 rev 2): continue every window's chain
             # from its parent segment's exported final State instead of
@@ -7199,21 +7558,33 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                 _release_run_lock_best_effort(out_dir)
                 raise
             dropped_window_indices = []
+            _seed_branch, _pulled_windows = "topup", set()
         else:
             starting_structure_system = create_system(app, unit, forcefield, topology, args, include_barostat=False)
             add_umbrella_cv_forces(openmm, starting_structure_system, topology, primary_cv_def, args,
                                    secondary_enabled=bool((secondary_cv_metadata or {}).get("enabled")))
+            if args._aux_runtime is not None:
+                from .auxiliary_cv.runtime import add_aux_cv_force
+                add_aux_cv_force(openmm, starting_structure_system, _aux_table, args,
+                                 force_group=args._aux_runtime.info.force_group)
 
             window_start_positions, window_start_velocities, dropped_window_indices = generate_us_starting_states_by_pulling(
                 args, out_dir, openmm, app, unit, topology, starting_structure_system, centers_nm, ks_kj_nm2,
                 equil_state, primary_cv_def, cv_atom1, cv_atom2, setup_platform, setup_props, progress=progress,
                 secondary_cv_centers=secondary_cv_centers, secondary_cv_ks_kj=secondary_cv_ks_kj,
                 secondary_cv_metadata=secondary_cv_metadata,
+                aux_ramp=_aux_pull_ramp(args, _aux_table, None),
             )
             window_start_boxes = [None] * nrep
             topup_seed_by_window = {}
+            _seed_branch, _pulled_windows = "pull", set(range(nrep))
 
         if dropped_window_indices:
+            if getattr(args, "_aux_runtime", None) is not None:
+                from .auxiliary_cv.runtime import refuse_aux_population_change
+                refuse_aux_population_change(len(centers_a),
+                                             len(centers_a) - len({int(i) for i in dropped_window_indices}),
+                                             cause="US auto-drop")
             _drop_result = drop_bad_us_windows_and_rebuild(
                 out_dir, dropped_window_indices,
                 centers_a, k_list, centers_nm, ks_kj_nm2,
@@ -7275,6 +7646,12 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
             ladder_active = resolve_ladder_active(state_lambdas, out_dir)
             if ladder_active and not ladder_supports_boost_type(args):
                 raise ValueError("a gamd_lambda ladder requires --gamd-boost-type pep-gamd-lower-dual or lower-dihedral")
+
+        if _aux_table is not None:
+            # F01: durable seeding evidence before any MD (aux refuses window drops, so indices are this
+            # phase's own); the union pools treat a pulled worker's phase as its burn-in phase.
+            _write_aux_seeding_record(out_dir, _aux_table, _seed_branch, _pulled_windows, continued_state_windows,
+                                      pdb_seeded_windows, _seed_fallback)
 
         if use_gamd:
             reusable_gamd = load_reusable_shared_gamd_setup(args, out_dir)
@@ -7519,7 +7896,8 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                         # see the summary line after the replica-construction loop.
                         _skipped_velocity_randomization = True
                     sim_i.context.setVelocities(start_vel)
-                set_window(sim_i.context, centers_nm, ks_kj_nm2, i, secondary_cv_centers, secondary_cv_ks_kj)
+                set_window(sim_i.context, centers_nm, ks_kj_nm2, i, secondary_cv_centers, secondary_cv_ks_kj,
+                           aux_state=getattr(args, "_aux_runtime", None))
                 if topup_seed_by_window.get(i) is not None:
                     # Top-up seeding (task 9): the loaded State must reproduce the CV
                     # values it was exported under. Runs here, right after set_window,
@@ -7652,6 +8030,28 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
     if _fast_primary_force_idx >= 0 and _ss_enabled_global and _fast_ss_force_idx >= 0 and not _use_fast_cv_path:
         print(f"[production] secondary CV mode {secondary_cv_mode(secondary_cv_metadata)!r} has no verified "
               "fast-path scalar; observing it from positions instead")
+    # ── Auxiliary-CV states (spec 3.3/4.2): one z per carrier, whatever state it occupies ──
+    _aux_rt = getattr(args, "_aux_runtime", None)
+    _aux_forces = [None] * nrep
+    if _aux_rt is not None:
+        # Task-6 alignment: one aux state per replica slot, in the window order the table was loaded in.
+        if _aux_rt.table.n != nrep or len(centers_a) != nrep:
+            raise RuntimeError(f"auxiliary state table has {_aux_rt.table.n} states for {nrep} replicas "
+                               f"({len(centers_a)} windows)")
+        if _aux_window_order_key(centers_a, k_list, secondary_cv_centers, secondary_cv_k_kcal_list,
+                                 nrep) != _aux_window_key:
+            raise RuntimeError("window order changed after the auxiliary state table was loaded; "
+                               "each auxiliary term would pair with another window's restraints")
+        from .auxiliary_cv.runtime import aux_bias_matrix_kcal, make_aux_z_observer, resolve_aux_force
+        # F07: each replica's own aux force (resolved from its own System and checked against the model),
+        # read on its own Context whatever CV1/CV2 path the run uses -- never the NumPy evaluator.
+        _aux_forces = [resolve_aux_force(sim.system, _aux_rt, replica=r) for r, sim in enumerate(sims)]
+        # The single z observation both the sample writer and the exchange kernel use; with any
+        # active state it also fails the segment on a degenerate torsion (spec 3.3, Task 5).
+        _aux_z_for_replica = make_aux_z_observer(_aux_rt, aux_forces=_aux_forces, unit=unit)
+    else:
+        def _aux_z_for_replica(r, sim) -> float:
+            return float("nan")
     # ────────────────────────────────────────────────────────────────────────────
 
     # ── tICA dihedral observation buffers (optional, gated by tica_obs_interval) ─
@@ -7877,6 +8277,13 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
             "gamd_lambda": "the λ-ladder boost strength of the state/window this sample was assigned to; 0.0 on every run where the λ-ladder is not active, and identically 0.0 on λ=0 rungs even when the ladder is active",
         },
     }
+    if getattr(args, "_aux_runtime", None) is not None:
+        pymbar_metadata["samples_columns_for_mbar"]["auxiliary_cv_bias_note"] = (
+            "auxiliary-CV runs: umbrella_bias_kcal_mol / umbrella_bias_kj_mol and every "
+            "umbrella_bias_all_windows_* total include the auxiliary restraint A_s of each state; "
+            "umbrella_reduced_bias and umbrella_reduced_bias_all_windows_json also include it; "
+            "the sample `potential` column includes A_s (physical_energy_groups include the aux group); "
+            "sampled_umbrella_bias_kj and the distance/secondary component vectors do not.")
     write_json(out_dir / "umbrella_pymbar_metadata.json", pymbar_metadata)
     print(f"PyMBAR umbrella constants written to {out_dir / 'umbrella_windows.csv'} and {out_dir / 'umbrella_pymbar_metadata.json'}")
 
@@ -7888,21 +8295,134 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
     _parent_seg_id = _parent_seg["segment_id"] if _parent_seg else None
     _parent_was_running = bool(_parent_seg and _parent_seg.get("status") == "running")
     _round_id = int(getattr(args, "adaptive_feedback_round", 1))
-    _seg_id = _seg_registry.open_segment(_run_id, _parent_seg_id, _round_id)
+    # Auxiliary runs register their segment only after every Context-free resume refusal (Task 14 F4).
+    _seg_id = None if getattr(args, "_aux_runtime", None) is not None else _seg_registry.open_segment(_run_id, _parent_seg_id, _round_id)
     _win_snapshot_windows = snapshot_window_rows(
         centers_a[:nrep], k_list[:nrep], secondary_cv_centers, secondary_cv_k_kcal_list,
         getattr(args, "state_gamd_lambdas", None), n=nrep,
     )
+    if getattr(args, "_aux_runtime", None) is not None:
+        from .auxiliary_cv.runtime import aux_snapshot_rows
+        # D5: every Stage-B-era snapshot names its auxiliary restraints, so a strict reader fails closed
+        # (MissingCoordinateError) instead of reconstructing the bias without A_s.
+        _win_snapshot_windows = aux_snapshot_rows(_win_snapshot_windows, args._aux_runtime.table)
+        _aux_table_rows = args._aux_runtime.table.window_rows()
+        if all("instance" in t for t in _aux_table_rows):
+            # C1: slot pairing and roles enforced once, by Stage A. aux_snapshot_rows does not carry
+            # the instance blocks, so they come from the table (checked here, not persisted).
+            from .correctness.bias import normalize_windows
+            from .correctness.state_identity import _check_instances
+            _check_instances(normalize_windows([dict(r, instance=t["instance"])
+                                                for r, t in zip(_win_snapshot_windows, _aux_table_rows)]))
     _cv2_type = (secondary_cv_metadata or {}).get("mode") if secondary_cv_centers is not None else None
-    WindowSnapshot(out_dir).snapshot(_seg_id, _win_snapshot_windows, cv1_type=primary_cv_mode(args), cv2_type=_cv2_type,
-                                     kernel_identity=kernel_identity_for_run(args, secondary_cv_metadata))
+    _aux_io = None
+    _aux_record_for_replica = None
+    _aux_reseal_records = None
+    _aux_reseal_plan = None
+    _aux_resume_loading = False
+    if getattr(args, "_aux_runtime", None) is not None:
+        from .auxiliary_cv.runtime_definition import (aux_io_runtime, build_runtime_state_definition,
+                                                      embed_cv_definition, solvated_start_topology)
+        from .auxiliary_cv.runtime_io import check_fixed_box, context_box_nm, make_aux_record_observer
+        from .cv import primary_cv_is_dimensionless
+        _ens = str(getattr(args, "production_ensemble", "npt")).upper()
+        _box = None
+        if _ens == "NVT" and fast_resume:
+            # The Contexts have not loaded their checkpoints yet (their box is the System default, from the
+            # PDB-reloaded topology): the fixed box is the checkpoint's; _aux_pre_apply verifies every
+            # restored box against it before the re-apply.
+            _box = (((resume_manifest or {}).get("aux") or {}).get("state_definition") or {}).get("fixed_box_vectors_nm")
+        elif _ens == "NVT":
+            # Board condition 3: an OpenMM State always carries the box (verified 2026-10-08, 8.5.1
+            # Reference/CPU). Fresh path: every replica got its start box in _build_context_i; they must agree.
+            _boxes = [_sim_pool.submit(r, context_box_nm, sims[r].context, unit).result() for r in range(nrep)]
+            check_fixed_box(_boxes, _boxes[0], label="NVT production replicas at segment start")
+            _box = _boxes[0]
+        _cv1 = embed_cv_definition(primary_cv_mode(args),
+                                   "dimensionless" if primary_cv_is_dimensionless(args) else "angstrom",
+                                   _json_ready(primary_cv_def))
+        _cv2 = (embed_cv_definition(_cv2_type, "dimensionless", _json_ready(secondary_cv_metadata))
+                if _cv2_type is not None else None)
+        _boost = ({"kind": str(getattr(args, "gamd_boost_type", "") or "gamd"),
+                   "envelope": _json_ready(shared_gamd_globals_all)} if use_gamd else None)
+        _aux_definition = build_runtime_state_definition(
+            physical_system_sha256=_aux_physical_sha, ensemble=_ens, temperature_k=float(args.temperature_k),
+            pressure_bar=float(args.pressure_bar) if _ens == "NPT" else None, box_vectors_nm=_box,
+            cv1=_cv1, cv2=_cv2, boost=_boost, snapshot_rows=_win_snapshot_windows,
+            aux_table=args._aux_runtime.table,
+            applied_window_key=_aux_window_order_key(centers_a, k_list, secondary_cv_centers,
+                                                     secondary_cv_k_kcal_list, nrep))
+        # Carry-over 8: the storage adapter sees the solvated start PDB's topology, never the in-memory one.
+        from .auxiliary_cv.sample_schema import runtime_precision_info
+        # Final fix wave I4c: the Precision property is read on replica 0's own worker; a failed read is
+        # warned about once and recorded (precision_fallback) in the samples' runtime block.
+        _aux_io = aux_io_runtime(args._aux_runtime, state_definition=_aux_definition,
+                                 topology=solvated_start_topology(out_dir), args=args,
+                                 platform=platform, context=sims[0].context,
+                                 precision_info=_sim_pool.submit(0, runtime_precision_info, platform.getName(),
+                                                                 platform, sims[0].context).result())
+        if _aux_io.topology_sha256 != _aux_whole_topology_sha:
+            raise RuntimeError("auxiliary topology identity is not the solvated start PDB's "
+                               f"({_aux_io.topology_sha256} vs {_aux_whole_topology_sha})")
+        _aux_record_for_replica = make_aux_record_observer(
+            args._aux_runtime, aux_forces=_aux_forces, unit=unit,
+            schema=_aux_io.sample_schema, models=_aux_io.models)
+    if _aux_io is not None:
+        # Final fix wave M2: every auxiliary refusal runs before the segment is registered -- the boundary
+        # alignment check too (same resolved intervals as the production loop's distance_interval).
+        from .auxiliary_cv.runtime_io import check_exchange_boundary_alignment
+        _aux_distance_interval = int(getattr(args, "distance_output_interval", 0) or 0)
+        if _aux_distance_interval <= 0:
+            _aux_distance_interval = max(1, min(int(args.report_interval), int(args.exchange_interval)))
+        _aux_distance_interval = max(1, _aux_distance_interval)
+        for _note in check_exchange_boundary_alignment(
+                exchange_interval=int(args.exchange_interval), distance_interval=_aux_distance_interval,
+                traj_interval=effective_traj_interval, calib_steps=int(calib_steps)):
+            print(f"WARNING: {_note}", flush=True)
+        _aux_parent_seg_id = _parent_seg_id
+        if fast_resume:
+            # Task 14 F4: the binding, ledger and duplicate refusals run (read-only) before the resumed segment
+            # exists, so a refused resume leaves no orphan segment behind. Its parent is the checkpoint's
+            # segment (fix round 2, minor 5); the re-seal waits for the checkpoint load (minor 4).
+            from .auxiliary_cv.runtime_io import prepare_aux_resume
+            _aux_reseal_plan = prepare_aux_resume(
+                out_dir, _seg_registry, resume_manifest, state_definition=_aux_io.state_definition,
+                force_info=_aux_io.force_info, topology_sha256=_aux_io.topology_sha256,
+                kernel_identity_digest=kernel_identity_for_run(args, secondary_cv_metadata)["digest"],
+                sample_basis_sha256=(_aux_io.sample_schema.basis_sha256
+                                     if _aux_io.sample_schema.schema == "atlas-aux-samples-v2" else None))
+            _aux_parent_seg_id = _aux_reseal_plan["parent_segment_id"]
+        _seg_id = _seg_registry.open_segment(_run_id, _aux_parent_seg_id, _round_id)
+        # Carry-over 5: the frozen v2 snapshot carries the state definition.
+        WindowSnapshot(out_dir).snapshot(_seg_id, _win_snapshot_windows, cv1_type=primary_cv_mode(args), cv2_type=_cv2_type,
+                                         kernel_identity=kernel_identity_for_run(args, secondary_cv_metadata),
+                                         state_definition=_aux_io.state_definition, phase_kind=_aux_io.phase_kind,
+                                         equilibrium_analysis_eligible=_aux_io.equilibrium_eligible)
+    else:
+        WindowSnapshot(out_dir).snapshot(_seg_id, _win_snapshot_windows, cv1_type=primary_cv_mode(args), cv2_type=_cv2_type,
+                                         kernel_identity=kernel_identity_for_run(args, secondary_cv_metadata))
     parquet_sample_writer = ParquetSampleWriter(
         out_dir / "samples" / _seg_id,
         flush_rows=int(getattr(args, "parquet_flush_rows", 5000) or 5000),
+        **({"aux_schema": _aux_io.sample_schema, "aux_runtime": _aux_io.runtime} if _aux_io is not None else {}),
     )
+    _exchange_seq = None
+    _aux_parity = None
+    _aux_event_kw = {}
+    if _aux_io is not None:
+        from .auxiliary_cv.ledger import EXCHANGE_EVENT_SCHEMA
+        from .auxiliary_cv.offline import parity_context
+        from .auxiliary_cv.runtime_io import ExchangeEventCounter
+        _exchange_seq = ExchangeEventCounter()
+        _aux_parity = parity_context(_aux_io.state_definition["windows"], beta)
+        # Final fix wave I4a: strict k_max lookup, resolved once (raises if an active state's model has none).
+        from .auxiliary_cv.offline import parity_bound
+        _aux_parity_k_max, _aux_parity_centers = parity_bound(_aux_parity, _aux_io.sample_schema.model_shas[0])
+        _aux_event_kw = {"event_schema": EXCHANGE_EVENT_SCHEMA}
     parquet_exchange_writer = ParquetExchangeWriter(
         out_dir / "exchanges" / _seg_id,
         flush_rows=int(getattr(args, "parquet_flush_rows", 5000) or 5000),
+        **_aux_event_kw,
     )
     exchange_csv = None
     sample_csv = None
@@ -8086,6 +8606,9 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
             potentials_kj = np.empty(nrep, dtype=np.float64)
             v_pep_kj = np.empty(nrep, dtype=np.float64)
             v_dih_kj = np.empty(nrep, dtype=np.float64)
+            aux_z = np.full(nrep, np.nan, dtype=np.float64)
+            aux_torsions = [None] * nrep
+            aux_pos_z = np.full(nrep, np.nan, dtype=np.float64)
 
             def _fetch_state(r_sim):
                 r, sim = r_sim
@@ -8099,19 +8622,34 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                     else:
                         pe = float("nan")
                     v_pep, v_dih = _fetch_v_pep_v_dih(ctx, pep_env, unit)
-                    return r, cv, ss, pe, v_pep, v_dih
+                    return (r, cv, ss, pe, v_pep, v_dih,
+                            *(_aux_record_for_replica(r, sim) if _aux_io is not None
+                              else (_aux_z_for_replica(r, sim), None, None)))
                 cv, ss, pe = primary_secondary_and_potential_from_state(
                     sim.context, primary_cv_def, args, unit, secondary_cv_metadata,
                     read_potential_energy=read_sample_potential,
                 )
                 v_pep, v_dih = _fetch_v_pep_v_dih(sim.context, pep_env, unit)
-                return r, cv, ss, pe, v_pep, v_dih
+                return (r, cv, ss, pe, v_pep, v_dih,
+                        *(_aux_record_for_replica(r, sim) if _aux_io is not None
+                          else (_aux_z_for_replica(r, sim), None, None)))
 
             with _phase_timers.phase("sample.fetch"):
                 _fetched_states = _sim_pool.map(_fetch_state, enumerate(sims))
-            for r, cv, ss, pe, v_pep, v_dih in _fetched_states:
+            for r, cv, ss, pe, v_pep, v_dih, z_aux, tor_aux, zpos_aux in _fetched_states:
                 primary_values[r], ss_values[r], potentials_kj[r] = cv, ss, pe
                 v_pep_kj[r], v_dih_kj[r] = v_pep, v_dih
+                aux_z[r] = z_aux
+                aux_torsions[r] = tor_aux
+                if zpos_aux is not None:
+                    aux_pos_z[r] = zpos_aux
+            if _aux_io is not None:
+                from .auxiliary_cv.runtime_io import check_runtime_parity
+                from .auxiliary_cv.sample_schema import PARITY_TOLERANCE
+                # Carry-over 6: precision from the payload runtime block (the one the sample writer records).
+                check_runtime_parity(aux_z, aux_pos_z, beta=float(beta),
+                                     k_max_kcal=_aux_parity_k_max, centers=_aux_parity_centers,
+                                     tolerance=PARITY_TOLERANCE[_aux_io.runtime["precision"]])
             ss_centers_arr = ss_centers_arr_global
             ss_k_arr = ss_k_kcal_arr_global
             _has_ss_axis = secondary_cv_centers is not None and secondary_cv_k_kcal_list is not None
@@ -8121,8 +8659,10 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
             )
             boost_bias_matrix_kj = (pep_gamd_boost_matrix_kj(v_pep_kj, v_dih_kj, state_lambdas, pep_env)
                                     if pep_env is not None else np.zeros((nrep, nrep)))
+            aux_bias_matrix_kcal_now = aux_bias_matrix_kcal(aux_z, _aux_rt.table) if _aux_rt is not None else None
             bias_matrix_kcal, bias_matrix_kj = assemble_bias_matrices(
-                distance_bias_matrix_kcal, ss_bias_matrix_kcal, boost_bias_matrix_kj
+                distance_bias_matrix_kcal, ss_bias_matrix_kcal, boost_bias_matrix_kj,
+                aux_bias_kcal=aux_bias_matrix_kcal_now,
             )
             reduced_bias_matrix = float(beta) * bias_matrix_kj
             observable_cache["step"] = int(step)
@@ -8131,6 +8671,7 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
             observable_cache["bias_matrix_kj"] = bias_matrix_kj
             observable_cache["v_pep_kj"] = v_pep_kj
             observable_cache["v_dih_kj"] = v_dih_kj
+            observable_cache["aux_z"] = aux_z
             observable_cache["boost_bias_matrix_kj"] = boost_bias_matrix_kj
             if is_prod:
                 ensure_sample_writer()
@@ -8235,6 +8776,7 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                         v_pep=float(v_pep_kj[r]) if pep_env is not None else float("nan"),
                         v_dih=float(v_dih_kj[r]) if pep_env is not None else float("nan"),
                         gamd_lambda=float(state_lambdas[w]),
+                        **({"aux_z": [float(aux_z[r])], "torsions": aux_torsions[r]} if _aux_io is not None else {}),
                     )
                 rows.append(row)
             if is_prod and bool(getattr(args, "flush_every_log", False)):
@@ -8387,11 +8929,26 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
             rep = int(replica_of_window[w])
             return rep if rep >= 0 else None
 
-        def _attempt_window_swap(wi: int, wj: int, primary_values: np.ndarray, bias_matrix_kj: np.ndarray, absolute_step: int, attempt: int, p_override: Optional[float] = None, force_accept: bool = False) -> int:
+        def _attempt_window_swap(wi: int, wj: int, primary_values: np.ndarray, bias_matrix_kj: np.ndarray, absolute_step: int, attempt: int, p_override: Optional[float] = None, force_accept: bool = False, aux_event: Optional[dict] = None, log_p_accept: Optional[float] = None) -> int:
             """Attempt/apply a swap between two umbrella windows using vectorized bias energies."""
+            def _aux_write_skip():
+                # A Gibbs move the swap kernel declined (no holder / no outcome) is still one ledger event.
+                # Pair modes pass no aux_event: their skipped pairs change no assignment and write nothing.
+                if _aux_io is not None and aux_event is not None:
+                    parquet_exchange_writer.write_event(
+                        step=int(absolute_step), attempt_seq=_exchange_seq.next(int(absolute_step)),
+                        selected_replica=int(aux_event["selected_replica"]),
+                        replica_i=int(aux_event["selected_replica"]), replica_j=int(aux_event["selected_replica"]),
+                        window_i=int(wi), window_j=int(wi), kind="skip", delta_e_kj=0.0, accepted=False,
+                        log_q_forward=aux_event["log_q_forward"], log_q_reverse=aux_event["log_q_reverse"],
+                        p_accept=aux_event["p_accept"], log_p_accept=aux_event["log_p_accept"],
+                        proposal_algorithm=aux_event["proposal_algorithm"], energy_version=_aux_io.energy_version,
+                        assignments_after=list(assignments))
+
             wi = int(wi)
             wj = int(wj)
             if wi == wj:
+                _aux_write_skip()
                 return attempt
             # Decision + bookkeeping live in the module-level kernel so a test can
             # drive them; the side effects below stay here. `force_accept` must not
@@ -8401,13 +8958,16 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
             # early on these cases without consuming a random number, and an
             # extra draw shifts every downstream stream.
             if swap_candidate_replicas(replica_of_window, wi, wj) is None:
+                _aux_write_skip()
                 return attempt
             outcome = apply_window_swap(
                 bias_matrix_kj, beta, assignments, replica_of_window, wi, wj,
                 None if force_accept else rng.random(),
                 p_override=p_override, force_accept=force_accept,
+                log_p_accept=log_p_accept,
             )
             if outcome is None:
+                _aux_write_skip()
                 return attempt
             i, j = outcome.replica_i, outcome.replica_j
             _record_exchange_stats(wi, wj, outcome.accepted)
@@ -8417,22 +8977,38 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                 # accepted swap re-labels replicas so the cached CV/bias
                 # observables are stale until the next sample().
                 def _apply_swap_to_replica(replica_index: int):
-                    set_window(sims[replica_index].context, centers_nm, ks_kj_nm2, assignments[replica_index], secondary_cv_centers, secondary_cv_ks_kj)
+                    set_window(sims[replica_index].context, centers_nm, ks_kj_nm2, assignments[replica_index],
+                               secondary_cv_centers, secondary_cv_ks_kj,
+                               aux_state=getattr(args, "_aux_runtime", None))
                     set_replica_lambda_for_window(sims[replica_index].integrator, assignments[replica_index], state_lambdas, k0max_by_channel)
 
                 with _phase_timers.phase("exchange.swap_apply"):
                     _sim_pool.submit(i, _apply_swap_to_replica, i).result()
                     _sim_pool.submit(j, _apply_swap_to_replica, j).result()
                 observable_cache.clear()
-            parquet_exchange_writer.write_exchange(
-                step=int(absolute_step),
-                replica_i=int(i),
-                replica_j=int(j),
-                window_i=int(wi),
-                window_j=int(wj),
-                delta_e=float(outcome.delta_kj),
-                accepted=bool(outcome.accepted),
-            )
+            if _aux_io is not None:
+                # Pair modes pass no aux_event: no proposal logs, and no Gibbs proposal algorithm (null).
+                _f = aux_event or {"selected_replica": i, "log_q_forward": float("nan"),
+                                   "log_q_reverse": float("nan"), "p_accept": float("nan"),
+                                   "log_p_accept": float("nan"), "proposal_algorithm": None}
+                parquet_exchange_writer.write_event(
+                    step=int(absolute_step), attempt_seq=_exchange_seq.next(int(absolute_step)),
+                    selected_replica=int(_f["selected_replica"]), replica_i=int(i), replica_j=int(j),
+                    window_i=int(wi), window_j=int(wj), kind="swap", delta_e_kj=float(outcome.delta_kj),
+                    accepted=bool(outcome.accepted), log_q_forward=_f["log_q_forward"],
+                    log_q_reverse=_f["log_q_reverse"], p_accept=_f["p_accept"], log_p_accept=_f["log_p_accept"],
+                    proposal_algorithm=_f["proposal_algorithm"],
+                    energy_version=_aux_io.energy_version, assignments_after=list(assignments))
+            else:
+                parquet_exchange_writer.write_exchange(
+                    step=int(absolute_step),
+                    replica_i=int(i),
+                    replica_j=int(j),
+                    window_i=int(wi),
+                    window_j=int(wj),
+                    delta_e=float(outcome.delta_kj),
+                    accepted=bool(outcome.accepted),
+                )
             return attempt + 1
 
         def _current_exchange_arrays(absolute_step: Optional[int] = None) -> tuple[np.ndarray, np.ndarray]:
@@ -8460,6 +9036,7 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
             ss_values = np.full(nrep, np.nan, dtype=np.float64)
             v_pep_kj = np.empty(nrep, dtype=np.float64)
             v_dih_kj = np.empty(nrep, dtype=np.float64)
+            aux_z = np.full(nrep, np.nan, dtype=np.float64)
             _ss_enabled = bool((secondary_cv_metadata or {}).get("enabled"))
 
             def _fetch_exchange_state(r_sim):
@@ -8474,15 +9051,16 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                     cv = primary_cv_value_from_positions_nm(pos, primary_cv_def, args)
                     ss = secondary_structure_score_from_positions_nm(pos, secondary_cv_metadata) if _ss_enabled else float("nan")
                     v_pep, v_dih = _fetch_v_pep_v_dih(sim.context, pep_env, unit)
-                return r, cv, ss, v_pep, v_dih
+                return r, cv, ss, v_pep, v_dih, _aux_z_for_replica(r, sim)
 
             with _phase_timers.phase("exchange.fetch"):
                 _fetched_exchange = _sim_pool.map(_fetch_exchange_state, enumerate(sims))
-            for r, cv, ss, v_pep, v_dih in _fetched_exchange:
+            for r, cv, ss, v_pep, v_dih, z_aux in _fetched_exchange:
                 primary_values[r] = cv
                 ss_values[r] = ss
                 v_pep_kj[r] = v_pep
                 v_dih_kj[r] = v_dih
+                aux_z[r] = z_aux
             _has_ss_axis = (secondary_cv_centers is not None and secondary_cv_ks_kj is not None
                             and ss_ks_kj_arr_global is not None)
             # Same kcal arrays as the sample path: the matrix the kernel exchanges on IS the
@@ -8494,7 +9072,9 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
             )
             boost_bias_matrix_kj = (pep_gamd_boost_matrix_kj(v_pep_kj, v_dih_kj, state_lambdas, pep_env)
                                     if pep_env is not None else np.zeros((nrep, nrep)))
-            _, bias_matrix_kj = assemble_bias_matrices(distance_bias_kcal, ss_bias_kcal, boost_bias_matrix_kj)
+            aux_bias_kcal = aux_bias_matrix_kcal(aux_z, _aux_rt.table) if _aux_rt is not None else None
+            _, bias_matrix_kj = assemble_bias_matrices(distance_bias_kcal, ss_bias_kcal, boost_bias_matrix_kj,
+                                                       aux_bias_kcal=aux_bias_kcal)
             return primary_values, bias_matrix_kj
 
         def _candidate_delta_for_window_swap(wi: int, wj: int, bias_matrix_kj: np.ndarray) -> Optional[float]:
@@ -8592,27 +9172,48 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                 limit = int(getattr(args, "exchange_max_pairs_per_interval", 0) or 0)
                 if limit > 0:
                     order = order[:limit]
+                # Aux runs use the log-space gibbs_softmax_log_v2 proposal + MH (F09); legacy
+                # runs keep the clipped algorithm and its RNG draw order byte-identically.
+                _gibbs_propose = select_gibbs_proposer(aux_active=_aux_io is not None)
                 for rep in order:
                     rep = int(rep)
-                    prop = gibbs_propose_one_replica(
+                    prop = _gibbs_propose(
                         bias_matrix_kj, float(beta), assignments, replica_of_window,
                         rep, lambda k, p: int(rng.choice(k, p=p)),
                     )
                     if prop.no_candidates:
                         exchange_stats["gibbs_all_nan_skips"] = exchange_stats.get("gibbs_all_nan_skips", 0) + 1
+                        if _aux_io is not None:
+                            from .auxiliary_cv.runtime_io import event_from_gibbs
+                            parquet_exchange_writer.write_event(**event_from_gibbs(
+                                prop, step=int(absolute_step), seq=_exchange_seq.next(int(absolute_step)),
+                                selected_replica=rep, accepted=False, energy_version=_aux_io.energy_version,
+                                assignments_after=list(assignments)))
                         continue
                     exchange_stats["gibbs_choices"] = int(exchange_stats.get("gibbs_choices", 0) or 0) + 1
                     if prop.stayed:
                         exchange_stats["gibbs_stays"] = int(exchange_stats.get("gibbs_stays", 0) or 0) + 1
+                        if _aux_io is not None:
+                            from .auxiliary_cv.runtime_io import event_from_gibbs
+                            parquet_exchange_writer.write_event(**event_from_gibbs(
+                                prop, step=int(absolute_step), seq=_exchange_seq.next(int(absolute_step)),
+                                selected_replica=rep, accepted=False, energy_version=_aux_io.energy_version,
+                                assignments_after=list(assignments)))
                         continue
                     # Counted here, before the MH test, so this is a count of
                     # PROPOSED moves. `gibbs_move_fraction` derived from it is a
                     # proposal rate, not an acceptance rate.
                     exchange_stats["gibbs_moves"] = int(exchange_stats.get("gibbs_moves", 0) or 0) + 1
                     exchange_stats["gibbs_mh_corrected"] = True
+                    _gibbs_aux_event = None
+                    if _aux_io is not None:
+                        from .auxiliary_cv.runtime_io import aux_event_fields
+                        _gibbs_aux_event = {"selected_replica": rep, **aux_event_fields(prop)}
                     attempt = _attempt_window_swap(
                         prop.current_window, prop.proposed_window, primary_values,
                         bias_matrix_kj, absolute_step, attempt, p_override=prop.pacc,
+                        aux_event=_gibbs_aux_event,
+                        log_p_accept=prop.log_p_accept if _aux_io is not None else None,
                     )
                 parquet_exchange_writer.flush() if bool(getattr(args, "flush_every_log", True)) else None
                 return parity, attempt
@@ -8623,6 +9224,9 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
         if distance_interval <= 0:
             distance_interval = max(1, min(int(args.report_interval), int(args.exchange_interval)))
         distance_interval = max(1, distance_interval)
+        if _aux_io is not None and distance_interval != _aux_distance_interval:
+            raise RuntimeError(f"auxiliary run: resolved distance_interval {distance_interval} differs from the "
+                               f"one checked before segment registration ({_aux_distance_interval})")
 
         # Article-style GaREUS: the GaMD setup was already performed once above and
         # copied into every replica.  Do not run per-replica calibration/equilibration
@@ -8683,7 +9287,53 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
             else:
                 adaptive_phase_info.update(merge_adaptive_phase_info(adaptive_phase_info, _api))
 
+        def _aux_checkpoint_block_now():
+            if _aux_io is not None:
+                from .auxiliary_cv.checkpoint import aux_checkpoint_block, read_aux_parameters
+                from .auxiliary_cv.runtime_io import data_boundary
+                return aux_checkpoint_block(
+                    state_definition=_aux_io.state_definition, force_info=_aux_io.force_info,
+                    assignments=list(assignments),
+                    observed_params=[_sim_pool.submit(r, read_aux_parameters, sims[r].context, _aux_io.force_info).result()
+                                     for r in range(nrep)],
+                    topology_sha256=_aux_io.topology_sha256,
+                    kernel_identity_digest=kernel_identity_for_run(args, secondary_cv_metadata)["digest"],
+                    segment_id=_seg_id, ledger_anchor=_aux_anchor,
+                    # Carry-over 12 (M1): safe before the first non-empty flush (generation 0, 0 rows).
+                    data_boundary=data_boundary(out_dir, _seg_id),
+                    sample_basis_sha256=(_aux_io.sample_schema.basis_sha256
+                                         if _aux_io.sample_schema.schema == "atlas-aux-samples-v2" else None))
+            return None
+
+        def _aux_pre_apply(manifest_in, assignments_in):
+            """Context parameters as restored by loadCheckpoint, BEFORE the re-apply (C5/S8)."""
+            if _aux_io is not None:
+                from .auxiliary_cv.checkpoint import read_aux_parameters, verify_aux_resume
+                from .auxiliary_cv.runtime_io import check_fixed_box, context_box_nm
+                # Carry-over 1: every Context read runs on that replica's own worker.
+                verify_aux_resume(
+                    manifest_in, aux_enabled=True, state_definition=_aux_io.state_definition,
+                    force_info=_aux_io.force_info, assignments=assignments_in,
+                    observed_params=[_sim_pool.submit(r, read_aux_parameters, sims[r].context, _aux_io.force_info).result()
+                                     for r in range(len(assignments_in))],
+                    topology_sha256=_aux_io.topology_sha256,
+                    kernel_identity_digest=kernel_identity_for_run(args, secondary_cv_metadata)["digest"],
+                    sample_basis_sha256=(_aux_io.sample_schema.basis_sha256
+                                         if _aux_io.sample_schema.schema == "atlas-aux-samples-v2" else None))
+                if _aux_io.state_definition["ensemble"] == "NVT":
+                    check_fixed_box([_sim_pool.submit(r, context_box_nm, sims[r].context, unit).result()
+                                     for r in range(len(assignments_in))],
+                                    _aux_io.state_definition["fixed_box_vectors_nm"],
+                                    label="boxes restored by loadCheckpoint")
+            elif manifest_in.get("aux") is not None:
+                # Legacy path: an inline check, no gareus.auxiliary_cv import (off path stays off the package).
+                # The one guard that stops a non-aux job from resuming an aux checkpoint.
+                raise RuntimeError("resume refused: this checkpoint binds auxiliary-CV states but this job has no "
+                                   "--aux-cv-model; resume it with the same --aux-cv-model (spec D6)")
+
         if bool(getattr(args, "resume", False)):
+            # Task 14 F4: a refusal inside the load (Context parameters/boxes) discards the empty new segment.
+            _aux_resume_loading = _aux_io is not None
             manifest = load_production_checkpoint(
                 out_dir, sims, centers_nm, ks_kj_nm2, rng, secondary_cv_centers, secondary_cv_ks_kj,
                 openmm_version=str(getattr(getattr(openmm, "version", None), "version", None)),
@@ -8691,7 +9341,9 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                 strict_gamd_restore=bool(getattr(args, "strict_gamd_restore", False)),
                 state_lambdas=state_lambdas, k0max_by_channel=k0max_by_channel,
                 drivers=drivers, pool=_sim_pool, npt_runtime=npt_runtime, args=args,
+                aux_pre_apply=_aux_pre_apply,
             )
+            # Fix round 3: the discard stays armed through the auxiliary re-seal below (disarmed after it).
             if manifest is not None:
                 assignments[:] = [int(x) for x in manifest.get("assignments", assignments)]
                 dashboard_info["gamd_integrator_restore_ok"] = bool(manifest.get("resume_gamd_integrator_restore_report", {}).get("ok", False))
@@ -8732,7 +9384,30 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                 # Seal the previous crashed segment: rows beyond the checkpoint
                 # step have wrong window_id labels (exchange state was rolled back)
                 # and must be excluded from MBAR analysis.
-                if _parent_was_running and _parent_seg_id is not None:
+                if getattr(args, "_aux_runtime", None) is not None:
+                    # Auxiliary runs only (ruling B4, Task 14 F4): the anchor-scoped ledger replay and the
+                    # duplicate-event refusal ran in prepare_aux_resume, before this segment was registered; the
+                    # re-seal (walking back over orphan segments to the checkpoint's own) runs now, after every
+                    # Context-dependent check in the load passed (fix round 2, minor 4).
+                    from .store import reseal_chain_for_resume
+                    if _aux_reseal_plan is None:
+                        raise RuntimeError("auxiliary resume loaded a checkpoint without its pre-registration "
+                                           "checks (no replica checkpoint files in the manifest); refusing")
+                    if int(_aux_reseal_plan["checkpoint_step"]) != int(manifest.get("absolute_step", 0)):
+                        # Final fix wave M7: the re-seal cut must be the checkpoint that was actually loaded.
+                        raise RuntimeError(f"auxiliary resume: the re-seal plan's checkpoint step "
+                                           f"{_aux_reseal_plan['checkpoint_step']} is not the loaded checkpoint's "
+                                           f"absolute_step {manifest.get('absolute_step')}; refusing")
+                    _aux_reseal_records = reseal_chain_for_resume(
+                        _seg_registry, _aux_reseal_plan["checkpoint_segment_id"],
+                        _aux_reseal_plan["checkpoint_step"], exclude=_seg_id)
+                    for _rec in (_aux_reseal_records or []):
+                        if _rec["previous_end_step"] != _rec["end_step"] or _rec["status"] != _rec["previous_status"]:
+                            print(f"    Resume: segment {_rec['segment_id']} re-sealed {_rec['status']} at step "
+                                  f"{_rec['end_step']} (was {_rec['previous_status']} at {_rec['previous_end_step']}); "
+                                  "later rows were rolled back.", flush=True)
+                    _aux_resume_loading = False      # re-seal done: from here on the segment is finalized
+                elif _parent_was_running and _parent_seg_id is not None:
                     _seg_registry.seal_segment(
                         _parent_seg_id,
                         absolute_end_step=int(manifest.get("absolute_step", 0)),
@@ -8741,6 +9416,12 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                 # Record the absolute start step of the resumed segment.
                 _seg_registry.set_segment_start_step(_seg_id, int(manifest.get("absolute_step", 0)))
             else:
+                if _aux_io is not None:
+                    # Final fix wave M1: an auxiliary fast resume whose checkpoint load found nothing refuses
+                    # like the non-fast path (committed rows would be pooled twice); the discard stays armed.
+                    from .auxiliary_cv.runtime_io import refuse_aux_resume_without_checkpoint
+                    refuse_aux_resume_without_checkpoint(out_dir)
+                _aux_resume_loading = False
                 print("    --resume requested, but no production checkpoint manifest was found; starting production from step 0")
                 # No checkpoint: any previously-running segment has no valid
                 # end boundary — mark it abandoned so it is skipped in analysis.
@@ -8772,6 +9453,14 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
         if progress is not None:
             progress.progress("gareus_production", prod_done, prod_total, message=f"{nrep} replicas | {getattr(args, 'exchange_mode', 'neighbor')} exchange attempts {attempt}", timestep_fs=float(args.timestep_fs), n_replicas=nrep, force=True)
 
+        _aux_anchor = None
+        _aux_test_fail_step = None
+        if _aux_io is not None:
+            _aux_anchor = {"segment_id": _seg_id, "start_step": int(calib_steps + prod_done),
+                           "start_assignments": list(assignments)}
+            # Carry-over 14: the injected-failure hook exists only for auxiliary runs (Task 14 crash tests).
+            if os.environ.get("GAREUS_TEST_FAIL_AT_PROD_STEP"):
+                _aux_test_fail_step = int(os.environ["GAREUS_TEST_FAIL_AT_PROD_STEP"])
         _phase_timers.begin()
         while prod_done < prod_total:
             if _graceful_shutdown.is_set():
@@ -8790,6 +9479,7 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                     platform_name=str(platform.getName()),
                     drivers=drivers, pool=_sim_pool, npt_runtime=npt_runtime,
                     keep_generations=int(getattr(args, "checkpoint_keep_generations", 0) or 0),
+                    aux_block=_aux_checkpoint_block_now(),
                 )
                 _maybe_prune_us_starting(args, out_dir)
                 _scratch_main = getattr(args, "_main_dir", None)
@@ -8798,6 +9488,8 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                                           keep_generations=int(getattr(args, "checkpoint_keep_generations", 0) or 0))
                     _maybe_prune_us_starting(args, _scratch_main)
                 break
+            if _aux_test_fail_step is not None and prod_done == _aux_test_fail_step:
+                raise RuntimeError(f"GAREUS_TEST_FAIL_AT_PROD_STEP={_aux_test_fail_step}: injected test failure")
             target = prod_total
             if next_exchange > prod_done:
                 target = min(target, next_exchange)
@@ -8894,6 +9586,7 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
                         platform_name=str(platform.getName()),
                         drivers=drivers, pool=_sim_pool, npt_runtime=npt_runtime,
                         keep_generations=int(getattr(args, "checkpoint_keep_generations", 0) or 0),
+                        aux_block=_aux_checkpoint_block_now(),
                     )
                 _maybe_prune_us_starting(args, out_dir)
                 # Written before the scratch sync so the main directory gets this checkpoint's timers.
@@ -9091,16 +9784,21 @@ def run_gareus(args, out_dir: Path, openmm, app, unit, forcefield, topology, equ
         # Gate segment-complete marking on BOTH a clean loop exit AND
         # successful writer flush/close.  Any failure leaves the segment
         # as "interrupted" so the next resume knows the last valid checkpoint.
-        try:
-            finalize_segment(
-                _seg_registry,
-                _seg_id,
-                completed_cleanly=_prod_completed_cleanly,
-                writers_ok=_writers_ok,
-                end_step=int(calib_steps + prod_done),
-            )
-        except Exception as _finalize_exc:
-            print(f"WARNING: segment registry finalization failed: {_finalize_exc}", flush=True)
+        _aux_discarded = False
+        if _aux_resume_loading:
+            from .auxiliary_cv.runtime_io import discard_refused_segment
+            _aux_discarded = discard_refused_segment(out_dir, _seg_registry, _seg_id)
+        if not _aux_discarded:
+            try:
+                finalize_segment(
+                    _seg_registry,
+                    _seg_id,
+                    completed_cleanly=_prod_completed_cleanly,
+                    writers_ok=_writers_ok,
+                    end_step=int(calib_steps + prod_done),
+                )
+            except Exception as _finalize_exc:
+                print(f"WARNING: segment registry finalization failed: {_finalize_exc}", flush=True)
 
         distance_logger.close()
 

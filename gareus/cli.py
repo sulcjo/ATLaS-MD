@@ -711,6 +711,23 @@ def _add_window_args(p: argparse.ArgumentParser) -> None:
                         "one atomic insert costing n_rungs x n_fills) instead of a single midpoint window, which "
                         "cannot connect a several-kT barrier. Falls back to the midpoint without a shape layout "
                         "plan. Off by default; frozen decision rule.")
+    p.add_argument("--ap-aux-discovery", action=argparse.BooleanOptionalAction, default=False,
+                   help="Discover a torsion-linear auxiliary CV (z3) from this campaign's own frames at each "
+                        "numbered-epoch boundary from the end of epoch 1 (never the last) and admit at most "
+                        "min(4, --ap-aux-reserve-slots minus live workers, free --max-replicas slots) lambda=0 worker states "
+                        "(spec 2026-10-09-cvaux-adaptive-discovery-design.md). Requires --ap-continue-states (frozen per "
+                        "campaign in adaptive_production/aux_campaign_options.json): without it every phase re-pulls "
+                        "every worker and the worker burn-in discards their samples. Off by default.")
+    p.add_argument("--ap-aux-reserve-slots", type=int, default=4,
+                   help="Replica slots of the P1 reserve kept for auxiliary workers (R1/R3 never use them).")
+    p.add_argument("--ap-aux-feature-space", choices=("backbone", "sidechain", "mixed", "auto"), default="backbone",
+                   help="Feature space for aux discovery, frozen per campaign. Backbone preserves the existing "
+                        "search; sidechain, mixed and auto are reserved until their discovery integration is available.")
+    p.add_argument("--ap-aux-validation", choices=("required", "off"), default="required",
+                   help="Gate on aux worker admission: required (default) = adaptive_production/aux_validation.json "
+                        "must be valid; off = skip it (k3 cap from aux_settings k3_max_unvalidated). Frozen per campaign.")
+    p.add_argument("--ap-aux-settings-override", action="store_true", default=False,
+                   help="Replace the campaign's recorded aux_settings.json with this job's values.")
     p.add_argument("--ap-cv2-respring", action=argparse.BooleanOptionalAction, default=False,
                    help="Re-derive CV2 springs from production samples (off by default). After each numbered "
                         "epoch, a CV2-restrained window whose realised mean compression k2/(k2 + F''_prod), "
@@ -900,6 +917,10 @@ def _add_gamd_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--gamd-cmd-steps", type=int, default=250000,
                    help="GaMD CMD pre-equilibration steps for Vmax/Vmin statistics (longer → better calibration, lower anharmonicity).")
     p.add_argument("--gamd-averaging-window", type=int, default=5000)
+    p.add_argument("--gamd-cmd-prep-steps", type=int, default=5000,
+                   help="Unrecorded Pep-GaMD cMD preparation steps before the cMD statistics stage (ntcmdprep). Lower only for short test runs.")
+    p.add_argument("--gamd-equil-prep-steps", type=int, default=5000,
+                   help="Unrecorded Pep-GaMD boosted-equilibration preparation steps (ntebprep). Lower only for short test runs.")
     p.add_argument("--gamd-multiwindow-recon-prep-steps", type=int, default=2000,
                    help="Unrecorded relaxation steps per window before multi-window GaMD recon starts collecting statistics (applies to both the cMD seed and the boosted passes).")
     p.add_argument("--gamd-multiwindow-recon-cmd-steps", type=int, default=20000,
@@ -1020,7 +1041,20 @@ def _add_swarm_args(p: argparse.ArgumentParser) -> None:
                         "overrides --swarm-replicates-per-cell (the derivation is printed).")
     p.add_argument("--swarm-bins", type=str, default="4,3,3",
                    help="Comma-separated cell counts on heavy-CV1 x Rg x end-to-end distance "
-                        "(quantile edges from the seed library, never a fixed [0,1] grid).")
+                        "(quantile edges from the seed library, never a fixed [0,1] grid). Five entries "
+                        "(e.g. 4,3,3,3,3) add two contact-pattern PCA axes cpc1 x cpc2 (PCA of the seeds' CA "
+                        "residue-pair contact vectors; basis from the library's contact_pca_basis.json -- GENPEPT "
+                        "--contact-pca-strata -- else fitted on the library), frozen in swarm/round_000/.")
+    p.add_argument("--swarm-max-members", type=int, default=0,
+                   help="Cap on the round's members (0 = off: --swarm-replicates-per-cell members in every occupied "
+                        "cell). With a cap, members are dealt round-robin over cells (largest first): every cell its "
+                        "first distinct seed before any cell a second, up to the per-cell quota. Keeps the budget "
+                        "fixed when more axes multiply the cells.")
+    p.add_argument("--swarm-contact-pca-cutoff-a", type=float, default=8.0,
+                   help="CA-CA contact cutoff (A) when the contact-PCA basis is fitted on the seed library "
+                        "(a library basis from GENPEPT carries its own).")
+    p.add_argument("--swarm-contact-pca-min-sep", type=int, default=3,
+                   help="Minimum residue separation |i - j| of the contact-PCA residue pairs (fitted basis only).")
     p.add_argument("--swarm-equil-ps", type=float, default=100.0,
                    help="Discarded-by-construction equilibration per member, in ps.")
     p.add_argument("--swarm-output-interval-ps", type=float, default=2.0,
@@ -1425,6 +1459,80 @@ def _validate_gamd_args(args: argparse.Namespace) -> None:
         )
 
 
+_AUX_PLAIN_WINDOW_MODES = ("adaptive", "manual")
+
+
+def _add_aux_cv_args(p: argparse.ArgumentParser) -> None:
+    p.add_argument("--aux-cv-model", default=None, metavar="PATH",
+                   help="Frozen auxiliary-CV model (atlas-aux-cv-model-v1 JSON). Enables auxiliary-CV "
+                        "states: every row of --windows-2d-csv must state aux_k_kcal_mol (0 = ordinary or "
+                        "sham) and active rows aux_center. Plain runs only. Spec "
+                        "docs/superpowers/specs/2026-10-07-auxiliary-cv-gibbs-production-spec.md.")
+    p.add_argument("--aux-phase-kind", default="pilot",
+                   choices=["production", "pilot", "exploration", "equilibration"],
+                   help="Sampling-policy phase kind frozen into an auxiliary run's window snapshot (spec Section 6). "
+                        "Only 'production' segments can be marked equilibrium-eligible.")
+    p.add_argument("--aux-equilibrium-eligible", action="store_true", default=False,
+                   help="Mark this auxiliary run's segments eligible for equilibrium analysis (needs "
+                        "--aux-phase-kind production and an equilibrated, prespecified retained segment).")
+
+
+def _validate_aux_cv_args(p: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    """Refuse every configuration the Stage B auxiliary-state machinery cannot run exactly."""
+    if not getattr(args, "aux_cv_model", None):
+        # Final fix wave I4e: the aux-only phase flags mean nothing without a model. Explicit use is detected
+        # by value (only an explicit flag or config key can make them non-default), so default-valued keys --
+        # every non-aux job's recorded args -- never error.
+        if getattr(args, "aux_equilibrium_eligible", False):
+            p.error("--aux-equilibrium-eligible needs --aux-cv-model (it marks auxiliary segments only)")
+        if getattr(args, "aux_phase_kind", None) not in (None, "pilot"):     # explicit null = default
+            p.error(f"--aux-phase-kind {args.aux_phase_kind} needs --aux-cv-model (it is frozen into auxiliary "
+                    "window snapshots only)")
+        return
+    if getattr(args, "aux_equilibrium_eligible", False) and str(getattr(args, "aux_phase_kind", "pilot")) != "production":
+        p.error("--aux-equilibrium-eligible needs --aux-phase-kind production (freeze_snapshot rule)")
+    window_mode = str(getattr(args, "window_mode", "adaptive") or "adaptive")
+    if window_mode not in _AUX_PLAIN_WINDOW_MODES:
+        p.error(f"--aux-cv-model is plain-run only (--window-mode {' or '.join(_AUX_PLAIN_WINDOW_MODES)} with "
+                f"--windows-2d-csv); for adaptive-production use --ap-aux-discovery, which fits and injects "
+                f"the model per phase")
+    if str(getattr(args, "swarm_stage", "off") or "off") != "off":
+        p.error("--aux-cv-model cannot run inside the swarm stage (--swarm-stage must be off)")
+    if not getattr(args, "windows_2d_csv", None):
+        p.error("--aux-cv-model needs --windows-2d-csv: auxiliary states are rows of an explicit state table")
+    run_mode = str(getattr(args, "run_mode", "gamd") or "gamd")
+    boost = str(getattr(args, "gamd_boost_type", "") or "")
+    if run_mode in ("gamd", "hmr-gamd") and not boost.startswith("pep-gamd"):
+        p.error(f"--aux-cv-model with --gamd-boost-type {boost!r}: every stock gamd-openmm integrator first "
+                "moves all forces to group 0 (gamd/integrator_factory.py set_all_forces_to_group), which "
+                "destroys the auxiliary restraint's own force group (and, for total/dual boost types, boosts "
+                "it); use a pep-gamd-* boost type or --run-mode cmd")
+    if str(getattr(args, "exchange_mode", "neighbor")) == "neighbor":
+        p.error("--aux-cv-model needs unrestricted exchange candidates (gibbs-walk, all-pair-sweep or "
+                "random-pair): --exchange-mode neighbor builds its graph from CV1/CV2 geometry and cannot "
+                "represent auxiliary states")
+    if bool(getattr(args, "us_auto_drop_bad_windows", False)):
+        p.error("--aux-cv-model refuses --us-auto-drop-bad-windows: the state table is frozen and a population "
+                "change is a new phase (spec Section 6)")
+
+
+def _validate_aux_discovery_args(p: argparse.ArgumentParser, args: argparse.Namespace) -> None:
+    from gareus.adaptive.aux_discovery.settings import aux_feature_space, aux_discovery_incompatibilities
+    try:
+        feature_space = aux_feature_space(args)
+    except ValueError as exc:
+        p.error(str(exc))
+    if not getattr(args, "ap_aux_discovery", False):
+        if feature_space != "backbone":
+            p.error("--ap-aux-feature-space needs --ap-aux-discovery for nondefault feature spaces")
+        return
+    if str(getattr(args, "window_mode", "")) != "adaptive-production":
+        p.error("--ap-aux-discovery needs --window-mode adaptive-production")
+    bad = aux_discovery_incompatibilities(args)
+    if bad:
+        p.error(bad[0])
+
+
 def _validate_fsf_clamp_args(p: argparse.ArgumentParser, args: argparse.Namespace) -> None:
     """--pep-gamd-fsf-floor-*: [0, 1), Pep-GaMD only; one set clamps both (the other at 0.0)."""
     total = getattr(args, "pep_gamd_fsf_floor_total", None)
@@ -1795,9 +1903,9 @@ def _shim_gamd(args: argparse.Namespace) -> None:
     args.sigma0p_kcal_mol = args.sigma0p
     args.sigma0d_kcal_mol = args.sigma0d
     args.gamd_equil_steps = args.equil_steps
-    # Dropped GaMD prep steps
-    args.gamd_cmd_prep_steps = 5000
-    args.gamd_equil_prep_steps = 5000
+    # GaMD prep steps: CLI options (default 5000); a namespace built without the parser keeps 5000.
+    args.gamd_cmd_prep_steps = int(getattr(args, "gamd_cmd_prep_steps", 5000))
+    args.gamd_equil_prep_steps = int(getattr(args, "gamd_equil_prep_steps", 5000))
     # Dropped exchange tuning
     args.exchange_random_pairs = 0
     args.exchange_max_pairs_per_interval = 0
@@ -1886,6 +1994,11 @@ def _shim_adaptive_production(args: argparse.Namespace) -> None:
     args.adaptive_production_refine_protect_epochs = args.ap_refine_protect_epochs
     args.adaptive_production_refine_min_sigma = args.ap_refine_min_sigma
     args.adaptive_production_cv2_respring = args.ap_cv2_respring
+    args.adaptive_production_aux_discovery = bool(getattr(args, "ap_aux_discovery", False))
+    args.adaptive_production_aux_reserve_slots = int(getattr(args, "ap_aux_reserve_slots", 4))
+    args.adaptive_production_aux_validation = str(getattr(args, "ap_aux_validation", "required"))
+    args.adaptive_production_aux_feature_space = args.ap_aux_feature_space
+    args.adaptive_production_aux_settings_override = bool(getattr(args, "ap_aux_settings_override", False))
     args.adaptive_production_cv2_bridge_sets = args.ap_cv2_bridge_sets
     args.adaptive_production_respring_min_neff = args.ap_respring_min_neff
     args.adaptive_production_respring_tolerance = args.ap_respring_tolerance
@@ -2085,6 +2198,7 @@ def build_gareus_parser() -> argparse.ArgumentParser:
     _add_cv_args(p)
     _add_cv_selection_args(p)
     _add_window_args(p)
+    _add_aux_cv_args(p)
     _add_us_args(p)
     _add_seeding_args(p)
     _add_genpept_prescan_args(p)
@@ -2119,6 +2233,7 @@ def parse_args(argv: Optional[Iterable[str]] = None):
     _add_cv_args(p)
     _add_cv_selection_args(p)
     _add_window_args(p)
+    _add_aux_cv_args(p)
     _add_us_args(p)
     _add_seeding_args(p)
     _add_genpept_prescan_args(p)
@@ -2143,6 +2258,8 @@ def parse_args(argv: Optional[Iterable[str]] = None):
 
     # Apply compat shims before validation (validators use legacy attr names)
     _apply_v2_compat_shims(args)
+    _validate_aux_cv_args(p, args)
+    _validate_aux_discovery_args(p, args)
 
     args.contact_scheme = contact_scheme(args)
     _validate_contact_args(args)
@@ -2164,6 +2281,15 @@ def parse_args(argv: Optional[Iterable[str]] = None):
         p.error(f"--swarm-seed-frame-interval-ps {_frame_ps:g} must be a whole multiple of "
                 f"--swarm-output-interval-ps {_out_ps:g} (frames are written every N trace rows; "
                 f"{_ratio:g} would round to {max(1, round(_ratio)) * _out_ps:g} ps)")
+    try:
+        _nb = [int(x) for x in str(getattr(args, "swarm_bins", "4,3,3") or "4,3,3").split(",")]
+    except ValueError:
+        _nb = []
+    if len(_nb) not in (3, 5) or any(x < 1 for x in _nb):
+        p.error(f"--swarm-bins needs 3 (cv1,rg,e2e) or 5 (+ contact-PCA cpc1,cpc2) positive ints, "
+                f"got {getattr(args, 'swarm_bins', None)!r}")
+    if int(getattr(args, "swarm_max_members", 0) or 0) < 0:
+        p.error("--swarm-max-members must be >= 0 (0 = no cap)")
     _lam_max = float(getattr(args, "swarm_lambda_max", 1.0))
     if not (math.isfinite(_lam_max) and 0.0 < _lam_max <= 1.0):
         p.error(f"--swarm-lambda-max must be in (0, 1], got {_lam_max:g}")
@@ -2505,6 +2631,13 @@ def main(argv: Optional[Iterable[str]] = None):
                 print(f"WARNING [scratchdir hydrate]: {_main_dir} → {out_dir} failed: {exc}")
     else:
         out_dir.mkdir(parents=True, exist_ok=True)
+    if bool(getattr(args, "resume", False) or getattr(args, "extend", False) or getattr(args, "ap_resume", False)):
+        # Stage C (B1, c10 safety): the auxiliary-capability mismatch check runs BEFORE anything is written
+        # (reproducibility files, run_args, initialize_run_manifest), so a refused resume never stamps
+        # auxiliary keys into a legacy campaign's run_manifest.json. After scratch hydration on purpose.
+        from .production import refuse_resume_of_aux_campaign
+        for _resume_candidate in (out_dir, out_dir / "final_production"):
+            refuse_resume_of_aux_campaign(_resume_candidate, args)
     configure_color(args.color, tui_mode=getattr(args, "tui_mode", None))
     if bool(getattr(args, "self_test_primary_cv_force", False)):
         if primary_cv_is_contacts(args):

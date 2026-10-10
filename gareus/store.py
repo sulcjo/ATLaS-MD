@@ -33,7 +33,7 @@ class ParquetSampleWriter:
     so partial flushes on crash leave no corrupt files.
     """
 
-    def __init__(self, out_dir: Path, flush_rows: int = 5000) -> None:
+    def __init__(self, out_dir: Path, flush_rows: int = 5000, aux_schema=None, aux_runtime=None) -> None:
         self._out_dir = Path(out_dir)
         self._out_dir.mkdir(parents=True, exist_ok=True)
         self._flush_rows = max(1, flush_rows)
@@ -42,6 +42,18 @@ class ParquetSampleWriter:
         if self._manifest is None and list(self._out_dir.glob("*.parquet")):
             raise ParquetManifestError(f"cannot append to legacy Parquet segment without manifest: {self._out_dir}")
         self._chunk_idx = (self._manifest["next_chunk_index"] - 1) if self._manifest else 0
+        self._aux_schema = aux_schema
+        self._aux_payload = None
+        if aux_schema is not None:
+            if aux_runtime is None:
+                raise ValueError("an aux sample writer needs aux_runtime={'platform', 'precision'}")
+            from .auxiliary_cv.sample_schema import payload_with_runtime
+            self._aux_payload = payload_with_runtime(aux_schema, aux_runtime)
+        recorded = (self._manifest or {}).get("payload_schema")
+        populated = bool(self._manifest and self._manifest["files"])
+        if populated and recorded != self._aux_payload:
+            raise ParquetManifestError(
+                f"payload schema of {self._out_dir} is {recorded!r}; this writer would write {self._aux_payload!r}")
 
     def write_sample(
         self,
@@ -57,7 +69,20 @@ class ParquetSampleWriter:
         v_pep: float = float("nan"),
         v_dih: float = float("nan"),
         gamd_lambda: float = 0.0,
+        aux_z=None,
+        torsions=None,
     ) -> None:
+        if self._aux_schema is None:
+            if aux_z is not None or torsions is not None:
+                raise ValueError("aux_z/torsions given to a writer without an aux sample schema")
+        else:
+            nz, nt = len(self._aux_schema.z_columns), len(self._aux_schema.torsion_columns)
+            if aux_z is None or torsions is None or len(aux_z) != nz or len(torsions) != nt:
+                raise ValueError(f"aux writer needs aux_z ({nz}) and torsions ({nt}) on every sample")
+            # Converted before any column is appended (as write_event does): a bad value never leaves a
+            # ragged buffer behind.
+            torsions = [float(v) for v in torsions]
+            aux_z = [float(v) for v in aux_z]
         b = self._buf
         b["step"].append(step)
         b["replica"].append(replica)
@@ -71,6 +96,12 @@ class ParquetSampleWriter:
         b["v_pep_kj_mol"].append(v_pep)
         b["v_dih_kj_mol"].append(v_dih)
         b["gamd_lambda"].append(gamd_lambda)
+        if self._aux_schema is not None:
+            b["observation_phase"].append("pre_exchange")
+            for name, value in zip(self._aux_schema.torsion_columns, torsions):
+                b[name].append(value)
+            for name, value in zip(self._aux_schema.z_columns, aux_z):
+                b[name].append(value)
         if len(b["step"]) >= self._flush_rows:
             self.flush()
 
@@ -95,6 +126,13 @@ class ParquetSampleWriter:
             "v_dih_kj_mol":        pa.array(b["v_dih_kj_mol"],        type=pa.float32()),
             "gamd_lambda":         pa.array(b["gamd_lambda"],         type=pa.float32()),
         })
+        if self._aux_schema is not None:
+            extra = {"observation_phase": pa.array(b["observation_phase"], type=pa.string())}
+            for name in self._aux_schema.torsion_columns + self._aux_schema.z_columns:
+                extra[name] = pa.array(b[name], type=pa.float64())
+            for name, column in extra.items():
+                tbl = tbl.append_column(name, column)
+            tbl = tbl.replace_schema_metadata({b"atlas_aux_samples": json.dumps(self._aux_payload, sort_keys=True).encode()})
 
         self._chunk_idx += 1
         chunk_path = self._out_dir / f"chunk_{self._chunk_idx:06d}.parquet"
@@ -121,6 +159,7 @@ class ParquetSampleWriter:
             kind="samples",
             record=record,
             next_chunk_index=self._chunk_idx + 1,
+            payload_schema=self._aux_payload,
         )
 
         for lst in b.values():
@@ -141,6 +180,8 @@ class ParquetSampleWriter:
         import pyarrow.parquet as pq
         tbl = ds.dataset(chunks, format="parquet").to_table()
         tbl = tbl.sort_by([("step", "ascending"), ("replica", "ascending")])
+        if self._aux_payload is not None:
+            tbl = tbl.replace_schema_metadata({b"atlas_aux_samples": json.dumps(self._aux_payload, sort_keys=True).encode()})
         has_compact = any(str(r["path"]).startswith("data") for r in source_records)
         name = f"data_{manifest['generation'] + 1:06d}.parquet" if has_compact else "data.parquet"
         output = self._out_dir / name
@@ -152,7 +193,8 @@ class ParquetSampleWriter:
         _fsync_dir(self._out_dir)
         record = file_record(output, rows=tbl.num_rows, first_step=int(tbl["step"][0].as_py()), last_step=int(tbl["step"][-1].as_py()))
         self._manifest = replace_files_in_manifest(
-            self._out_dir, kind="samples", records=[record], next_chunk_index=self._chunk_idx + 1
+            self._out_dir, kind="samples", records=[record], next_chunk_index=self._chunk_idx + 1,
+            payload_schema=self._aux_payload,
         )
         for source in chunks:
             source.unlink(missing_ok=True)
@@ -162,7 +204,7 @@ class ParquetSampleWriter:
 class ParquetExchangeWriter:
     """Buffers exchange events and flushes to Parquet chunks."""
 
-    def __init__(self, out_dir: Path, flush_rows: int = 1000) -> None:
+    def __init__(self, out_dir: Path, flush_rows: int = 1000, event_schema: Optional[str] = None) -> None:
         self._out_dir = Path(out_dir)
         self._out_dir.mkdir(parents=True, exist_ok=True)
         self._flush_rows = max(1, flush_rows)
@@ -171,6 +213,45 @@ class ParquetExchangeWriter:
         if self._manifest is None and list(self._out_dir.glob("*.parquet")):
             raise ParquetManifestError(f"cannot append to legacy Parquet segment without manifest: {self._out_dir}")
         self._chunk_idx = (self._manifest["next_chunk_index"] - 1) if self._manifest else 0
+        self._event_schema = event_schema
+        self._payload = {"schema": event_schema} if event_schema is not None else None
+        recorded = (self._manifest or {}).get("payload_schema")
+        if self._manifest and self._manifest["files"] and recorded != self._payload:
+            raise ParquetManifestError(
+                f"payload schema of {self._out_dir} is {recorded!r}; this writer would write {self._payload!r}")
+
+    def write_event(self, *, step, attempt_seq, selected_replica, replica_i, replica_j, window_i, window_j,
+                    kind, delta_e_kj, accepted, log_q_forward, log_q_reverse, p_accept, energy_version,
+                    assignments_after, log_p_accept=float("nan"), proposal_algorithm=None) -> None:
+        from .auxiliary_cv.ledger import EVENT_KINDS, assignment_sha256
+        if self._event_schema is None:
+            raise ValueError("write_event needs a writer constructed with event_schema")
+        if kind not in EVENT_KINDS:
+            raise ValueError(f"exchange event kind must be one of {EVENT_KINDS}, got {kind!r}")
+        if int(attempt_seq) < 0:
+            raise ValueError("attempt_seq must be >= 0")
+        if kind != "swap" and bool(accepted):
+            raise ValueError("only a swap event can be accepted")
+        if not isinstance(energy_version, str) or not energy_version:
+            raise ValueError("exchange event needs its energy/schema version")
+        # Convert every value before touching a buffer: a bad row must not leave ragged columns.
+        delta = float(delta_e_kj)
+        row = {
+            "step": int(step), "replica_i": int(replica_i), "replica_j": int(replica_j),
+            "window_i": int(window_i), "window_j": int(window_j), "delta_e": delta,
+            "accepted": bool(accepted), "attempt_seq": int(attempt_seq),
+            "selected_replica": int(selected_replica), "kind": kind, "delta_e_kj": delta,
+            "log_q_forward": float(log_q_forward), "log_q_reverse": float(log_q_reverse),
+            "p_accept": float(p_accept), "log_p_accept": float(log_p_accept),
+            "proposal_algorithm": None if proposal_algorithm is None else str(proposal_algorithm),
+            "energy_version": energy_version,
+            "assignment_sha256_after": assignment_sha256(assignments_after),
+        }
+        b = self._buf
+        for name, value in row.items():
+            b[name].append(value)
+        if len(b["step"]) >= self._flush_rows:
+            self.flush()
 
     def write_exchange(
         self,
@@ -182,6 +263,8 @@ class ParquetExchangeWriter:
         delta_e: float,
         accepted: bool,
     ) -> None:
+        if self._event_schema is not None:
+            raise ValueError("event-mode writer requires write_event (ordered ledger), not write_exchange")
         b = self._buf
         b["step"].append(step)
         b["replica_i"].append(replica_i)
@@ -209,6 +292,22 @@ class ParquetExchangeWriter:
             "delta_e":   pa.array(b["delta_e"],   type=pa.float32()),
             "accepted":  pa.array(b["accepted"],  type=pa.bool_()),
         })
+        if self._event_schema is not None:
+            extra = {
+                "attempt_seq": pa.array(b["attempt_seq"], type=pa.uint32()),
+                "selected_replica": pa.array(b["selected_replica"], type=pa.int32()),
+                "kind": pa.array(b["kind"], type=pa.string()),
+                "delta_e_kj": pa.array(b["delta_e_kj"], type=pa.float64()),
+                "log_q_forward": pa.array(b["log_q_forward"], type=pa.float64()),
+                "log_q_reverse": pa.array(b["log_q_reverse"], type=pa.float64()),
+                "p_accept": pa.array(b["p_accept"], type=pa.float64()),
+                "log_p_accept": pa.array(b["log_p_accept"], type=pa.float64()),
+                "proposal_algorithm": pa.array(b["proposal_algorithm"], type=pa.string()),
+                "energy_version": pa.array(b["energy_version"], type=pa.string()),
+                "assignment_sha256_after": pa.array(b["assignment_sha256_after"], type=pa.string()),
+            }
+            for name, column in extra.items():
+                tbl = tbl.append_column(name, column)
 
         self._chunk_idx += 1
         chunk_path = self._out_dir / f"chunk_{self._chunk_idx:06d}.parquet"
@@ -235,6 +334,7 @@ class ParquetExchangeWriter:
             kind="exchanges",
             record=record,
             next_chunk_index=self._chunk_idx + 1,
+            payload_schema=self._payload,
         )
 
         for lst in b.values():
@@ -254,7 +354,10 @@ class ParquetExchangeWriter:
         import pyarrow.dataset as ds
         import pyarrow.parquet as pq
         tbl = ds.dataset(chunks, format="parquet").to_table()
-        tbl = tbl.sort_by([("step", "ascending")])
+        keys = [("step", "ascending")]
+        if self._event_schema is not None:
+            keys.append(("attempt_seq", "ascending"))
+        tbl = tbl.sort_by(keys)
         has_compact = any(str(r["path"]).startswith("data") for r in source_records)
         name = f"data_{manifest['generation'] + 1:06d}.parquet" if has_compact else "data.parquet"
         output = self._out_dir / name
@@ -266,7 +369,8 @@ class ParquetExchangeWriter:
         _fsync_dir(self._out_dir)
         record = file_record(output, rows=tbl.num_rows, first_step=int(tbl["step"][0].as_py()), last_step=int(tbl["step"][-1].as_py()))
         self._manifest = replace_files_in_manifest(
-            self._out_dir, kind="exchanges", records=[record], next_chunk_index=self._chunk_idx + 1
+            self._out_dir, kind="exchanges", records=[record], next_chunk_index=self._chunk_idx + 1,
+            payload_schema=self._payload,
         )
         for source in chunks:
             source.unlink(missing_ok=True)
@@ -346,6 +450,17 @@ class SegmentRegistry:
                 break
         self._save()
 
+    def discard_latest_segment(self, segment_id: str) -> bool:
+        """Remove the LATEST segment's registry entry (auxiliary refused-resume rollback only).
+
+        Callers guarantee the segment holds no rows; anything but the newest entry is never removed.
+        """
+        if not self._segments or self._segments[-1]["segment_id"] != segment_id:
+            return False
+        self._segments.pop()
+        self._save()
+        return True
+
     def get_segment(self, segment_id: str) -> Optional[Dict[str, Any]]:
         for seg in self._segments:
             if seg["segment_id"] == segment_id:
@@ -397,6 +512,61 @@ def finalize_segment(
         registry.seal_segment(seg_id, absolute_end_step=end_step, status="interrupted")
 
 
+def reseal_parent_for_resume(registry: "SegmentRegistry", parent_segment_id: Optional[str],
+                             checkpoint_absolute_step: int) -> Optional[Dict[str, Any]]:
+    """On resume of an AUXILIARY run, cut a non-complete parent segment back to its checkpoint.
+
+    ``finalize_segment`` seals an exception exit at the crash step, and a killed job leaves the
+    parent ``running``. Either way, rows after the checkpoint come from a state that was rolled
+    back; the resumed segment re-runs those steps. Without this cut they would be pooled twice and
+    the event ledger would hold duplicate (step, attempt_seq). Legacy runs keep their own seal
+    (production resume branch, ruling B4).
+    """
+    seg = registry.get_segment(parent_segment_id) if parent_segment_id is not None else None
+    if seg is None or seg.get("status") not in ("running", "interrupted"):
+        return None
+    previous_end = seg.get("end_step")
+    cut = int(checkpoint_absolute_step) if previous_end is None else min(int(previous_end), int(checkpoint_absolute_step))
+    previous_status = seg.get("status")
+    registry.seal_segment(parent_segment_id, absolute_end_step=cut, status="interrupted")
+    return {"segment_id": parent_segment_id, "previous_status": previous_status,
+            "previous_end_step": previous_end, "end_step": cut}
+
+
+def reseal_chain_for_resume(registry: "SegmentRegistry", checkpoint_segment_id: str,
+                            checkpoint_absolute_step: int, *, exclude: Optional[str] = None) -> List[Dict[str, Any]]:
+    """On resume of an AUXILIARY run, walk back from the newest segment to the checkpoint's own segment.
+
+    Every non-complete segment after the checkpoint's segment holds only rows past the checkpoint (an
+    empty orphan left by a refused resume, or a child that died before its first checkpoint): it is sealed
+    ``abandoned``. The checkpoint's segment is then cut back to the checkpoint step
+    (:func:`reseal_parent_for_resume`). A ``complete`` segment after the checkpoint's segment cannot follow
+    from this checkpoint: refused. ``exclude`` is the resuming segment itself (already registered), never
+    touched. Returns one record per segment changed (Task 14 F4).
+    """
+    segs = [s for s in registry.all_segments() if s["segment_id"] != exclude]
+    ids = [s["segment_id"] for s in segs]
+    if checkpoint_segment_id not in ids:
+        raise RuntimeError(f"resume refused: the checkpoint's segment {checkpoint_segment_id!r} is not in the "
+                           f"segment registry {ids}")
+    later = segs[ids.index(checkpoint_segment_id) + 1:]
+    for seg in later:                                  # validate the whole chain before changing anything
+        if seg.get("status") == "complete":
+            raise RuntimeError(f"resume refused: segment {seg['segment_id']} is complete but comes after the "
+                               f"checkpoint's segment {checkpoint_segment_id}; this checkpoint is not the newest")
+    records: List[Dict[str, Any]] = []
+    for seg in later:
+        if seg.get("status") == "abandoned":
+            continue
+        records.append({"segment_id": seg["segment_id"], "previous_status": seg.get("status"),
+                        "previous_end_step": seg.get("end_step"), "end_step": -1, "status": "abandoned"})
+        registry.seal_segment(seg["segment_id"], absolute_end_step=-1, status="abandoned")
+    rec = reseal_parent_for_resume(registry, checkpoint_segment_id, int(checkpoint_absolute_step))
+    if rec is not None:
+        records.insert(0, dict(rec, status="interrupted"))
+    return records
+
+
 class WindowSnapshot:
     """Writes a per-segment window definition snapshot.
 
@@ -415,7 +585,30 @@ class WindowSnapshot:
         cv1_type: str,
         cv2_type: Optional[str],
         kernel_identity: Optional[Dict[str, Any]] = None,
+        state_definition: Optional[Dict[str, Any]] = None,
+        phase_kind: str = "production",
+        equilibrium_analysis_eligible: Optional[bool] = None,
     ) -> None:
+        if state_definition is not None:
+            # Auxiliary-capable segment: an immutable frozen v2 snapshot whose CV kinds
+            # must match the definition (keeps the residual-CV2 kernel gate honest, C19).
+            from .correctness.state_identity import freeze_snapshot, write_frozen_snapshot
+            cv1_def = state_definition.get("cv1") or {}
+            cv2_def = state_definition.get("cv2")
+            if (cv1_def.get("kind") if cv1_def else None) != cv1_type:
+                raise ValueError(f"cv1_type {cv1_type!r} != state definition cv1 kind {cv1_def.get('kind')!r}")
+            if (cv2_def["kind"] if cv2_def else None) != cv2_type:
+                raise ValueError(f"cv2_type {cv2_type!r} != state definition cv2 kind "
+                                 f"{cv2_def['kind'] if cv2_def else None!r}")
+            if equilibrium_analysis_eligible is None:
+                raise ValueError("an auxiliary-capable snapshot must state its equilibrium eligibility explicitly")
+            frozen = freeze_snapshot(segment_id, state_definition,
+                                     equilibrium_analysis_eligible=bool(equilibrium_analysis_eligible),
+                                     phase_kind=phase_kind)
+            if kernel_identity is not None:
+                frozen["kernel_identity"] = dict(kernel_identity)
+            write_frozen_snapshot(self._win_dir / f"{segment_id}.json", frozen)
+            return
         payload = {
             "segment_id": segment_id,
             "cv1_type": cv1_type,

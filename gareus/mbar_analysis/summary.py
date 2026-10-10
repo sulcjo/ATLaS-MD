@@ -122,6 +122,18 @@ def summary_md(path,s):
                 f"| {r['lambda']:.3f} | {int(r['n'])} | {r['mean_dv_kcal']:.3f} | "
                 f"{r['sd_dv_kcal']:.3f} | {r['mean_dv_kt']:.3f} | {r['anharm_nats']:.3f} | {r['skew']:.3f} |"
             )
+    aux = s.get('auxiliary_cv_pmf')
+    if aux is not None:
+        lines += ['', '## CVaux PMF', '']
+        if aux.get('available'):
+            lines += [f"Coordinate: **{aux.get('coordinate')} ({aux.get('units')})**",
+                      f"Selected method: **{aux.get('selected_unbiased_method')}**",
+                      f"Finite samples: **{aux.get('n_samples')}**",
+                      f"PMF span: **{aux['pmf_span_kcal_mol']:.3f} kcal/mol**"]
+            if aux.get('files', {}).get('cvaux_pmf_png'):
+                lines += ['', '![CVaux PMF](cvaux_pmf_unbiased.png)', '']
+        else:
+            lines.append(f"CVaux PMF unavailable: {aux.get('reason', 'not computed')}")
     rg=s.get('rg',{}) or {}
     lines += ['', '## Radius of gyration diagnostics', '']
     if rg.get('available'):

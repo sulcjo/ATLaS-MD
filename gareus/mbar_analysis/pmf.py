@@ -970,6 +970,16 @@ OVERLAP_CV2_WARN_RETAINED_FRACTION = 0.95
 OVERLAP_SPACE_MARGINAL = 'cv1_marginal'
 OVERLAP_SPACE_JOINT = 'cv1_cv2_joint'
 
+# CVaux Stage C final fix wave I2 (spec Section 15): diagnostics not yet audited for auxiliary states report
+# this, never a pass. Keyed strictly on meta['aux_models'] (set by load_parquet's auxiliary branch and by the
+# adaptive union-Parquet loader when it pools admitted aux workers).
+AUX_DIAGNOSTICS_UNAVAILABLE = 'unavailable: aux states (Stage D audit)'
+
+
+def aux_diagnostics_unavailable(meta) -> Optional[str]:
+    """The unavailable reason for an auxiliary-state analysis, else None (every legacy analysis)."""
+    return AUX_DIAGNOSTICS_UNAVAILABLE if isinstance(meta, dict) and meta.get('aux_models') else None
+
 
 def _secondary_window_params(meta: dict, K: int) -> tuple:
     """``(secondary_center, secondary_k)``, length K, from the loader's own
@@ -1768,7 +1778,13 @@ def run_pmf_and_gamd_boost_report(d: 'Data', args, logw: np.ndarray, bins: np.nd
                                          kbt_kcal, n_k=n_k_local)
     _cv_neigh_by_window = {int(r['window']): r for r in cv_neigh}
     _cv_bad_pairs = _weak_pairs(cv_neigh, _marg_thr)
-    if _cv_bad_pairs:
+    # Final fix wave I2: restraint-centre space cannot see an auxiliary axis (states differing only in A_s
+    # sit at one CV point), so on auxiliary data these overlap/connectivity grades are unavailable.
+    _aux_na = aux_diagnostics_unavailable(d.meta)
+    if _aux_na is not None:
+        warnings.append(f'{warning_prefix}CV-space nearest-neighbour overlap, joint (CV1, CV2) overlap and '
+                        f'overlap connectivity: {_aux_na}; their numbers are recorded but not graded.')
+    if _cv_bad_pairs and _aux_na is None:
         warnings.append(
             f'{warning_prefix}Weak CV-space nearest-neighbour overlap below '
             f'%.2f (CV1 marginal) for pairs: ' % _marg_thr
@@ -1787,7 +1803,7 @@ def run_pmf_and_gamd_boost_report(d: 'Data', args, logw: np.ndarray, bins: np.nd
         cv_neigh_joint = cv_space_neighbor_overlap(O_joint, d.centers, d.k_kcal, _sec_centers,
                                                   _sec_ks, kbt_kcal, n_k=n_k_local)
         _joint_bad_pairs = _weak_pairs(cv_neigh_joint, _joint_thr)
-        if _joint_bad_pairs:
+        if _joint_bad_pairs and _aux_na is None:
             warnings.append(
                 f'{warning_prefix}Weak joint (CV1, CV2) nearest-neighbour overlap below '
                 f'%.3f for pairs: ' % _joint_thr
@@ -1842,10 +1858,11 @@ def run_pmf_and_gamd_boost_report(d: 'Data', args, logw: np.ndarray, bins: np.nd
                        'components': [], 'component_samples': [],
                        'excluded_unsampled_states': []}
     connectivity = {'marginal': _conn_marginal, 'joint': _conn_joint}
-    warnings.extend(overlap_connectivity_warning_lines(
-        _conn_marginal, 'CV1-marginal', warning_prefix))
-    warnings.extend(overlap_connectivity_warning_lines(
-        _conn_joint, 'joint (CV1, CV2)', warning_prefix))
+    if _aux_na is None:
+        warnings.extend(overlap_connectivity_warning_lines(
+            _conn_marginal, 'CV1-marginal', warning_prefix))
+        warnings.extend(overlap_connectivity_warning_lines(
+            _conn_joint, 'joint (CV1, CV2)', warning_prefix))
     sel = pmfs[selected]
     finite = sel['pmf'][np.isfinite(sel['pmf'])]
     span = float(np.max(finite) - np.min(finite)) if finite.size else float('nan')
@@ -2200,6 +2217,74 @@ def run_secondary_cv_analyses(d: 'Data', args, base_logw: np.ndarray, selected: 
     if isinstance(dominant_fes_info, dict):
         dominant_fes_info['regime_breakdown'] = breakdown
     return dominant_pmf_info, dominant_fes_info
+
+
+def analyze_auxiliary_cv_pmf(d, args, base_logw, selected, boost_ok, kbt_kcal, out, warnings):
+    if not (d.meta.get('aux_models') or d.meta.get('aux_states')):
+        return {'available': False, 'reason': 'No auxiliary CV model'}
+    z = getattr(d, 'aux_z', None)
+    if z is None:
+        z = d.meta.get('aux_z')
+    if z is None:
+        return {'available': False, 'reason': 'Auxiliary CV samples unavailable'}
+    z = np.asarray(z, dtype=np.float64)
+    if z.ndim == 2 and z.shape[1] == 1:
+        z = z[:, 0]
+    logw = np.asarray(base_logw, dtype=np.float64)
+    boost = np.asarray(d.boost_kj, dtype=np.float64)
+    if z.shape != (len(d.cv),) or logw.shape != z.shape or boost.shape != z.shape:
+        raise ValueError('Auxiliary CV samples and MBAR weights must be aligned scalar arrays')
+    chosen = selected
+    if d.meta.get('gamd_ladder') or not boost_ok:
+        chosen = 'umbrella_only'
+    mask = np.isfinite(z) & np.isfinite(logw)
+    if chosen != 'umbrella_only':
+        mask &= np.isfinite(boost)
+    n = int(np.count_nonzero(mask))
+    if n < max(20, d.u_nk.shape[1]):
+        return {'available': False, 'reason': 'Too few finite auxiliary CV samples', 'n_samples': n}
+    _agm = _bridge()
+    bins = make_bins(z[mask], int(args.bins), None, None)
+    result, _, chosen = _agm._observable_pmf_from_logw(
+        z[mask], logw[mask], boost[mask], bins, chosen, d.beta, kbt_kcal,
+        smooth_logfac_sigma=_agm._eff_smooth(args, 'gamd_smooth_sigma'))
+    out = Path(out)
+    out.mkdir(parents=True, exist_ok=True)
+    csv_path = out / 'cvaux_pmf_unbiased.csv'
+    _agm._write_csv_rows(csv_path, [
+        {'method': chosen, 'bin': i, 'cvaux_z': float(x),
+         'probability': float(result['prob'][i]),
+         'pmf_kcal_mol': float(result['pmf'][i]) if np.isfinite(result['pmf'][i]) else '',
+         'counts': int(result['counts'][i])}
+        for i, x in enumerate(result['cv_A'])])
+    files = {'cvaux_pmf_unbiased_csv': str(csv_path),
+             'cvaux_pmf_summary_json': str(out / 'cvaux_pmf_summary.json')}
+    try:
+        import matplotlib.pyplot as plt
+        from gareus.mbar_analysis import plotstyle as ps
+        fig, ax = plt.subplots(figsize=(8, 5))
+        try:
+            finite = np.isfinite(result['pmf'])
+            ax.plot(result['cv_A'][finite], result['pmf'][finite])
+            ps.style_line_axes(ax, xlabel='CVaux z3 (dimensionless)',
+                               ylabel='PMF (kcal/mol, shifted)',
+                               title=f'CVaux PMF ({ps.pretty_method(chosen)})')
+            fig.tight_layout()
+            fig.savefig(out / 'cvaux_pmf_unbiased.png', dpi=200)
+            files['cvaux_pmf_png'] = str(out / 'cvaux_pmf_unbiased.png')
+        finally:
+            plt.close(fig)
+    except Exception as exc:
+        warnings.append(f'Auxiliary CV PMF plot failed: {exc}')
+    finite = np.isfinite(result['pmf'])
+    info = {'available': True, 'coordinate': 'z3', 'units': 'dimensionless',
+            'model_sha256': d.meta.get('aux_model_sha256'),
+            'selected_unbiased_method': chosen, 'n_samples': n,
+            'bins': int(len(bins) - 1),
+            'pmf_span_kcal_mol': float(np.ptp(result['pmf'][finite])),
+            'files': files}
+    _agm.wjson(out / 'cvaux_pmf_summary.json', info)
+    return info
 
 
 def analyze_secondary_cv_pmf(d: Data, args, base_logw: np.ndarray, selected: str, boost_ok: bool, kbt_kcal: float, out: Path, warnings: list[str], progress: Optional['Progress']) -> dict:

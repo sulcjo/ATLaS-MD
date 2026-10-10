@@ -1,0 +1,255 @@
+import numpy as np
+import pytest
+
+from gareus.auxiliary_cv.ledger import EXCHANGE_EVENT_SCHEMA, assignment_sha256, replay_assignments
+from gareus.correctness._io import IntegrityError
+
+
+def _writer(run_dir, seg_id):
+    from gareus.store import ParquetExchangeWriter
+    return ParquetExchangeWriter(run_dir / "exchanges" / seg_id, flush_rows=1, event_schema=EXCHANGE_EVENT_SCHEMA)
+
+
+def _swap(w, step, seq, ri, rj, wi, wj, after, accepted=True):
+    w.write_event(step=step, attempt_seq=seq, selected_replica=ri, replica_i=ri, replica_j=rj, window_i=wi,
+                  window_j=wj, kind="swap", delta_e_kj=0.0, accepted=accepted, log_q_forward=0.0,
+                  log_q_reverse=0.0, p_accept=1.0, energy_version="v3", assignments_after=after)
+
+
+def _quiet(w, step, seq, r, win, after, kind="stay"):
+    w.write_event(step=step, attempt_seq=seq, selected_replica=r, replica_i=r, replica_j=r, window_i=win,
+                  window_j=win, kind=kind, delta_e_kj=0.0, accepted=False, log_q_forward=0.0,
+                  log_q_reverse=float("nan"), p_accept=float("nan"), energy_version="v3", assignments_after=after)
+
+
+def _crashed_parent(tmp_path):
+    """Checkpoint at 200 ([1,2,0]); an accepted swap at 300; then an EXCEPTION exit (finalize_segment)."""
+    from gareus.store import SegmentRegistry, finalize_segment
+    reg = SegmentRegistry(tmp_path)
+    seg = reg.open_segment("run", None, 1)
+    w = _writer(tmp_path, seg)
+    _swap(w, 100, 0, 0, 1, 0, 1, [1, 0, 2])
+    _swap(w, 100, 1, 1, 2, 0, 2, [1, 2, 0])        # second accepted swap at the SAME step
+    _quiet(w, 200, 0, 0, 1, [1, 2, 0])
+    _quiet(w, 200, 1, 2, 0, [1, 2, 0], kind="skip")
+    _swap(w, 200, 2, 0, 2, 1, 0, [1, 2, 0], accepted=False)
+    _swap(w, 300, 0, 0, 1, 1, 2, [2, 1, 0])        # after the checkpoint: phantom once resumed
+    w.flush()
+    finalize_segment(reg, seg, completed_cleanly=False, writers_ok=True, end_step=300)
+    return reg, seg
+
+
+def test_exception_exit_seals_at_crash_step_then_resume_reseals_at_checkpoint(tmp_path):
+    from gareus.query import load_exchanges
+    from gareus.store import reseal_parent_for_resume
+    reg, seg = _crashed_parent(tmp_path)
+    assert reg.get_segment(seg)["end_step"] == 300 and int(np.max(load_exchanges(tmp_path)["step"])) == 300
+    rec = reseal_parent_for_resume(reg, seg, 200)
+    assert rec == {"segment_id": seg, "previous_status": "interrupted", "previous_end_step": 300, "end_step": 200}
+    ev = load_exchanges(tmp_path)
+    assert int(np.max(ev["step"])) == 200
+    assert replay_assignments(ev, [0, 1, 2], after_step=0, up_to_step=10**9) == [1, 2, 0]
+
+
+def test_reseal_running_parent_and_leave_complete_alone(tmp_path):
+    from gareus.store import SegmentRegistry, reseal_parent_for_resume
+    reg = SegmentRegistry(tmp_path)
+    a = reg.open_segment("run", None, 1)
+    assert reseal_parent_for_resume(reg, a, 500)["end_step"] == 500        # running, end None
+    b = reg.open_segment("run", a, 1)
+    reg.close_segment(b, 900)
+    assert reseal_parent_for_resume(reg, b, 400) is None and reg.get_segment(b)["status"] == "complete"
+    assert reseal_parent_for_resume(reg, "nope", 1) is None
+
+
+def test_crash_during_flush_leaves_orphan_tmp_ignored(tmp_path):
+    from gareus.query import load_exchanges
+    from gareus.store import reseal_parent_for_resume
+    reg, seg = _crashed_parent(tmp_path)
+    reseal_parent_for_resume(reg, seg, 200)
+    (tmp_path / "exchanges" / seg / "chunk_000099.parquet.tmp.4242").write_bytes(b"partial")
+    assert replay_assignments(load_exchanges(tmp_path), [0, 1, 2], after_step=0, up_to_step=200) == [1, 2, 0]
+
+
+def test_checksum_mismatch_raises(tmp_path):
+    from gareus.query import load_exchanges
+    _crashed_parent(tmp_path)
+    ev = load_exchanges(tmp_path)
+    ev["assignment_sha256_after"] = np.asarray(ev["assignment_sha256_after"], dtype=object).copy()
+    ev["assignment_sha256_after"][1] = assignment_sha256([9, 9, 9])
+    with pytest.raises(IntegrityError, match="step 100 seq 1"):
+        replay_assignments(ev, [0, 1, 2], after_step=0, up_to_step=200)
+
+
+def test_window_mismatch_raises(tmp_path):
+    from gareus.query import load_exchanges
+    _crashed_parent(tmp_path)
+    with pytest.raises(IntegrityError, match="window"):
+        replay_assignments(load_exchanges(tmp_path), [2, 1, 0], after_step=0, up_to_step=200)
+
+
+def test_duplicate_step_seq_raises(tmp_path):
+    from gareus.query import load_exchanges
+    _crashed_parent(tmp_path)
+    ev = load_exchanges(tmp_path)
+    ev = {k: np.concatenate([np.asarray(v), np.asarray(v)[:1]]) for k, v in ev.items()}
+    with pytest.raises(IntegrityError, match="duplicate"):
+        replay_assignments(ev, [0, 1, 2], after_step=0, up_to_step=200)
+
+
+def test_legacy_rows_mixed_into_event_ledger_raise(tmp_path):
+    from gareus.query import load_exchanges
+    from gareus.store import ParquetExchangeWriter, SegmentRegistry
+    reg = SegmentRegistry(tmp_path)
+    s0 = reg.open_segment("run", None, 1)
+    w0 = ParquetExchangeWriter(tmp_path / "exchanges" / s0)
+    w0.write_exchange(step=50, replica_i=0, replica_j=1, window_i=0, window_j=1, delta_e=0.5, accepted=True)
+    w0.close(); reg.close_segment(s0, 50)
+    s1 = reg.open_segment("run", s0, 1)
+    w1 = _writer(tmp_path, s1)
+    _swap(w1, 100, 0, 0, 1, 1, 0, [0, 1, 2])
+    w1.close(); reg.close_segment(s1, 100)
+    with pytest.raises(IntegrityError, match="legacy exchange rows mixed"):
+        replay_assignments(load_exchanges(tmp_path), [1, 0, 2], after_step=0, up_to_step=100)
+
+
+def test_float_nan_event_columns_raise_before_any_int_cast(tmp_path):
+    from gareus.query import load_exchanges
+    reg_seg = "seg_001"
+    w = _writer(tmp_path, reg_seg)
+    _swap(w, 100, 0, 0, 1, 1, 0, [1, 0, 2])
+    _swap(w, 200, 0, 0, 1, 1, 0, [0, 1, 2])
+    w.close()
+    ev = dict(load_exchanges(tmp_path))
+    seq = np.asarray(np.ma.getdata(ev["attempt_seq"]), dtype=np.float64).copy()
+    seq[1] = np.nan
+    ev["attempt_seq"] = seq
+    with pytest.raises(IntegrityError, match="legacy exchange rows mixed.*NaN"):
+        replay_assignments(ev, [0, 1, 2], after_step=0, up_to_step=200)
+    sha = np.asarray(ev["assignment_sha256_after"], dtype=object).copy()
+    sha[0] = float("nan")
+    ev["attempt_seq"] = np.asarray(np.ma.getdata(load_exchanges(tmp_path)["attempt_seq"]))
+    ev["assignment_sha256_after"] = sha
+    with pytest.raises(IntegrityError, match="legacy exchange rows mixed.*None/NaN"):
+        replay_assignments(ev, [0, 1, 2], after_step=0, up_to_step=200)
+
+
+def test_legacy_exchanges_cannot_be_replayed(tmp_path):
+    from gareus.query import load_exchanges
+    from gareus.store import ParquetExchangeWriter
+    w = ParquetExchangeWriter(tmp_path / "exchanges" / "seg_001")
+    w.write_exchange(step=5, replica_i=0, replica_j=1, window_i=0, window_j=1, delta_e=0.5, accepted=True)
+    w.close()
+    with pytest.raises(IntegrityError, match="ordered event"):
+        replay_assignments(load_exchanges(tmp_path), [0, 1], after_step=0, up_to_step=10)
+
+
+def test_production_resume_reseal_is_aux_gated_and_legacy_seal_is_unchanged():
+    """B4 (user ruling): re-seal for auxiliary runs only; the legacy checkpoint-resume seal stays verbatim."""
+    import ast
+    import inspect
+    import gareus.production as production
+    tree = ast.parse(inspect.getsource(production.run_gareus))
+    parents = {child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
+
+    def calls(name):
+        return [n for n in ast.walk(tree) if isinstance(n, ast.Call)
+                and getattr(n.func, "attr", getattr(n.func, "id", None)) == name]
+
+    def if_tests(node):
+        out = []
+        while node in parents:
+            node = parents[node]
+            if isinstance(node, ast.If):
+                out.append(ast.unparse(node.test))
+        return out
+
+    # Task 14 F4: the aux re-seal runs inside prepare_aux_resume, before the resumed segment is registered.
+    reseal = calls("prepare_aux_resume")
+    assert len(reseal) == 1 and any("aux" in t for t in if_tests(reseal[0]))
+    interrupted = [c for c in calls("seal_segment") if any(
+        k.arg == "status" and isinstance(k.value, ast.Constant) and k.value.value == "interrupted"
+        for k in c.keywords)]
+    assert len(interrupted) == 1, "the legacy checkpoint-resume seal must stay"
+    assert if_tests(interrupted[0])[0] == "_parent_was_running and _parent_seg_id is not None"
+    assert ast.unparse(interrupted[0]) == (
+        "_seg_registry.seal_segment(_parent_seg_id, absolute_end_step=int(manifest.get('absolute_step', 0)), "
+        "status='interrupted')")
+
+
+def test_replay_orders_same_step_swaps_by_attempt_seq_regardless_of_row_order(tmp_path):
+    """Two accepted swaps at step 100 only replay in attempt_seq order; reversed rows must still work."""
+    from gareus.query import load_exchanges
+    _crashed_parent(tmp_path)
+    ev = load_exchanges(tmp_path)
+    n = len(np.asarray(ev["step"]))
+    rev = {k: v[::-1] for k, v in ev.items() if hasattr(v, "__len__") and len(v) == n}
+    assert int(np.asarray(rev["step"])[0]) == 300
+    assert replay_assignments(rev, [0, 1, 2], after_step=0, up_to_step=200) == [1, 2, 0]
+
+
+# ── F09: proposal algorithm + authoritative logs; old (v1) records load as the legacy algorithm ──────────
+
+def _write_v1_segment(seg_dir, rows):
+    """A pre-F09 event chunk: no log_p_accept / proposal_algorithm columns (what v1 writers produced)."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    from gareus.parquet_manifest import append_file_to_manifest, file_record
+    seg_dir.mkdir(parents=True)
+    cols = {k: [r[k] for r in rows] for k in rows[0]}
+    types = {"step": pa.uint64(), "replica_i": pa.uint16(), "replica_j": pa.uint16(), "window_i": pa.uint16(),
+             "window_j": pa.uint16(), "delta_e": pa.float32(), "accepted": pa.bool_(), "attempt_seq": pa.uint32(),
+             "selected_replica": pa.int32(), "kind": pa.string(), "delta_e_kj": pa.float64(),
+             "log_q_forward": pa.float64(), "log_q_reverse": pa.float64(), "p_accept": pa.float64(),
+             "energy_version": pa.string(), "assignment_sha256_after": pa.string()}
+    tbl = pa.table({k: pa.array(cols[k], type=types[k]) for k in types})
+    path = seg_dir / "chunk_000001.parquet"
+    pq.write_table(tbl, path)
+    append_file_to_manifest(seg_dir, kind="exchanges", record=file_record(path, rows=tbl.num_rows,
+                            first_step=min(cols["step"]), last_step=max(cols["step"])),
+                            next_chunk_index=2, payload_schema={"schema": "atlas-exchange-events-v1"})
+
+
+def test_old_and_new_ledger_records_load_together(tmp_path):
+    from gareus.auxiliary_cv.ledger import LEGACY_PROPOSAL_ALGORITHM, proposal_logs
+    from gareus.query import load_exchanges
+    from gareus.store import SegmentRegistry
+    reg = SegmentRegistry(tmp_path)
+    a = reg.open_segment("run", None, 1)
+    old_row = dict(step=100, replica_i=0, replica_j=1, window_i=0, window_j=1, delta_e=0.0, accepted=False,
+                   attempt_seq=0, selected_replica=0, kind="swap", delta_e_kj=-1000.0, log_q_forward=0.0,
+                   log_q_reverse=float("-inf"), p_accept=0.0, energy_version="v3",
+                   assignment_sha256_after=assignment_sha256([0, 1, 2]))
+    _write_v1_segment(tmp_path / "exchanges" / a, [old_row])
+    reg.close_segment(a, 100)
+    b = reg.open_segment("run", a, 1)
+    w = _writer(tmp_path, b)
+    w.write_event(step=200, attempt_seq=0, selected_replica=0, replica_i=0, replica_j=1, window_i=0, window_j=1,
+                  kind="swap", delta_e_kj=-1000.0, accepted=True, log_q_forward=0.0, log_q_reverse=-1001.3132616875,
+                  p_accept=0.2689414213699951, log_p_accept=-1.3132616875182228,
+                  proposal_algorithm="gibbs_softmax_log_v2", energy_version="v3", assignments_after=[1, 0, 2])
+    _quiet(w, 300, 0, 2, 2, [1, 0, 2])                      # a writer call without the new keywords
+    w.flush()
+    reg.close_segment(b, 300)
+    ev = load_exchanges(tmp_path)
+    got = proposal_logs(ev)
+    order = np.argsort(np.asarray(ev["step"]))
+    alg = got["proposal_algorithm"][order].tolist()
+    assert alg == [LEGACY_PROPOSAL_ALGORITHM, "gibbs_softmax_log_v2", LEGACY_PROPOSAL_ALGORITHM]
+    lqr = got["log_q_reverse"][order]
+    assert np.isnan(lqr[0])                                 # historical -inf: unrecoverable, never finite or -inf
+    assert lqr[1] == -1001.3132616875                       # v2: the authoritative finite log
+    assert np.isnan(got["log_p_accept"][order][0]) and got["log_p_accept"][order][1] == -1.3132616875182228
+    assert replay_assignments(ev, [0, 1, 2], after_step=0, up_to_step=10**9) == [1, 0, 2]
+
+
+def test_v2_writer_refuses_to_append_to_a_v1_segment(tmp_path):
+    from gareus.parquet_manifest import ParquetManifestError
+    seg = tmp_path / "exchanges" / "seg_x"
+    _write_v1_segment(seg, [dict(step=1, replica_i=0, replica_j=0, window_i=0, window_j=0, delta_e=0.0,
+                                 accepted=False, attempt_seq=0, selected_replica=0, kind="stay", delta_e_kj=0.0,
+                                 log_q_forward=0.0, log_q_reverse=float("-inf"), p_accept=0.0, energy_version="v",
+                                 assignment_sha256_after=assignment_sha256([0]))])
+    from gareus.store import ParquetExchangeWriter
+    with pytest.raises(ParquetManifestError, match="payload schema"):
+        ParquetExchangeWriter(seg, event_schema=EXCHANGE_EVENT_SCHEMA)

@@ -50,16 +50,30 @@ from gareus.swarm.seed_library import (
     _resolve_conformer,
 )
 from gareus.swarm.stratify import (
+    BASE_AXES,
+    CONTACT_AXES,
     SeedDescriptor,
     _bin_index,
+    cells_from_edges,
     describe_seeds,
     plan_members,
     quantile_edges,
+    seed_contact_axes,
+    stratification_edges,
     stratify_cells,
 )
 
 PLAN_COLUMNS = ["member_id", "cell_id", "cell_cv1", "cell_rg", "cell_e2e",
                 "seed_id", "seed_pdb", "replicate", "velocity_seed"]
+CONTACT_PLAN_COLUMNS = ["cell_cpc1", "cell_cpc2"]      # 5-axis plans (contact-PCA strata) only
+
+
+def plan_columns(axes) -> List[str]:
+    """PLAN_COLUMNS, plus cell_cpc1/cell_cpc2 after cell_e2e for a 5-axis plan."""
+    if tuple(axes) == tuple(BASE_AXES):
+        return list(PLAN_COLUMNS)
+    i = PLAN_COLUMNS.index("cell_e2e") + 1
+    return PLAN_COLUMNS[:i] + CONTACT_PLAN_COLUMNS + PLAN_COLUMNS[i:]
 
 _ROUND_DIR_RE = re.compile(r"^round_(\d+)$")
 
@@ -93,27 +107,23 @@ def parse_member_range(spec: Optional[str], n_members: int) -> range:
     return range(a, b)
 
 
-def _parse_bins(spec) -> Tuple[int, int, int]:
+def _parse_bins(spec) -> Tuple[int, ...]:
     if isinstance(spec, (tuple, list)):
         values = [int(x) for x in spec]
     else:
         values = [int(x) for x in str(spec).split(",")]
-    if len(values) != 3:
-        raise ValueError(f"--swarm-bins needs exactly 3 comma-separated ints, got {spec!r}")
-    return tuple(values)  # type: ignore[return-value]
+    if len(values) not in (3, 5):
+        raise ValueError(f"--swarm-bins needs 3 (cv1,rg,e2e) or 5 (+ contact-PCA cpc1,cpc2) comma-separated ints, "
+                         f"got {spec!r}")
+    return tuple(values)
 
 
-def stratify_with_frozen_edges(seeds: List[SeedDescriptor], edges: Dict[str, list]) -> Dict[Tuple[int, int, int], List[SeedDescriptor]]:
+def stratify_with_frozen_edges(seeds: List[SeedDescriptor], edges: Dict[str, list]) -> Dict[tuple, List[SeedDescriptor]]:
     """Bin ``seeds`` against previously persisted quantile edges (round >= 1: the
-    coordinate is frozen after round 0, spec Sec.3.6 -- never re-fit here)."""
-    e_cv1 = np.asarray(edges["cv1"], dtype=float)
-    e_rg = np.asarray(edges["rg"], dtype=float)
-    e_e2e = np.asarray(edges["e2e"], dtype=float)
-    cells: Dict[Tuple[int, int, int], List[SeedDescriptor]] = {}
-    for s in seeds:
-        key = (_bin_index(s.cv1, e_cv1), _bin_index(s.rg_nm, e_rg), _bin_index(s.e2e_nm, e_e2e))
-        cells.setdefault(key, []).append(s)
-    return dict(sorted(cells.items()))
+    coordinate is frozen after round 0, spec Sec.3.6 -- never re-fit here). The axes are
+    the ones round 0 recorded (cv1/rg/e2e, plus cpc1/cpc2 for a contact-PCA plan)."""
+    axes = BASE_AXES + (CONTACT_AXES if all(a in edges for a in CONTACT_AXES) else ())
+    return cells_from_edges(seeds, edges, axes)
 
 
 def _load_frozen_edges(out_dir) -> Dict[str, list]:
@@ -126,7 +136,7 @@ def _load_frozen_edges(out_dir) -> Dict[str, list]:
     return edges
 
 
-def _write_plan(rd: Path, rows: List[dict], meta: dict) -> None:
+def _write_plan(rd: Path, rows: List[dict], meta: dict, columns: Optional[List[str]] = None) -> None:
     """Persist one round's member plan, all-or-nothing.
 
     ``plan.csv`` is the round's definition of how many members exist; every
@@ -136,10 +146,11 @@ def _write_plan(rd: Path, rows: List[dict], meta: dict) -> None:
     as the completion marker that ``build_or_load_plan`` gates on.
     """
     rd.mkdir(parents=True, exist_ok=True)
+    columns = list(columns or PLAN_COLUMNS)
     write_csv_atomic(
         rd / "plan.csv",
-        PLAN_COLUMNS,
-        ([row.get(k, "") for k in PLAN_COLUMNS] for row in rows),
+        columns,
+        ([row.get(k, "") for k in columns] for row in rows),
     )
     write_json(rd / "plan_meta.json", meta)
 
@@ -147,7 +158,7 @@ def _write_plan(rd: Path, rows: List[dict], meta: dict) -> None:
 SEED_DESCRIPTOR_COLUMNS = ["seed_id", "pdb_path", "cv1", "rg_nm", "e2e_nm"]
 
 
-def _write_seed_descriptors(rd: Path, seeds: List[SeedDescriptor]) -> None:
+def _write_seed_descriptors(rd: Path, seeds: List[SeedDescriptor], with_contact_axes: bool = False) -> None:
     """Round 0's per-seed heavy-CV1/Rg/E2E descriptors, one row per library seed in
     ``describe_seeds``'s own (deterministic) order. Analysis reads this back as the
     *real* library CV1 sample for ``_library_cv1_for_round0``'s reported diagnostic
@@ -155,11 +166,15 @@ def _write_seed_descriptors(rd: Path, seeds: List[SeedDescriptor]) -> None:
     the 2026-09-08 fix) -- ``plan_meta["edges"]["cv1"]`` is only bin *boundaries* and
     understates its q99 (controller review, round 1 fix)."""
     rd.mkdir(parents=True, exist_ok=True)
+    columns = SEED_DESCRIPTOR_COLUMNS + (["cpc1", "cpc2"] if with_contact_axes else [])
     with (rd / "seed_descriptors.csv").open("w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=SEED_DESCRIPTOR_COLUMNS)
+        w = csv.DictWriter(f, fieldnames=columns)
         w.writeheader()
         for s in seeds:
-            w.writerow({"seed_id": s.seed_id, "pdb_path": s.pdb_path, "cv1": s.cv1, "rg_nm": s.rg_nm, "e2e_nm": s.e2e_nm})
+            row = {"seed_id": s.seed_id, "pdb_path": s.pdb_path, "cv1": s.cv1, "rg_nm": s.rg_nm, "e2e_nm": s.e2e_nm}
+            if with_contact_axes:
+                row.update({"cpc1": s.cpc1, "cpc2": s.cpc2})
+            w.writerow(row)
 
 
 _INT_PLAN_FIELDS = ("member_id", "cell_cv1", "cell_rg", "cell_e2e", "replicate", "velocity_seed")
@@ -170,7 +185,7 @@ def _load_plan(rd: Path) -> Tuple[List[dict], dict]:
     with (rd / "plan.csv").open(newline="") as f:
         for row in csv.DictReader(f):
             out_row = dict(row)
-            for key in _INT_PLAN_FIELDS:
+            for key in _INT_PLAN_FIELDS + tuple(c for c in CONTACT_PLAN_COLUMNS if c in row):
                 out_row[key] = int(row[key])
             rows.append(out_row)
     meta = json.loads((rd / "plan_meta.json").read_text())
@@ -205,36 +220,81 @@ def build_or_load_plan(args, out_dir, round_index: int, *, topology, contact_pai
             )
         ca_indices_in_seed = _ca_indices_in_seed(library, topology)
         dropped: list = []
-        seeds = describe_seeds(library, ca_indices_in_seed, contact_pairs, args, dropped_out=dropped)
-        _write_seed_descriptors(rd, seeds)
+        contact_basis, contact_rec = (None, None)
+        if len(bins) == 5:
+            contact_basis, contact_rec = _round0_contact_basis(args, rd, library)
+        seeds = describe_seeds(library, ca_indices_in_seed, contact_pairs, args, dropped_out=dropped,
+                               contact_basis=contact_basis)
+        _write_seed_descriptors(rd, seeds, with_contact_axes=contact_basis is not None)
         cells = stratify_cells(seeds, bins)
-        edges = {
-            "cv1": quantile_edges(np.array([s.cv1 for s in seeds]), bins[0]).tolist(),
-            "rg": quantile_edges(np.array([s.rg_nm for s in seeds]), bins[1]).tolist(),
-            "e2e": quantile_edges(np.array([s.e2e_nm for s in seeds]), bins[2]).tolist(),
-        }
+        edges = {a: e.tolist() for a, e in stratification_edges(seeds, bins).items()}
     else:
         # cv1/rg_nm/e2e_nm were already validated (finite, non-empty) by
         # _validate_production_frame_row when the library was loaded -- no
         # re-parsing of raw CSV strings here.
-        seeds = [
-            SeedDescriptor(
+        edges = _load_frozen_edges(out_dir)
+        contact_basis, contact_rec = (None, None)
+        if all(a in edges for a in CONTACT_AXES):
+            contact_basis, contact_rec = _frozen_contact_basis(out_dir)
+        seeds = []
+        for i, entry in enumerate(library):
+            cpc = seed_contact_axes(entry, contact_basis) if contact_basis is not None else (float("nan"),) * 2
+            seeds.append(SeedDescriptor(
                 seed_id=f"seed_{i:05d}", pdb_path=str(entry["pdb_path"]),
                 cv1=float(entry["primary_cv_value"]),
                 rg_nm=float(entry["validated_rg_nm"]),
                 e2e_nm=float(entry["validated_e2e_nm"]),
-            )
-            for i, entry in enumerate(library)
-        ]
-        edges = _load_frozen_edges(out_dir)
+                cpc1=cpc[0], cpc2=cpc[1],
+            ))
         cells = stratify_with_frozen_edges(seeds, edges)
 
-    rows, meta = plan_members(cells, replicates_per_cell, seed_ns=seed_ns, budget_ns=budget_ns, base_seed=base_seed)
+    axes = BASE_AXES + (CONTACT_AXES if all(a in edges for a in CONTACT_AXES) else ())
+    rows, meta = plan_members(cells, replicates_per_cell, seed_ns=seed_ns, budget_ns=budget_ns, base_seed=base_seed,
+                              axes=axes, max_members=int(getattr(args, "swarm_max_members", 0) or 0))
     meta["edges"] = edges
     meta["round_index"] = int(round_index)
     meta["bins"] = list(bins)
-    _write_plan(rd, rows, meta)
+    if contact_rec is not None:
+        meta["contact_pca"] = contact_rec
+    _write_plan(rd, rows, meta, columns=plan_columns(axes))
     return rows, meta
+
+
+def _round0_contact_basis(args, rd: Path, library: List[dict]):
+    """Round 0's contact-PCA basis: the seed library's own ``contact_pca_basis.json`` (GENPEPT
+    --contact-pca-strata) when present, else fitted on the library's CA contact vectors with
+    --swarm-contact-pca-cutoff-a/--swarm-contact-pca-min-sep. Frozen in this round's directory
+    (later rounds load it from there)."""
+    from gareus.contact_pca import BASIS_FILENAME, contact_vector, fit_basis, load_basis, read_pdb_ca_A
+    lib_dir = Path(getattr(args, "seed_conformers_dir", "") or ".")
+    basis, source = None, None
+    if (lib_dir / BASIS_FILENAME).exists():
+        basis, source = load_basis(lib_dir / BASIS_FILENAME), f"seed library ({lib_dir / BASIS_FILENAME})"
+    else:
+        cutoff = float(getattr(args, "swarm_contact_pca_cutoff_a", 8.0) or 8.0)
+        min_sep = int(getattr(args, "swarm_contact_pca_min_sep", 3) or 3)
+        cas = [read_pdb_ca_A(e.get("pdb_path", "")) for e in library]
+        n_res = max((c.shape[0] for c in cas), default=0)
+        vecs = [contact_vector(c, cutoff_A=cutoff, min_sep=min_sep) for c in cas if c.shape[0] == n_res]
+        if not vecs:
+            raise SystemExit("5-axis --swarm-bins: no seed PDB has C-alpha atoms to fit the contact-PCA basis on")
+        basis = fit_basis(np.vstack(vecs), cutoff_A=cutoff, min_sep=min_sep, n_residues=n_res,
+                          source=f"swarm round 0 seed library ({len(vecs)} seeds)")
+        source = "fitted on the seed library"
+    path = basis.save(rd / BASIS_FILENAME)
+    print(f"    swarm: contact-PCA strata, basis {source}: {basis.n_pairs} pairs, explained variance "
+          f"{basis.explained_variance_ratio[0]:.2f}/{basis.explained_variance_ratio[1]:.2f}")
+    return basis, {"basis": str(path), "sha256": basis.sha256, "source": source,
+                   "explained_variance_ratio": list(basis.explained_variance_ratio)}
+
+
+def _frozen_contact_basis(out_dir):
+    from gareus.contact_pca import BASIS_FILENAME, load_basis
+    path = round_dir(out_dir, 0) / BASIS_FILENAME
+    if not path.exists():
+        raise SystemExit(f"round 0 used contact-PCA strata but {path} is missing")
+    basis = load_basis(path)
+    return basis, {"basis": str(path), "sha256": basis.sha256, "source": "round 0 (frozen)"}
 
 
 def ensure_system(args, out_dir, progress) -> dict:

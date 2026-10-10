@@ -1308,6 +1308,31 @@ def _completed_or_cancel_on_stop(futures):
         raise
 
 
+AUX_PULL_RAMP_STAGES = 5
+
+
+def ramp_aux_restraint(sim, runtime, *, center: float, k_kcal: float, stages: int, steps_per_stage: int) -> dict:
+    """Bring a freshly pulled window into its auxiliary restraint gradually.
+
+    k ramps 0 -> k_kcal at a fixed centre over ``stages`` MD stages; the parameters are always
+    cleared afterwards (production's set_window applies the real ones), also on exception.
+    """
+    from gareus.auxiliary_cv.force import set_aux_parameters
+    from gareus.auxiliary_cv.runtime import observe_aux_z
+    n = max(1, int(stages))
+    z_end = float("nan")
+    try:
+        for i in range(1, n + 1):
+            set_aux_parameters(sim.context, runtime.info, center=float(center), k_kcal=float(k_kcal) * i / n)
+            sim.step(max(1, int(steps_per_stage)))
+        from openmm import unit as _unit
+        pos = sim.context.getState(getPositions=True).getPositions(asNumpy=True).value_in_unit(_unit.nanometer)
+        z_end = float(observe_aux_z(sim.context, runtime, positions_nm=pos))
+    finally:
+        set_aux_parameters(sim.context, runtime.info, center=0.0, k_kcal=0.0)
+    return {"aux_ramp_stages": n, "aux_z_end": z_end}
+
+
 def generate_us_starting_states_by_pulling(
     args,
     out_dir: Path,
@@ -1330,6 +1355,7 @@ def generate_us_starting_states_by_pulling(
     secondary_cv_metadata: Optional[dict] = None,
     allow_slow_mode_reseed: bool = True,
     total_windows: Optional[int] = None,
+    aux_ramp: Optional[dict] = None,
 ):
     """Generate one starting structure per umbrella window by restrained CV pulling.
 
@@ -1713,6 +1739,14 @@ def generate_us_starting_states_by_pulling(
                     f"Pull w{w+1}/{nwin}: cv1→{centers_user_arr[w]:.3f}{primary_cv_units(args)} k={pull_k_kcal_a2:.1f}",
                     stage_override=contact_ramp_stage_override,
                 )
+        aux_row: dict = {}
+        if (aux_ramp is not None and w < len(aux_ramp["k_kcal"]) and float(aux_ramp["k_kcal"][w]) > 0.0
+                and aux_ramp["centers"][w] is not None):
+            _stages = max(1, int(aux_ramp["stages"]))
+            aux_row = ramp_aux_restraint(
+                sim, aux_ramp["runtime"], center=float(aux_ramp["centers"][w]),
+                k_kcal=float(aux_ramp["k_kcal"][w]), stages=_stages,
+                steps_per_stage=max(1, int(effective_pull_steps) // _stages))
         state = sim.context.getState(getPositions=True, getVelocities=True, getEnergy=True, enforcePeriodicBox=True)
         pos = state.getPositions()
         vel = state.getVelocities()
@@ -1758,6 +1792,7 @@ def generate_us_starting_states_by_pulling(
             "potential_kj_mol": float(pe_kj),
             "direction": str(direction_label),
             "pdb": str(pdb_path),
+            **aux_row,
         }, pos, vel
 
     rows = []

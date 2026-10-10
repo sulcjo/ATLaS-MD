@@ -115,10 +115,13 @@ class SwarmRoundProgress:
                 pad = 0.1 * (hi - lo) if hi > lo else 0.1
                 self._hist[name] = {"lo": lo - pad, "hi": hi + pad, "counts": [0] * HIST_BINS, "below": 0, "above": 0}
         self._cells_visited: set = set()
+        # Live coverage is over the axes the frames carry (cv1, rg, e2e); a contact-PCA plan's
+        # cpc1/cpc2 edges are not measured per frame, so they must not inflate the total.
         self._cells_total = 0
-        if self._edges:
+        live = [self._edges[n] for n in ("cv1", "rg", "e2e") if self._edges.get(n)]
+        if live:
             self._cells_total = 1
-            for e in self._edges.values():
+            for e in live:
                 self._cells_total *= len(e) - 1
         # frames
         args = getattr(sink, "args", None)

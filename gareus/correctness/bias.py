@@ -71,6 +71,26 @@ def _term(window: Mapping[str, Any], axis: int, label: str) -> tuple[float, floa
     return center, force
 
 
+AUX_WINDOW_FIELDS = ("aux_model_sha256", "aux_center", "aux_k")
+
+
+def _aux_term(window: Mapping[str, Any], label: str) -> tuple[str | None, float, float]:
+    """Canonical (model sha, centre, k) of an auxiliary restraint; k = 0 -> (None, 0.0, 0.0)."""
+    if "aux_k" not in window:
+        raise IntegrityError(f"{label}: auxiliary fields require an explicit aux_k (inactive is 0)")
+    force = finite_number(window["aux_k"], f"{label}.aux_k", minimum=0)
+    if force == 0:
+        return None, 0.0, 0.0
+    sha = window.get("aux_model_sha256")
+    if (not isinstance(sha, str) or len(sha) != 64
+            or any(c not in "0123456789abcdef" for c in sha)):
+        raise IntegrityError(f"{label}: active aux_k requires a full aux_model_sha256")
+    if "aux_center" not in window:
+        raise IntegrityError(f"{label}: active aux_k requires aux_center")
+    # + 0.0 canonicalises -0.0 so identity hashes do not depend on the sign of zero
+    return sha, finite_number(window["aux_center"], f"{label}.aux_center") + 0.0, force
+
+
 def normalize_windows(windows: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
     normalized = []
     for index, raw in enumerate(windows):
@@ -82,6 +102,9 @@ def normalize_windows(windows: Sequence[Mapping[str, Any]]) -> list[dict[str, An
         window["center2"], window["k2"] = _term(raw, 2, label)
         window["gamd_lambda"] = finite_number(raw.get("gamd_lambda", 0.0),
                                               f"{label}.gamd_lambda", minimum=0)
+        if any(key in raw for key in AUX_WINDOW_FIELDS):
+            (window["aux_model_sha256"], window["aux_center"],
+             window["aux_k"]) = _aux_term(raw, label)
         normalized.append(window)
     return normalized
 
@@ -123,6 +146,7 @@ def reconstruct_bias_matrix(
     v_dih: np.ndarray | None = None,
     envelope=None,
     meta: dict | None = None,
+    aux_z: Mapping[str, np.ndarray] | None = None,
     _ladder_apply: Callable | None = None,
 ) -> np.ndarray:
     """Return the (N,K) reduced umbrella-plus-ladder bias, not full potential.
@@ -131,6 +155,7 @@ def reconstruct_bias_matrix(
     yield NaN only in states requiring that coordinate. Row filtering belongs
     downstream and must keep origins/counts/aligned arrays consistent.
     _ladder_apply is a test seam, not an alternative production boost definition.
+    aux_z maps model_sha256 to that model's z for every sample; required for every model with an active state.
     """
     beta = finite_number(beta, "beta", positive=True)
     primary = numeric_vector(cv_A, "cv_A")
@@ -144,6 +169,16 @@ def reconstruct_bias_matrix(
         raise MissingCoordinateError(
             f"cv2 was not supplied, but states {active_secondary} have active secondary restraints"
         )
+    aux_columns = {}
+    for column, row in enumerate(rows):
+        if row.get("aux_k", 0.0) > 0:
+            sha = row["aux_model_sha256"]
+            if aux_z is None or sha not in aux_z:
+                raise MissingCoordinateError(
+                    f"aux z for model {sha} was not supplied, but state "
+                    f"{row.get('window_id', column)} has an active auxiliary restraint")
+            if sha not in aux_columns:
+                aux_columns[sha] = numeric_vector(aux_z[sha], f"aux_z[{sha[:12]}]", n)
     matrix = np.zeros((n, len(rows)), dtype=np.float64)
     with np.errstate(over="raise", invalid="ignore"):
         try:
@@ -154,6 +189,9 @@ def reconstruct_bias_matrix(
                 if row["k2"] > 0:
                     delta = secondary - row["center2"]
                     matrix[:, column] += 0.5 * row["k2"] * delta * delta
+                if row.get("aux_k", 0.0) > 0:
+                    delta = aux_columns[row["aux_model_sha256"]] - row["aux_center"]
+                    matrix[:, column] += 0.5 * row["aux_k"] * delta * delta
             matrix *= beta * KJ_PER_KCAL
         except FloatingPointError as exc:
             raise IntegrityError("Overflow reconstructing umbrella bias; check CV units/parameters") from exc

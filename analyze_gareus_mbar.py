@@ -5221,7 +5221,12 @@ def _analyze_population(d, args, out: Path, progress: Optional[Progress] = None,
     # (not d_main below): the epoch_000/rest split is a GaMD-envelope-
     # recalibration axis, orthogonal to which states carry lambda=0.
     ladder_crosscheck_summary={'status':'skipped','reason':'gamd_ladder not active for this run','n_lambda0_samples':0,'n_bins_compared':0}
-    if d.meta.get('gamd_ladder'):
+    from gareus.mbar_analysis.pmf import aux_diagnostics_unavailable
+    _aux_na=aux_diagnostics_unavailable(d.meta)   # final fix wave I2: None on every legacy analysis
+    if _aux_na is not None:
+        # Auxiliary states: the λ=0-only crosscheck is not audited for them yet (Stage D) -> NA, never a pass.
+        ladder_crosscheck_summary={'status':'skipped','reason':_aux_na,'n_lambda0_samples':0,'n_bins_compared':0}
+    elif d.meta.get('gamd_ladder'):
         _lcc=ladder_crosscheck(d,m['f_k'],bins,kbt_kcal)
         # Slim, JSON-safe view for pmf_summary.json -- the two full PMF
         # dicts (_lcc['pmf_full']/['pmf_lambda0']) carry numpy arrays and go
@@ -5249,6 +5254,46 @@ def _analyze_population(d, args, out: Path, progress: Optional[Progress] = None,
             else:
                 warn.append(f"λ-ladder cross-check FAILED: {_lcc.get('reason','contradictory ladder metadata')} -- "
                             f"the cross-check could not be made at all, so no PMF from this run is certified.")
+
+    # CVaux adaptive (Task 15): ordinary-only vs all-states PMF crosscheck + descriptive worker table.
+    # Only when the loader marked auxiliary states (d.meta['aux_states']); legacy runs never reach it.
+    aux_crosscheck_summary=None; aux_workers_summary=None
+    _aux_state_ids=[int(x) for x in (d.meta.get('aux_states') or [])]
+    if _aux_state_ids:
+        try:
+            from gareus.mbar_analysis.crosscheck import aux_ordinary_crosscheck
+            from gareus.adaptive.aux_worker_table import worker_table
+            _ordinary=[k for k in range(d.u_nk.shape[1]) if k not in set(_aux_state_ids)]
+            _bins_by_axis={'cv1':bins}
+            if np.any(np.isfinite(np.asarray(d.cv2,float))):
+                _bins_by_axis['cv2']=make_bins(np.asarray(d.cv2,float)[np.isfinite(np.asarray(d.cv2,float))],40,None,None)
+            _az=getattr(d,'aux_z',None)
+            if _az is None: _az=d.meta.get('aux_z')
+            if _az is not None:
+                _azf=np.asarray(_az,float); _azf=_azf[np.isfinite(_azf)]
+                if _azf.size: _bins_by_axis['z3']=make_bins(_azf,40,None,None)
+            _acc=aux_ordinary_crosscheck(d,m['f_k'],_bins_by_axis,kbt_kcal,ordinary_states=_ordinary)
+            aux_crosscheck_summary={k:v for k,v in _acc.items() if k!='axes'}
+            aux_crosscheck_summary['axes']={a:{k:v for k,v in r.items() if k not in ('edges','pmf_all','pmf_ordinary','counts_all','counts_ordinary')}
+                                            for a,r in _acc['axes'].items()}
+            _rows=[]
+            for _a,_r in _acc['axes'].items():
+                for _i,_e in enumerate(_r.get('pmf_all',[])):
+                    _rows.append((_a,_r['edges'][_i],_r['edges'][_i+1],_e,_r['pmf_ordinary'][_i],_r['counts_all'][_i],_r['counts_ordinary'][_i]))
+            if _rows:
+                import csv as _csv
+                with open(out/'pmf_aux_crosscheck.csv','w',newline='') as _fh:
+                    _w=_csv.writer(_fh); _w.writerow(['axis','edge_lo','edge_hi','pmf_all_kcal','pmf_ordinary_kcal','count_all','count_ordinary']); _w.writerows(_rows)
+                aux_crosscheck_summary['files']={'pmf_aux_crosscheck_csv':str(out/'pmf_aux_crosscheck.csv')}
+            if _acc['status']=='heuristic_fail':
+                warn.append(f"Aux ordinary-only cross-check (raw-count heuristic) FAILED: PMF from ordinary states only disagrees with the all-states PMF by "
+                            f"{_acc.get('max_abs_diff_kcal',float('nan')):.3f} kcal/mol (tolerance {_acc['tolerance_kcal']:.3f}) -- "
+                            f"the auxiliary states' bias terms or sampling are inconsistent with the ordinary ensemble.")
+            aux_workers_summary={'workers':worker_table(d,m['f_k'],aux_states=_aux_state_ids,ordinary_states=_ordinary,state_lambdas=getattr(d,'state_lambdas',None)),
+                                 'attribution':'none (no shams)','model_sha256':d.meta.get('aux_model_sha256')}
+        except Exception as _exc:
+            warn.append(f"Aux crosscheck/worker table unavailable: {type(_exc).__name__}: {_exc}")
+            aux_crosscheck_summary={'status':'error','method':'raw_count_heuristic','reason':f'{type(_exc).__name__}: {_exc}','axes':{}}
 
     # Never pool epoch_000 into the main PMF/GaMD-boost report: it runs under
     # a different GaMD envelope (the shared-envelope recalibration fires from
@@ -5306,6 +5351,10 @@ def _analyze_population(d, args, out: Path, progress: Optional[Progress] = None,
     thermo_info=analyze_thermo_decomposition(d,args,m,kbt_kcal=kbt_kcal,out=out,warnings=warn)
     chignolin_fes_info=analyze_chignolin_fes(d,args,logw,selected,boost_ok,kbt_kcal,out,warn,progress)
     secondary_cv_pmf_info,cv1_cv2_fes_info=run_secondary_cv_analyses(d,args,logw,selected,boost_ok,kbt_kcal,out,warn,progress,f_k_global=m['f_k'])
+    auxiliary_cv_pmf_info = None
+    if d.meta.get('aux_models') or d.meta.get('aux_states'):
+        from gareus.mbar_analysis.pmf import analyze_auxiliary_cv_pmf
+        auxiliary_cv_pmf_info = analyze_auxiliary_cv_pmf(d,args,logw,selected,boost_ok,kbt_kcal,out,warn)
     poincare_info=analyze_poincare_map(d,args,logw,selected,boost_ok,kbt_kcal,out,warn,progress)
     poincare_torsions_info=analyze_poincare_residue_torsions(d,args,out,poincare_info,warn,progress)
     epoch_cv_info=_analyze_epoch_cv_exploration(d.prod_dir,out,d.meta,warn)
@@ -5356,6 +5405,14 @@ def _analyze_population(d, args, out: Path, progress: Optional[Progress] = None,
     else:
         s['epoch_000_report']={'available':False,'reason':'no epoch_000/rest split available (single-epoch run or non-adaptive-production source)'}
     s['ladder_crosscheck']=ladder_crosscheck_summary
+    if aux_crosscheck_summary is not None: s['aux_crosscheck']=aux_crosscheck_summary
+    if aux_workers_summary is not None: s['aux_workers']=aux_workers_summary
+    if d.meta.get('aux_burnin_exclusions') is not None:
+        # F01: which carriers' rows the union excluded as worker burn-in (aux-admitted analyses only).
+        s['aux_burnin_exclusions']=d.meta['aux_burnin_exclusions']
+    if _aux_na is not None:
+        # Written only for auxiliary-state analyses: gareus_report grades the unaudited rows NA from it.
+        s['aux_states']={'reason':_aux_na,'models':[str(x) for x in d.meta.get('aux_models') or []]}
     s['rg']=rg_info
     s['distance_rg_2d_fes']=fes2d_info
     s['pca_2d_fes']=pca2d_info
@@ -5363,6 +5420,8 @@ def _analyze_population(d, args, out: Path, progress: Optional[Progress] = None,
     s['thermo_decomposition']=thermo_info
     s['chignolin_fes']=chignolin_fes_info
     s['secondary_cv_pmf']=secondary_cv_pmf_info
+    if auxiliary_cv_pmf_info is not None:
+        s['auxiliary_cv_pmf'] = auxiliary_cv_pmf_info
     s['poincare_map']=poincare_info
     s['poincare_residue_torsions']=poincare_torsions_info
     s['cv1_cv2_2d_fes']=cv1_cv2_fes_info
@@ -5375,7 +5434,7 @@ def _analyze_population(d, args, out: Path, progress: Optional[Progress] = None,
     for _info in (rg_info,fes2d_info,pca2d_info,extra_obs_info,chignolin_fes_info,
                   poincare_info,poincare_torsions_info,secondary_cv_pmf_info,
                   cv1_cv2_fes_info,epoch_cv_info,tica_epoch_info,torsion_pca_scree_info,conv_info,
-                  ladder_crosscheck_summary):
+                  ladder_crosscheck_summary,auxiliary_cv_pmf_info):
         if isinstance(_info,dict) and _info.get('files'):
             s['files'].update(_info['files'])
     # Presentation-only result-health verdict + warning triage (derived from the
@@ -5403,7 +5462,11 @@ def _analyze_population(d, args, out: Path, progress: Optional[Progress] = None,
     # block, via gareus_report.overall_from_checks (the same worst-status
     # rule build_health_verdict itself uses), inside the gamd_ladder gate so
     # a non-ladder run's health verdict is byte-for-byte unaffected.
-    if d.meta.get('gamd_ladder'):
+    if _aux_na is not None and d.meta.get('gamd_ladder'):
+        s['ladder_overlap']={'available':False,'reason':_aux_na}
+        s.setdefault('health',{}).setdefault('checks',[]).append(
+            {'name':'Ladder state overlap','status':'na','detail':_aux_na})
+    elif d.meta.get('gamd_ladder'):
         try:
             from gareus_report import overall_from_checks
             from gareus.mbar_analysis.ladder import pairwise_state_overlap
@@ -5916,7 +5979,37 @@ def main(argv=None):
         memory_reporter.close()
 
 
+def _write_aux_refusal_summary(args, exc) -> Path:
+    """Final fix wave M3: an aux pooling refusal (AuxPoolingRefused, raised only when aux evidence exists) still
+    leaves a gradeable pmf_summary.json where the summary normally goes: status refused, the reason as
+    ``aux_integrity_failure`` (gareus_report grades it FAIL ahead of everything) and an ``unavailable``
+    crosscheck. The caller re-raises, so the analysis still exits non-zero."""
+    from gareus_report import build_health_verdict
+    out = Path(args.out) if args.out else prod_dir_of(Path(args.input)) / 'pmf_analysis'
+    reason = str(exc)
+    s = {'status': 'refused', 'reason': reason, 'aux_integrity_failure': reason,
+         'aux_crosscheck': {'status': 'unavailable', 'reason': f'aux pooling refused: {reason}'},
+         'production_dir': str(prod_dir_of(Path(args.input))), 'output_dir': str(out)}
+    s['health'] = build_health_verdict(s, float(getattr(args, 'min_neighbor_overlap', 0.30)))
+    out.mkdir(parents=True, exist_ok=True)
+    wjson(out / 'pmf_summary.json', s)
+    return out / 'pmf_summary.json'
+
+
 def _main(args, memory_reporter):
+    from gareus.kernel_identity import AuxPoolingRefused
+    try:
+        return _main_inner(args, memory_reporter)
+    except AuxPoolingRefused as exc:
+        try:
+            path = _write_aux_refusal_summary(args, exc)
+            print(f'  [aux] pooling refused; FAIL summary written to {path}')
+        except Exception as write_exc:
+            print(f'  WARNING [aux] pooling refused and the refusal summary could not be written ({write_exc})')
+        raise
+
+
+def _main_inner(args, memory_reporter):
     args._memory_reporter = memory_reporter
     memory_reporter.record('startup')
     progress=Progress()

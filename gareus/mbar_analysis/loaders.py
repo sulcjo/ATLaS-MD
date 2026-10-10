@@ -240,11 +240,32 @@ def _load_secondary_cv_from_csv(samples_csv: Path, expected_size: int) -> np.nda
     return arr if arr.size == expected_size else np.full(expected_size, np.nan)
 
 
+def _refuse_aux_run(prod: Path, meta: dict, *, depth: int = 0) -> None:
+    """Refuse an auxiliary-CV run in every loader except load_parquet (CVaux Stage B ruling C3, Stage C B3/H4).
+
+    Their stored matrices / reconstructed biases omit the auxiliary restraint term. Fires on records naming
+    the v3_aux kernel or an auxiliary model digest, and on any window snapshot carrying auxiliary states
+    (kernel_identity.snapshot_has_aux: kernel identity, frozen v2 aux_models, D5a rows); depth=2 also scans
+    phase directories for the adaptive branch. Legacy runs: read-only JSON, unchanged output.
+    Raises AuxPoolingRefused (a RuntimeError).
+    """
+    from gareus.kernel_identity import AuxPoolingRefused, aux_snapshot_hits, is_aux_kernel_record
+    manifest = rjson(prod/'run_manifest.json', {})
+    records = [meta, (meta or {}).get('kernel_identity') if isinstance(meta, dict) else None,
+               manifest.get('method_settings') if isinstance(manifest, dict) else None]
+    hits = aux_snapshot_hits(prod, depth=depth)
+    if hits or any(is_aux_kernel_record(r) for r in records):
+        raise AuxPoolingRefused(f'{prod}: auxiliary-CV run (state_bias_matrix_v3_aux / aux model recorded'
+                                f'{"; " + hits[0] if hits else ""}); its bias pools only through load_parquet or '
+                                'the strict fixed-state exporter (CVaux Stage C).')
+
+
 def load_npz(prod: Path) -> Data:
+    meta=rjson(prod/'analysis_arrays_metadata.json',{}); meta.update(rjson(prod/'umbrella_pymbar_metadata.json',{}))
+    _refuse_aux_run(prod, meta)  # CVaux Stage B (ruling C3), hoisted in Stage C (B3): before any data read
     arr, load_notes = _load_merged_arrays(prod)
     if not arr:
         raise FileNotFoundError(f'No samples in {prod}/analysis_arrays.npz or analysis_chunks/')
-    meta=rjson(prod/'analysis_arrays_metadata.json',{}); meta.update(rjson(prod/'umbrella_pymbar_metadata.json',{}))
     if load_notes:
         meta.setdefault('load_notes', []).extend(load_notes)
     cv=np.asarray(arr['cv_A'],float)
@@ -365,6 +386,7 @@ def _window_float_array(rows: list[dict], keys: tuple[str, ...], default: float)
 
 def load_csv(prod: Path, load_notes: Optional[list[str]] = None) -> Data:
     meta=rjson(prod/'umbrella_pymbar_metadata.json',{})
+    _refuse_aux_run(prod, meta)  # CVaux Stage B (ruling C3): aux runs never load here
     if load_notes:
         meta.setdefault('load_notes', []).extend(load_notes)
     centers,ks,rows=read_windows(prod/'umbrella_windows.csv')
@@ -511,7 +533,9 @@ def _parquet_sample_count(prod: Path) -> int:
         return 0
 
 
-def load_parquet(prod: Path) -> Data:
+def load_parquet(prod: Path, *, exclude_segments_without_aux_features: bool = False,
+                 allow_ineligible_aux_segments: bool = False, aux_on_incomplete: str = 'refuse',
+                 aux_time_block_steps: Optional[int] = None) -> Data:
     """Load MBAR inputs from new Parquet sample format (gareus >= 2026.05 package).
 
     Reads samples/{seg_id}/chunk_*.parquet via gareus.query.load_samples(),
@@ -527,7 +551,11 @@ def load_parquet(prod: Path) -> Data:
             'Run from the gareus project directory or install with pip install -e .'
         ) from exc
 
-    samples = load_samples(prod)
+    # Auxiliary-CV run (CVaux Stage C): every segment holding rows is judged (classify_pool_segments),
+    # so the auxiliary branch loads ineligible segments too; legacy calls are unchanged.
+    from gareus.kernel_identity import run_has_aux
+    aux_present = run_has_aux(prod)
+    samples = load_samples(prod, include_ineligible=True) if aux_present else load_samples(prod)
     if not samples or 'cv1' not in samples:
         raise FileNotFoundError(f'No Parquet sample data found in {prod}/samples/')
 
@@ -538,6 +566,16 @@ def load_parquet(prod: Path) -> Data:
     meta = rjson(prod / 'umbrella_pymbar_metadata.json', {})
     meta.update(rjson(prod / 'gareus_metadata.json', {}))
     temp, beta = infer_temp_beta(prod, meta)
+
+    aux_z = None
+    if aux_present:
+        # One eligible fixed state table (frozen snapshots), one sample schema, offline z with
+        # per-segment parity; refused/excluded segment classes are decided here, before any row is used.
+        from gareus.auxiliary_cv.offline import pool_aux_segments
+        samples, windows, aux_z = pool_aux_segments(
+            prod, samples, beta, meta,
+            exclude_segments_without_aux_features=exclude_segments_without_aux_features,
+            allow_ineligible_aux_segments=allow_ineligible_aux_segments, temperature_k=temp)
 
     cv       = samples['cv1'].astype(np.float64)
     cv2_raw  = samples.get('cv2')
@@ -616,7 +654,13 @@ def load_parquet(prod: Path) -> Data:
     envelope = load_pep_gamd_envelope(prod) if np.any(state_lambdas > 0.0) else None
     windows_for_nk = [dict(w, gamd_lambda=float(state_lambdas[i])) for i, w in enumerate(windows)]
     u_nk = reconstruct_bias_matrix(cv, cv2_for_nk, windows_for_nk, beta,
-                                   v_pep=v_pep, v_dih=v_dih, envelope=envelope, meta=meta)
+                                   v_pep=v_pep, v_dih=v_dih, envelope=envelope, meta=meta, aux_z=aux_z)
+    if aux_present:
+        # clean() below silently drops non-finite rows; in an auxiliary run every such row is refused or
+        # excluded WITH a report first (same mask clean() applies: finite cv and finite u_nk row).
+        _audit_aux_incomplete_rows(cv, u_nk, window, replica, step, samples, aux_z, meta,
+                                   n_states=len(windows), on_incomplete=aux_on_incomplete,
+                                   time_block_steps=aux_time_block_steps)
 
     rows = []
     wcsv = prod / 'umbrella_windows.csv'
@@ -640,6 +684,30 @@ def load_parquet(prod: Path) -> Data:
         boost_dih_kj=_boost_dih_arg,
         v_pep_kj=v_pep, v_dih_kj=v_dih, state_lambdas=state_lambdas,
     ))
+
+
+def _audit_aux_incomplete_rows(cv, u_nk, window, replica, step, samples, aux_z, meta, *, n_states: int,
+                               on_incomplete: str, time_block_steps: Optional[int]) -> None:
+    """Refuse, or record an exclusion report for, the rows clean() would drop in an auxiliary run."""
+    from gareus.correctness._io import IntegrityError
+    if on_incomplete not in ('refuse', 'exclude_and_report'):
+        raise IntegrityError(f'aux_on_incomplete must be "refuse" or "exclude_and_report", got {on_incomplete!r}')
+    incomplete = ~(np.isfinite(cv) & np.all(np.isfinite(u_nk), axis=1))
+    if not incomplete.any():
+        return
+    counts = np.bincount(window.astype(np.int64)[incomplete], minlength=n_states).tolist()
+    if on_incomplete == 'refuse':
+        raise IntegrityError(f'Incomplete cross-state energies for {int(incomplete.sum())} auxiliary-run samples; '
+                             f'counts by origin={counts}; pass aux_on_incomplete="exclude_and_report"')
+    if not time_block_steps or int(time_block_steps) <= 0:
+        raise IntegrityError('aux_on_incomplete="exclude_and_report" needs a positive aux_time_block_steps')
+    from gareus.auxiliary_cv.offline import exclusion_report
+    meta['aux_exclusion_report'] = exclusion_report(
+        incomplete, origin_ids=window, replicas=replica, steps=step,
+        segment_ids=np.asarray(samples['segment_id']).astype(str), aux_z=aux_z or {},
+        time_block_steps=int(time_block_steps))
+    meta.setdefault('load_notes', []).append(
+        f'auxiliary run: {int(incomplete.sum())} incomplete rows excluded with report (aux_exclusion_report)')
 
 
 def prod_dir_of(path: Path) -> Path:
@@ -1060,13 +1128,21 @@ def load_data(inp: Path, out: Optional[Path], source: str = 'auto', no_augment: 
     prod=prod_dir_of(inp)
     # Adaptive-production: prefer new Parquet epoch data, fall back to legacy NPZ.
     if prod.name == 'adaptive_production':
+        # CVaux Stage C (rulings B3/H4): union NPZ, epoch CSV and union Parquet cannot carry the auxiliary term.
+        # A campaign whose driver admitted aux workers (aux_admission.json) pools ONLY through the union-Parquet
+        # loader, which evaluates the worker restraint from per-sample z (final fix wave C3).
+        from gareus.kernel_identity import AuxPoolingRefused, aux_admission_allows_pooling
+        _aux_admitted = aux_admission_allows_pooling(prod) is not None
+        if not _aux_admitted:
+            _refuse_aux_run(prod, {}, depth=2)
         union_npz = prod / 'adaptive_union_mbar.npz'
         _stale = _union_npz_older_than_samples(prod, union_npz) if (low_memory and epoch_ids is None
-                                                                    and union_npz.exists()) else None
+                                                                    and union_npz.exists()
+                                                                    and not _aux_admitted) else None
         if _stale:
             print(f'    WARNING [load] --low-memory: adaptive_union_mbar.npz is older than {_stale} '
                   '(a phase ran on after the snapshot); loading Parquet sequentially instead')
-        if low_memory and epoch_ids is None and union_npz.exists() and not _stale:
+        if low_memory and epoch_ids is None and union_npz.exists() and not _stale and not _aux_admitted:
             prov_notes = check_union_npz_window_map_provenance(prod)
             d = load_union_npz(prod, low_memory=True)
             if analysis_stride > 1 or analysis_stride_offset > 0:
@@ -1083,6 +1159,9 @@ def load_data(inp: Path, out: Optional[Path], source: str = 'auto', no_augment: 
         has_epoch_parquet = has_registry and any(prod.glob('*/samples/**/*.parquet'))
         if not has_epoch_parquet:
             has_epoch_parquet = bool(_find_adaptive_epoch_dirs(prod, epoch_ids=epoch_ids))
+        if _aux_admitted and not has_epoch_parquet:
+            raise AuxPoolingRefused(f'{prod}: admitted auxiliary workers (aux_admission.json) pool only through '
+                                    'the union-Parquet loader, and no epoch Parquet data was found')
         if has_epoch_parquet:
             d = load_parquet_adaptive_union(
                 prod, n_threads=n_threads, n_workers=n_workers, epoch_ids=epoch_ids,
@@ -1116,6 +1195,10 @@ def load_data(inp: Path, out: Optional[Path], source: str = 'auto', no_augment: 
         if out is not None: d.out_dir = Path(out)
         return d
     requested=str(source or 'auto').strip().lower()
+    from gareus.kernel_identity import refuse_aux_snapshots, run_has_aux
+    aux_run = run_has_aux(prod)
+    if aux_run and requested == 'auto':
+        requested = 'parquet'      # the only per-segment feature-checked loader
     has_parquet=(prod/'segments.json').exists() and (prod/'samples').is_dir()
     has_npz=(prod/'analysis_arrays.npz').exists() or (prod/'analysis_chunks_manifest.json').exists() or (prod/'analysis_chunks').exists()
     has_csv=(prod/'samples.csv').exists()
@@ -1164,8 +1247,17 @@ def load_data(inp: Path, out: Optional[Path], source: str = 'auto', no_augment: 
     else:
         raise ValueError(f'Unknown analysis source {source!r}; use auto, parquet, npz, or csv')
     if out is not None: d.out_dir=Path(out)
-    if not no_augment:
-        run_dir = prod.parent if prod.name == 'final_production' else prod
+    run_dir = prod.parent if prod.name == 'final_production' else prod
+    if aux_run:
+        if not no_augment:
+            _rounds = _find_gareus_round_dirs(run_dir)      # adaptive_feedback_round_* with analysis chunks only
+            for _rd in _rounds:
+                refuse_aux_snapshots(Path(_rd), where=f'adaptive round augmentation ({Path(_rd).name})', depth=0)
+            if _rounds:
+                d.meta.setdefault('load_notes', []).append(
+                    f'Auxiliary run: adaptive round augmentation skipped for {len(_rounds)} round dir(s); their rows '
+                    'carry no auxiliary features and cannot join an auxiliary pool.')
+    elif not no_augment:
         if _find_gareus_round_dirs(run_dir):
             d = _augment_with_adaptive_rounds(d, run_dir)
             if out is not None: d.out_dir = Path(out)

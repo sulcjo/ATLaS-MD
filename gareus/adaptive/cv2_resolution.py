@@ -213,7 +213,9 @@ def state_views(registry: Any, payload: Mapping[str, Any]) -> Dict[int, StateVie
     """Active registry states joined to the payload's P4 moments (missing -> None)."""
     rows = {int(r.get("state_id")): r for r in payload.get("states", []) or []}
     out: Dict[int, StateView] = {}
-    for s in registry.active_states():
+    # in-function import: adaptive_production imports this module (circular otherwise)
+    from gareus.adaptive_production import ordinary_active_states  # noqa: PLC0415
+    for s in ordinary_active_states(registry):
         pc = (rows.get(int(s.state_id)) or {}).get("paired_cv") or {}
         m2 = pc.get("cv2") or {}
         out[int(s.state_id)] = StateView(

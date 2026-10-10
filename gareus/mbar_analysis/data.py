@@ -116,6 +116,8 @@ class Data:
     v_pep_kj: Optional[np.ndarray] = None
     v_dih_kj: Optional[np.ndarray] = None
     state_lambdas: Optional[np.ndarray] = None
+    # Admitted aux workers (CVaux adaptive): per-sample z of the frozen aux model; None without workers.
+    aux_z: Optional[np.ndarray] = None
 
 
 def infer_temp_beta(prod: Path, meta: dict, arrays=None):
@@ -190,7 +192,7 @@ def infer_temp_beta(prod: Path, meta: dict, arrays=None):
 # state_lambdas). state_lambdas is indexed by d.window, NOT by sample, so
 # row-slicing it would silently corrupt the ladder cross-check (crosscheck.py)
 # and the boost report (boost_report.py) with no error to warn anyone.
-_OPTIONAL_PER_SAMPLE_FIELDS = ('potential_kj', 'boost_dih_kj', 'v_pep_kj', 'v_dih_kj')
+_OPTIONAL_PER_SAMPLE_FIELDS = ('potential_kj', 'boost_dih_kj', 'v_pep_kj', 'v_dih_kj', 'aux_z')
 # Required (never-None) per-sample fields. u_nk is checked separately: it is
 # 2-D (n_samples x K), so its sample count is shape[0], not size.
 _REQUIRED_PER_SAMPLE_FIELDS = ('cv', 'cv2', 'rg_A', 'window', 'replica', 'step', 'boost_kj')

@@ -1,0 +1,152 @@
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+from aux_discovery_fixture import make_phase
+
+from gareus.adaptive.aux_discovery.frames import build_frame_table, load_phase_samples, phase_epoch
+
+
+def test_phase_epoch_labels():
+    assert phase_epoch("epoch_002/baseline") == 2 and phase_epoch("epoch_000") == 0
+    assert phase_epoch("final") is None and phase_epoch("final_extension_001") is None
+
+
+def test_join_dedup_stride_and_lambda0(tmp_path: Path):
+    make_phase(tmp_path, "epoch_000",
+               {"replica_0.xtc": (0, 0, [300, 3300, 6300]),
+                "replica_0_resume_from_3300.xtc": (0, 0, [6300, 9300]),
+                "replica_1.xtc": (1, 1, [300, 3300, 6300])},
+               {0: 0.0, 1: 0.2}, lambda s: s / 1e4)
+    ft = build_frame_table(tmp_path, epochs=[0], registry_lambda={100: 0.0, 101: 0.2},
+                           stride_steps=3000, max_frames=10 ** 6, seed=0)
+    assert set(ft.state_id) == {100}
+    assert sorted(ft.step.tolist()) == [300, 3300, 6300, 9300]
+    assert np.allclose(ft.cv1, ft.step / 1e4)
+    assert ft.tors.shape == (4, 36)
+    assert set(ft.lineage) == {"epoch_000:0"} and ft.n == 4
+
+
+def test_resume_step_frame_kept_c10_layout(tmp_path: Path):
+    # C2: the earlier file ends AT the resume step, the resume file's first frame is one interval later
+    make_phase(tmp_path, "epoch_000",
+               {"replica_000.xtc": (0, 0, [263700, 266700, 269700]),
+                "replica_000_resume_from_000269700.xtc": (0, 0, [272700, 275700])},
+               {0: 0.0}, lambda s: s / 1e6)
+    ft = build_frame_table(tmp_path, epochs=[0], registry_lambda={100: 0.0}, stride_steps=3000,
+                           max_frames=10 ** 6, seed=0)
+    assert sorted(ft.step.tolist()) == [263700, 266700, 269700, 272700, 275700]
+
+
+def test_resume_file_reemitting_the_resume_step_counted_once(tmp_path: Path):
+    make_phase(tmp_path, "epoch_000",
+               {"replica_0.xtc": (0, 0, [300, 3300, 6300]),
+                "replica_0_resume_from_3300.xtc": (0, 0, [3300, 6300, 9300])},
+               {0: 0.0}, lambda s: s / 1e4)
+    ft = build_frame_table(tmp_path, epochs=[0], registry_lambda={100: 0.0}, stride_steps=3000,
+                           max_frames=10 ** 6, seed=0)
+    assert sorted(ft.step.tolist()) == [300, 3300, 6300, 9300]
+
+
+def test_samples_dedup_keeps_last_segment(tmp_path: Path):
+    ph = tmp_path / "p"
+    (ph / "samples" / "seg_000").mkdir(parents=True)
+    (ph / "samples" / "seg_001").mkdir()
+    base = {"step": [300], "replica": [0], "window_id": [0], "cv2": [0.0], "gamd_lambda": [0.0]}
+    pd.DataFrame({**base, "cv1": [1.0]}).to_parquet(ph / "samples" / "seg_000" / "data.parquet")
+    pd.DataFrame({**base, "cv1": [2.0]}).to_parquet(ph / "samples" / "seg_001" / "data.parquet")
+    df = load_phase_samples(ph)
+    assert len(df) == 1 and float(df.cv1.iloc[0]) == 2.0
+
+
+def test_budget_caps_total_frames(tmp_path: Path):
+    make_phase(tmp_path, "epoch_000", {"replica_0.xtc": (0, 0, list(range(300, 300 + 3000 * 40, 3000)))},
+               {0: 0.0}, lambda s: 0.0)
+    ft = build_frame_table(tmp_path, epochs=[0], registry_lambda={100: 0.0}, stride_steps=3000,
+                           max_frames=10, seed=0)
+    assert ft.n == 10
+
+
+def test_unwanted_epoch_and_run_dir_root(tmp_path: Path):
+    make_phase(tmp_path, "epoch_000", {"replica_0.xtc": (0, 0, [300, 3300])}, {0: 0.0}, lambda s: 0.0)
+    make_phase(tmp_path, "epoch_001", {"replica_0.xtc": (0, 0, [300, 3300])}, {0: 0.0}, lambda s: 0.0)
+    ft = build_frame_table(tmp_path / "adaptive_production", epochs=[0], registry_lambda={100: 0.0},
+                           stride_steps=3000, max_frames=100, seed=0)
+    assert ft.n == 2 and set(ft.epoch) == {0}
+
+
+def test_workers_pool_matches_serial(tmp_path: Path):
+    for name in ("epoch_000", "epoch_001"):
+        make_phase(tmp_path, name, {"replica_0.xtc": (0, 0, [300, 3300, 6300])}, {0: 0.0}, lambda s: s / 1e4)
+    kw = dict(epochs=[0, 1], registry_lambda={100: 0.0}, stride_steps=3000, max_frames=100, seed=0)
+    a = build_frame_table(tmp_path, **kw)
+    b = build_frame_table(tmp_path, workers=2, **kw)
+    assert a.n == b.n == 6 and np.array_equal(a.step, b.step) and np.allclose(a.tors, b.tors)
+
+
+def test_stride_anchored_per_replica_across_resume_files(tmp_path: Path):
+    make_phase(tmp_path, "epoch_000",
+               {"replica_0.xtc": (0, 0, [300, 3300]),
+                "replica_0_resume_from_4800.xtc": (0, 0, list(range(4800, 9301, 300)))},
+               {0: 0.0}, lambda s: 0.0)
+    ft = build_frame_table(tmp_path, epochs=[0], registry_lambda={100: 0.0}, stride_steps=3000,
+                           max_frames=10 ** 6, seed=0)
+    assert sorted(ft.step.tolist()) == [300, 3300, 6300, 9300]
+    assert ft.sources[0]["n_dropped_unmapped"] == 0
+
+
+def test_unmapped_state_counted(tmp_path: Path):
+    make_phase(tmp_path, "epoch_000", {"replica_0.xtc": (0, 0, [300, 3300]),
+                                       "replica_1.xtc": (1, 1, [300, 3300])},
+               {0: 0.0, 1: 0.0}, lambda s: 0.0)
+    ft = build_frame_table(tmp_path, epochs=[0], registry_lambda={100: 0.0}, stride_steps=3000,
+                           max_frames=100, seed=0)
+    assert ft.sources[0]["n_dropped_unmapped"] == 2 and set(ft.state_id) == {100}
+
+
+def test_gamd_phase_sample_steps_carry_the_calibration_offset(tmp_path: Path):
+    # Task 17 (CPU e2e under pep-gamd): production logs samples at calib_steps + prod_done but the trajectory
+    # reporter writes the Context step count (production-relative); the join found no frame at all.
+    make_phase(tmp_path, "epoch_000", {"replica_0.xtc": (0, 0, [300, 3300, 6300])}, {0: 0.0},
+               lambda s: s / 1e4, sample_step_offset=10200)
+    ft = build_frame_table(tmp_path, epochs=[0], registry_lambda={100: 0.0}, stride_steps=3000,
+                           max_frames=10 ** 6, seed=0)
+    assert sorted(ft.step.tolist()) == [10500, 13500, 16500]            # the samples' (absolute) steps
+    assert np.allclose(ft.cv1, ft.step / 1e4)
+
+
+def test_xtc_offset_is_zero_when_replicas_loaded_the_setup_checkpoint(tmp_path: Path):
+    import json
+    from gareus.adaptive.aux_discovery.frames import xtc_step_offset
+    ph = make_phase(tmp_path, "epoch_000", {"replica_0.xtc": (0, 0, [300])}, {0: 0.0}, lambda s: 0.0,
+                    sample_step_offset=10200)
+    assert xtc_step_offset(ph) == 10200
+    rep = {"replicas": [{"loaded_from_shared_gamd_setup_checkpoint": True}] * 2}
+    (ph / "replica_shared_gamd_copy_report.json").write_text(json.dumps(rep))
+    assert xtc_step_offset(ph) == 0                                     # Context step count continues calib
+    rep["replicas"][1] = {"loaded_from_shared_gamd_setup_checkpoint": False}
+    (ph / "replica_shared_gamd_copy_report.json").write_text(json.dumps(rep))
+    import pytest
+    with pytest.raises(ValueError, match="mixed"):
+        xtc_step_offset(ph)
+
+
+def test_wrong_step_clock_fails_loudly_not_as_an_empty_phase(tmp_path: Path):
+    import json
+    import pytest
+    ph = make_phase(tmp_path, "epoch_000", {"replica_0.xtc": (0, 0, [300, 3300])}, {0: 0.0}, lambda s: 0.0)
+    (ph / "gareus_metadata.json").write_text(json.dumps({"shared_gamd_calibration_steps": 10200}))
+    with pytest.raises(RuntimeError, match="offset 10200"):
+        build_frame_table(tmp_path, epochs=[0], registry_lambda={100: 0.0}, stride_steps=3000,
+                          max_frames=10 ** 6, seed=0)
+
+
+def test_cv1_only_schema_loads_without_cv2(tmp_path: Path):
+    ph = make_phase(tmp_path, "epoch_000", {"replica_0.xtc": (0, 0, [300, 3300])}, {0: 0.0}, lambda s: s / 1e4)
+    f = ph / "samples" / "seg_000" / "data.parquet"
+    pd.read_parquet(f).drop(columns=["cv2"]).to_parquet(f)
+    assert "cv2" not in load_phase_samples(ph).columns
+    ft = build_frame_table(tmp_path, epochs=[0], registry_lambda={100: 0.0}, stride_steps=3000,
+                           max_frames=100, seed=0)
+    assert ft.cv2 is None and ft.n == 2 and np.allclose(ft.cv1, ft.step / 1e4)
+    assert ft.take(np.array([0])).cv2 is None
