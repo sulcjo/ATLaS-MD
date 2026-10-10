@@ -214,3 +214,43 @@ def test_wrong_and_adjacent_float32_lambda_refused_float64_exact():
     assert _lam_export(0.1, 0.1, np.float64)["N_k"].tolist() == [4]
     with pytest.raises(IntegrityError, match="gamd_lambda"):
         _lam_export(float(np.float32(0.1)), 0.1, np.float64)
+
+
+# Final fix wave M7: flag-off pins -----------------------------------------------------------------------------
+
+def _non_aux_lam_export(stored, frozen=(0.0, 0.1)):
+    """A non-aux (no aux model, no aux row) 2-rung ladder export with a float64 gamd_lambda column."""
+    from aux_c_fixture import BOX, CV1
+    r = [{"window_id": i, "center1": 0.2, "k1": 10.0, "center2": 0.0, "k2": 0.0, "gamd_lambda": lam}
+         for i, lam in enumerate(frozen)]
+    d = make_state_definition(r, physical_system_sha256="a" * 64, ensemble="NVT", temperature_k=300.0,
+                              fixed_box_vectors_nm=BOX, cv1=CV1, cv2=None,
+                              boost={"kind": "pep-gamd", "envelope": {"vmax": 1.0}})
+    n = 4
+    s = {"cv1": np.linspace(0.1, 0.3, n), "window_id": np.array([0, 1, 0, 1]),
+         "segment_id": np.array(["seg_001"] * n), "gamd_lambda": np.asarray(stored, dtype=np.float64)}
+    snap = {"seg_001": freeze_snapshot("seg_001", d, equilibrium_analysis_eligible=True, phase_kind="production")}
+    return build_export_arrays(s, snap, BETA, sample_view=VIEW, envelope_factory=lambda boost: None,
+                               reconstruct=lambda cv1, cv2, w, b, **k: np.zeros((len(cv1), len(w))))
+
+
+def test_non_aux_float64_lambda_export_acceptance_unchanged():
+    from gareus.correctness.observation_keys import lambda_equals_frozen
+    assert _non_aux_lam_export([0.0, 0.1, 0.0, 0.1])["N_k"].tolist() == [2, 2]
+    for bad in ([0.0, float(np.float32(0.1)), 0.0, 0.1], [0.0, 0.2, 0.0, 0.1], [0.1, 0.0, 0.0, 0.1]):
+        with pytest.raises(IntegrityError, match="gamd_lambda"):
+            _non_aux_lam_export(bad)
+    # float64 columns: the new comparison is exactly the old np.array_equal rule
+    rng = np.random.default_rng(3)
+    frozen = rng.choice([0.0, 0.1, 0.47, 1.0], size=64)
+    for stored in (frozen.copy(), np.where(rng.random(64) < 0.1, np.nextafter(frozen, 2.0), frozen),
+                   frozen.astype(np.float32).astype(np.float64)):
+        assert bool(lambda_equals_frozen(stored, frozen).all()) == bool(np.array_equal(stored, frozen))
+
+
+def test_gamd_prep_steps_cli_defaults_are_5000(tmp_path):
+    from gareus.cli import build_gareus_parser, parse_args
+    a = parse_args(["--seq", "GA", "--cv1", "contacts", "--out", str(tmp_path / "o")])
+    assert a.gamd_cmd_prep_steps == 5000 and a.gamd_equil_prep_steps == 5000
+    p = build_gareus_parser()
+    assert p.get_default("gamd_cmd_prep_steps") == 5000 and p.get_default("gamd_equil_prep_steps") == 5000

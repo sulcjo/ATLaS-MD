@@ -11,7 +11,7 @@ Pooling also needs a passing post-admission spot check once one is due (``requir
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, Iterable, Optional, Tuple
+from typing import Dict, Iterable, Mapping, Optional, Tuple
 
 import numpy as np
 
