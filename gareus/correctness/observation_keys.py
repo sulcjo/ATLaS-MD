@@ -48,6 +48,16 @@ def _int_key(raw: Any, label: str, n: Optional[int]) -> np.ndarray:
     return out
 
 
+def phase_column(samples: Mapping[str, Any]):
+    """The per-row phase id column (``phase_id``), or None = the whole pool is one phase."""
+    return samples.get("phase_id")
+
+
+def integer_key(raw: Any, label: str, n: Optional[int] = None) -> np.ndarray:
+    """Strict non-negative int64 key column (same rules as validate_observation_keys); typed refusal."""
+    return _int_key(raw, label, n)
+
+
 def validate_observation_keys(phase: Any, replica: Any, step: Any, *, segment_ids: Any = None,
                               where: str = "sample pool"):
     """Validate (phase/source id, replica, step) columns; return ``(phase_code, replica, step)`` int64 arrays.

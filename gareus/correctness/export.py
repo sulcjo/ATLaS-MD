@@ -17,7 +17,7 @@ import numpy as np
 
 from ._io import IntegrityError, digest, fsync_directory, json_bytes, json_loads
 from .bias import finite_number, numeric_vector, reconstruct_bias_matrix
-from .observation_keys import lambda_equals_frozen, validate_observation_keys
+from .observation_keys import lambda_equals_frozen, phase_column, validate_observation_keys
 from .state_identity import state_definition_hash, validate_fixed_state_segments
 
 EXPORT_SCHEMA = "atlas-fixed-state-npz-v1"
@@ -130,8 +130,8 @@ def build_export_arrays(
     aux_z = None
     if active_aux:
         # Auxiliary pooling counts every observation once: strict (phase, replica, step) identity (F10).
-        phase = next((samples[k] for k in ("phase_id", "source_id") if k in samples), None)
-        validate_observation_keys(phase, samples.get("replica"), samples.get("step"), segment_ids=segments,
+        # Gated on active aux by design (opt-in rule): non-aux strict exports keep their old key handling.
+        validate_observation_keys(phase_column(samples), samples.get("replica"), samples.get("step"), segment_ids=segments,
                                   where="strict export")
         from ..auxiliary_cv.offline import aux_z_from_samples, parity_context, registry_model
         from ..auxiliary_cv.sample_schema import PARITY_TOLERANCE

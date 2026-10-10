@@ -195,11 +195,10 @@ def refuse_duplicate_sample_keys(samples: Mapping[str, Any]) -> None:
     Task 13 carry-over 3 / F10: key = (phase/source id, replica, step); ``segment_id`` is provenance. An
     interrupted auxiliary parent that never checkpointed stays pooled up to its crash step while its restarted
     child re-runs the same steps; the two would count one carrier's observation twice. The phase id is the
-    ``phase_id`` (else ``source_id``) column when the pool carries one, else the pool is one phase.
+    ``phase_id`` column when the pool carries one, else the pool is one phase.
     """
-    from ..correctness.observation_keys import validate_observation_keys
-    phase = next((samples[k] for k in ("phase_id", "source_id") if k in samples), None)
-    validate_observation_keys(phase, samples.get("replica"), samples.get("step"),
+    from ..correctness.observation_keys import phase_column, validate_observation_keys
+    validate_observation_keys(phase_column(samples), samples.get("replica"), samples.get("step"),
                               segment_ids=samples.get("segment_id"), where="auxiliary sample pool")
 
 
@@ -282,7 +281,8 @@ def pool_aux_segments(prod, samples, beta, meta, *, exclude_segments_without_aux
     if columns != tuple(range(len(columns))):
         raise IntegrityError(f"frozen state table window_id columns {list(columns)[:8]} are not 0..K-1 in order; "
                              "load_parquet cannot index them by window_id")
-    origins = np.asarray(np.ma.filled(np.ma.asarray(samples["window_id"]), -1)).astype(np.int64)
+    from ..correctness.observation_keys import integer_key
+    origins = integer_key(samples.get("window_id"), "window_id", seg_col.size)   # no truncation of fractional/masked ids
     unknown = sorted(set(origins[(origins < 0) | (origins >= len(columns))].tolist()))
     if unknown:
         raise IntegrityError(f"sample window_id(s) {unknown[:8]} are not states of the frozen table "

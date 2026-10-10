@@ -106,6 +106,7 @@ def test_pool_refuses_missing_key_and_added_duplicate_changes_nothing():
         refuse_duplicate_sample_keys({"step": s["step"]})
     with pytest.raises(ObservationKeyRefusal, match="missing"):
         refuse_duplicate_sample_keys({})
+    refuse_duplicate_sample_keys({**s, "source_id": np.zeros(4, dtype=int)})   # source_id is not a phase column
     refuse_duplicate_sample_keys({**s, "phase_id": np.array(["p", "p", "q", "q"])})
 
 
@@ -126,3 +127,40 @@ def test_flag_off_load_parquet_reaches_no_new_code(tmp_path, monkeypatch):
     with pytest.raises(RuntimeError, match="stop after the aux gate"):
         loaders.load_parquet(tmp_path)
     assert calls == []
+
+
+def _aux_pool(tmp_path, mutate):
+    import test_aux_loaders as tl
+    from gareus.auxiliary_cv.offline import pool_aux_segments
+    from gareus.query import load_samples
+    tl._run(tmp_path)
+    samples = load_samples(tmp_path, include_ineligible=True)
+    samples = {k: (np.ma.copy(v) if hasattr(v, "__len__") else v) for k, v in samples.items()}
+    mutate(samples)
+    return lambda: pool_aux_segments(tmp_path, samples, 0.4, {})
+
+
+def _set(key, value_fn):
+    def mut(s):
+        s[key] = value_fn(s[key])
+    return mut
+
+
+@pytest.mark.parametrize("key", ["window_id", "step", "replica"])
+@pytest.mark.parametrize("kind,match", [("fractional", "fractional"), ("masked", "masked")])
+def test_pool_refuses_fractional_and_masked_keys(tmp_path, key, kind, match):
+    def bad(v):
+        if kind == "fractional":
+            out = np.asarray(v, dtype=np.float64).copy(); out[0] += 0.5
+            return out
+        return np.ma.masked_array(np.asarray(v), mask=np.arange(len(v)) == 0)
+    run = _aux_pool(tmp_path, _set(key, bad))
+    with pytest.raises(ObservationKeyRefusal, match=match):
+        run()
+
+
+@pytest.mark.parametrize("key", ["step", "replica"])
+def test_pool_refuses_missing_key_column(tmp_path, key):
+    run = _aux_pool(tmp_path, lambda s: s.pop(key))
+    with pytest.raises(ObservationKeyRefusal, match="missing"):
+        run()
